@@ -2,7 +2,8 @@ import ast
 import collections
 import json
 import math
-#import networkx as nx
+import networkx as nx
+import numpy as np
 import pandas as pd
 import sys
 import torch
@@ -10,14 +11,17 @@ import torch.nn.functional as F
 
 import wandb
 
-from adapters import AutoAdapterModel
+from adapters import AdapterTrainer, AutoAdapterModel
 from collections import defaultdict
 from itertools import combinations
+
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoConfig, AutoTokenizer, get_scheduler
+from transformers import AutoConfig, AutoTokenizer, get_scheduler, TrainingArguments, EvalPrediction
+
 
 MAX_TOK_LEN = 512
 
@@ -46,6 +50,7 @@ def initialize_model(model_name, adapter_name="mrpc"):
     model.add_classification_head(adapter_name, num_labels=2)
     model.add_adapter(adapter_name, config="seq_bn")
     model.set_active_adapters(adapter_name)
+    model.train_adapter(adapter_name)
     wandb.watch(model)
     return model, tokenizer
 
@@ -75,6 +80,9 @@ def tokenize_schemas(train_df, tokenizer):
     
     # Add a new column for tokenized schemas
     train_df["Tokenized_schema"] = tokenized_schemas
+
+    # Shuffle the DataFrame
+    train_df = train_df.sample(frac=1).reset_index(drop=True)
 
     return train_df
 
@@ -125,16 +133,50 @@ def merge_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer):
         return [tokenizer.bos_token_id] + tokenized_schema1.tolist() + newline_token + tokenized_schema2.tolist() + [tokenizer.eos_token_id]
 
 
+def transform_data(train_df, tokenizer):
+    # The transformers model expects the target class column to be named "labels"
+    train_df = train_df.rename(columns={"Label": "labels"})
+
+    # Get the maximum length of tokenized schemas
+    max_length = max(len(schema) for schema in train_df["Tokenized_schema"])
+
+    # Create an empty list to store padded schemas
+    padded_schemas = []
+    for schema in train_df["Tokenized_schema"]:
+        # Pad each schema to the maximum length
+        padded_schema = torch.nn.functional.pad(torch.tensor(schema), (0, max_length - len(schema)), value=tokenizer.pad_token_id)
+        padded_schemas.append(padded_schema)
+
+    # Stack the padded schemas into a tensor
+    input_ids = torch.stack(padded_schemas)
+
+    # Create an empty list to store attention masks
+    attention_masks = []
+    for padded_schema in padded_schemas:
+        # Create attention mask based on the presence of tokens
+        attention_mask = torch.where(padded_schema != tokenizer.pad_token_id, torch.tensor(1), torch.tensor(0))
+        attention_masks.append(attention_mask)
+
+    # Stack the attention masks into a tensor
+    attention_masks = torch.stack(attention_masks)
+
+    # Get the labels
+    labels = torch.tensor(train_df["labels"].values)
+
+    train_data_dict = [{"input_ids": input_id, "attention_mask": mask, "labels": label} for input_id, mask, label in zip(input_ids, attention_masks, labels)]
+    return train_data_dict
+
+
 def train_model(train_df):
     model_name = "microsoft/codebert-base"
     accumulation_steps = 4
     batch_size = 16
-    learning_rate = 2e-5
-    num_epochs = 10
+    learning_rate = 1e-6
+    num_epochs = 25
 
     # Start a new wandb run to track this script
     wandb.init(
-        project="custom-codebert_frequent_patterns_all_" + str(num_epochs),
+        project="custom-codebert_frequent_patterns",
         config={
             "accumulation_steps": accumulation_steps,
             "batch_size": batch_size,
@@ -147,11 +189,12 @@ def train_model(train_df):
 
     # Initialize tokenizer, model with adapter and classification head
     model, tokenizer = initialize_model(model_name)
-    train_df_with_tokens = tokenize_schemas(train_df, tokenizer)
-    #train_df_with_tokens.to_csv("sample_data.csv")
 
-    # Shuffle the DataFrame
-    train_df_with_tokens = train_df_with_tokens.sample(frac=1).reset_index(drop=True)
+    # Tokenize the data
+    train_df_with_tokens = tokenize_schemas(train_df, tokenizer)
+
+    # Transform data into dict
+    train_data_dict = transform_data(train_df_with_tokens, tokenizer)
 
     # Set up optimizer
     optimizer = AdamW(model.parameters(), lr=learning_rate)
@@ -160,73 +203,58 @@ def train_model(train_df):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # Set up scheduler to adjust the learning rate during training
-    num_training_steps = num_epochs * len(train_df_with_tokens) // batch_size
-    num_warmup_steps = int(0.1 * num_training_steps)
+    # Setup the training arguments
+    training_args = TrainingArguments(
+        report_to="wandb",
+        learning_rate=learning_rate,
+        num_train_epochs=num_epochs,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        logging_steps=1,
+        evaluation_strategy="epoch",
+        logging_strategy="epoch",
+        output_dir="./training_output",
+        overwrite_output_dir=True,
+        # The next line is important to ensure the dataset labels are properly passed to the model
+        remove_unused_columns=False,
+    )
+
+     # Calculate total steps
+    total_steps = len(train_data_dict) // training_args.per_device_train_batch_size * training_args.num_train_epochs
+
+    # Define warm-up steps
+    warmup_steps = int(0.1 * total_steps)
+
+    # Initialize scheduler with warm-up steps
     lr_scheduler = get_scheduler(
         "linear",
         optimizer=optimizer,
-        num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_training_steps,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
     )
 
-    # Get the maximum length of tokenized schemas
-    max_length = max(len(schema) for schema in train_df_with_tokens["Tokenized_schema"])
-
-    # Tokenize and pad schemas outside the epoch loop
-    padded_schemas = []
-    for schema in train_df_with_tokens["Tokenized_schema"]:
-        padded_schema = torch.nn.functional.pad(torch.tensor(schema), (0, max_length - len(schema)), value=tokenizer.pad_token_id)
-        padded_schemas.append(padded_schema)
-
-    # Stack the padded schemas into a tensor
-    input_ids = torch.stack(padded_schemas)
-
-    # Create attention masks based on the presence of tokens
-    attention_masks = torch.nn.functional.pad(torch.ones_like(input_ids), (0, max_length - input_ids.shape[1]), value=0).to(device)
-
-    # Process labels outside the epoch loop
-    labels = torch.tensor(train_df_with_tokens["Label"].values).to(device)
+    # Create AdapterTrainer instance
+    trainer = AdapterTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_data_dict,
+        eval_dataset=train_data_dict,
+        compute_metrics=compute_accuracy,
+        optimizers=(optimizer, lr_scheduler),
+    )
 
     # Train the model
-    model.train()
-    for epoch in tqdm(range(num_epochs), desc="Epoch", position=0):
-        total_loss = 0
-        
-        # Iterate over batches
-        for i in tqdm(range(0, len(input_ids), batch_size), desc="Batch", position=0, leave=True):
-            # Get the current batch
-            batch_input_ids = input_ids[i:i + batch_size].to(device)
-            batch_attention_masks = attention_masks[i:i + batch_size].to(device)
-            batch_labels = labels[i:i + batch_size].to(device)
-            print(batch_input_ids)
-            print(batch_attention_masks)
-            print(batch_labels)
-            print()
-
-            # Forward pass
-            outputs = model(input_ids=batch_input_ids, attention_mask=batch_attention_masks, labels=batch_labels)
-  
-            # Calculate the training loss
-            training_loss = outputs.loss
-            training_loss.backward()
-            
-            # Gradient accumulation and optimization step
-            if (i + 1) % accumulation_steps == 0 or i == len(input_ids) - 1:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-
-            total_loss += training_loss.item()
-            torch.cuda.empty_cache()
-        
-        average_loss = total_loss / len(train_df_with_tokens)
-        wandb.log({"training_loss": average_loss})
+    trainer.train()
         
     # Save the adapter
-    #save_adapter(model)
-    #wandb.save("./adapter/*")
+    save_adapter(model)
+    wandb.save("./adapter/*")
+  
 
+def compute_accuracy(p: EvalPrediction):
+  preds = np.argmax(p.predictions, axis=1)
+  return {"acc": (preds == p.label_ids).mean()}
+    
 
 def save_adapter(model):
     # Save the adapter
