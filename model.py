@@ -2,7 +2,7 @@ import ast
 import collections
 import json
 import math
-#import networkx as nx
+import networkx as nx
 import numpy as np
 import pandas as pd
 import sys
@@ -55,20 +55,20 @@ def initialize_model(model_name, adapter_name="mrpc"):
     return model, tokenizer
 
 
-def tokenize_schemas(train_df, tokenizer):
+def tokenize_schemas(df, tokenizer):
     """Tokenize schemas and add tokenized versions as new columns to the DataFrame. Remove first and last token
 
     Args:
-        train_df (DataFrame): train dataframe containing pairs, label, filename, and schema of each path in pair
+        df (pd.DataFrame): dataframe containing pairs, label, filename, and schema of each path in pair
         tokenizer: Microsoft CodeBERT tokenizer
 
     Returns:
-        DataFrame: train dafaframe with tokenized schemas
+        DataFrame: dafaframe with tokenized schemas
     """
     tokenized_schemas = []
 
     # Loop over the schemas of the pairs of paths
-    for idx, (schema1, schema2) in train_df[["Schema1", "Schema2"]].iterrows():
+    for idx, (schema1, schema2) in df[["Schema1", "Schema2"]].iterrows():
 
         # Tokenize the schemas
         tokenized_schema1 = tokenizer(schema1, return_tensors="pt", max_length=MAX_TOK_LEN, padding=True)["input_ids"][0][1:-1]
@@ -79,30 +79,12 @@ def tokenize_schemas(train_df, tokenizer):
         tokenized_schemas.append(tokenized_schema)
     
     # Add a new column for tokenized schemas
-    train_df["Tokenized_schema"] = tokenized_schemas
+    df["Tokenized_schema"] = tokenized_schemas
 
     # Shuffle the DataFrame
-    train_df = train_df.sample(frac=1).reset_index(drop=True)
+    df = df.sample(frac=1).reset_index(drop=True)
 
-    return train_df
-
-
-def tokenize_test_schemas(test_df, tokenizer):
-    """Tokenize schemas and add tokenized versions as new columns to the DataFrame. Remove first and last token
-
-    Args:
-        test_df (DataFrame): test dataframe containing path, label, filename, and schema of path
-        tokenizer: Microsoft CodeBERT tokenizer
-
-    Returns:
-        DataFrame: test dafaframe with tokenized schemas
-    """
-
-    test_df["Tokenized_schema"] = test_df["Schema"].apply(
-        lambda schema: tokenizer(schema, return_tensors="pt", max_length=MAX_TOK_LEN, padding=True, truncation=True)["input_ids"][0][1:-1]
-    )
-
-    return test_df
+    return df
 
 
 def merge_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer):
@@ -133,85 +115,47 @@ def merge_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer):
         return [tokenizer.bos_token_id] + tokenized_schema1.tolist() + newline_token + tokenized_schema2.tolist() + [tokenizer.eos_token_id]
 
 
-def transform_data(df, tokenizer, device, is_train=True):
-    """
-    Transforms the input DataFrame into a format suitable for the transformer model.
-
-    Args:
-        df (pd.DataFrame): The input DataFrame with column "Tokenized_schema". For training, it also includes "Label".
-        tokenizer (PreTrainedTokenizer): The tokenizer used for processing text data.
-        device (torch.device): The device (CPU or GPU) to which tensors should be moved.
-        is_train (bool): Whether the input DataFrame is for training or testing.
-
-    Returns:
-        list: A list of dictionaries, each containing "input_ids", "attention_mask", and "labels" tensors (for training).
-              For testing, the dictionaries contain only "input_ids" and "attention_mask".
-    """
-    if is_train:
-        df = df.rename(columns={"Label": "labels"})
-
-    max_length = max(len(schema) for schema in df["Tokenized_schema"])
-    pad_token_id = tokenizer.pad_token_id
-
-    dataset = []
-    for item in df.itertuples(index=False):
-        schema = item.Tokenized_schema
-        schema_tensor = torch.tensor(schema)
-        padded_schema = torch.nn.functional.pad(schema_tensor, (0, max_length - len(schema)), value=pad_token_id)
-        attention_mask = (padded_schema != pad_token_id).long()
-
-        if is_train:
-            label = item.labels
-            label_tensor = torch.tensor(label)
-            dictionary = {
-                "input_ids": padded_schema.to(device),
-                "attention_mask": attention_mask.to(device),
-                "labels": label_tensor.to(device)
-            }
-        else:
-            dictionary = {
-                "input_ids": padded_schema.to(device),
-                "attention_mask": attention_mask.to(device)
-            }
-        dataset.append(dictionary)
-
-    return dataset
-
-
-def transform_train_data(train_df, tokenizer, device):
+def transform_data(df, tokenizer, device):
     """
     Transforms the input training DataFrame into a format suitable for a transformer model.
 
     Args:
-        train_df (pd.DataFrame): The training DataFrame with columns "Tokenized_schema" and "Label".
+        df (pd.DataFrame): The training DataFrame with columns "Tokenized_schema" and "Label".
         tokenizer (PreTrainedTokenizer): The tokenizer used for processing text data.
         device (torch.device): The device (CPU or GPU) to which tensors should be moved.
 
     Returns:
         list: A list of dictionaries, each containing "input_ids", "attention_mask", and "labels" tensors.
     """
-    return transform_data(train_df, tokenizer, device, is_train=True)
+    # Rename the target column to "labels"
+    df = df.rename(columns={"Label": "labels"})
 
+    # Get the maximum length of tokenized schemas
+    max_length = max(len(schema) for schema in df["Tokenized_schema"])
 
-def transform_test_data(test_df, tokenizer, device):
-    """
-    Transforms the input test DataFrame into a format suitable for a transformer model.
+    pad_token_id = tokenizer.pad_token_id
 
-    Args:
-        test_df (pd.DataFrame): The test DataFrame with the column "Tokenized_schema".
-        tokenizer (PreTrainedTokenizer): The tokenizer used for processing text data.
-        device (torch.device): The device (CPU or GPU) to which tensors should be moved.
+    dataset = []
+    for schema, label in zip(df["Tokenized_schema"], df["labels"]):
+        schema_tensor = torch.tensor(schema, device=device)
+        padded_schema = torch.nn.functional.pad(schema_tensor, (0, max_length - len(schema)), value=pad_token_id)
+        attention_mask = (padded_schema != pad_token_id).long()
+        label_tensor = torch.tensor(label, device=device)
 
-    Returns:
-        list: A list of dictionaries, each containing "input_ids" and "attention_mask" tensors.
-    """
-    return transform_data(test_df, tokenizer, device, is_train=False)
+        dictionary = {
+            "input_ids": padded_schema,
+            "attention_mask": attention_mask.to(device),
+            "labels": label_tensor
+        }
+        dataset.append(dictionary)
+
+    return dataset
 
 
 def train_model(train_df, test_df):
     model_name = "microsoft/codebert-base" 
     accumulation_steps = 4
-    batch_size = 4
+    batch_size = 8
     learning_rate = 1e-6
     num_epochs = 10
 
@@ -231,22 +175,21 @@ def train_model(train_df, test_df):
     # Initialize tokenizer, model with adapter and classification head
     model, tokenizer = initialize_model(model_name)
 
+    # Tokenize the train and test schemas
+    train_df_with_tokens = tokenize_schemas(train_df, tokenizer)
+    test_df_with_tokens = tokenize_schemas(test_df, tokenizer)
+
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # Tokenize the data
-    train_df_with_tokens = tokenize_schemas(train_df, tokenizer)
-    test_df_with_tokens = tokenize_test_schemas(test_df, tokenizer)
-
     # Transform data into dict
-    train_dataset = transform_train_data(train_df_with_tokens, tokenizer, device)
-    test_dataset = transform_test_data(test_df_with_tokens, tokenizer, device)
+    train_dataset = transform_data(train_df_with_tokens, tokenizer, device)
+    test_dataset = transform_data(test_df_with_tokens, tokenizer, device)
 
     # Set up optimizer
     optimizer = AdamW(model.parameters(), lr=learning_rate)
 
-    
     # Setup the training arguments
     training_args = TrainingArguments(
         report_to="wandb",
@@ -290,6 +233,7 @@ def train_model(train_df, test_df):
 
     # Train the model
     trainer.train()
+    trainer.evaluate()
         
     # Save the adapter
     save_adapter(model)
@@ -313,7 +257,6 @@ def save_adapter(model):
 
 
 def load_model_and_adapter():
-    model_path = "model.pth"
     adapter_path = "./adapter"
 
     # Load the adapter configuration from file
@@ -329,10 +272,6 @@ def load_model_and_adapter():
 
      # Activate the adapter
     model.set_active_adapters(adapter_config["name"])
-
-    # Load the model state dictionary
-    state_dict = torch.load(model_path)
-    model.load_state_dict(state_dict)
 
     return model
 
@@ -452,7 +391,7 @@ def find_definitions_from_graph(graph):
 
 def evaluate_data(test_df, test_ground_truth, model, tokenizer):
     # Tokenize the schema
-    test_df = tokenize_test_schemas(test_df, tokenizer)
+    test_df = tokenize_schemas(test_df, tokenizer)
 
      # Evaluate the model
     model.eval()
