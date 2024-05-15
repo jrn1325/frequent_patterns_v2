@@ -1,6 +1,7 @@
 import json
 import model
 import pandas as pd
+import sys
 
 
 from transformers import AutoTokenizer
@@ -18,7 +19,6 @@ def load_data():
 
 def evaluate_model():
     
-
     # Load the model and adapter
     m = model.load_model_and_adapter()
 
@@ -27,7 +27,6 @@ def evaluate_model():
 
      # Get the testing data
     test_df = pd.read_csv("test_data.csv") 
-    sample_df = test_df[test_df["Filename"] == "img-catapult-psp.json"]
 
     # Get the ground truth
     test_ground_truth = {}
@@ -36,18 +35,22 @@ def evaluate_model():
             test_ground_truth.update(json.loads(line))
 
     # Evaluate the model
-    model.evaluate_data(sample_df, test_ground_truth, m, tokenizer)
+    model.evaluate_data(test_df, test_ground_truth, m, tokenizer)
 
                 
               
 def main():
-    # Tokenize training schemas
-    #model.tokenize_schemas()
-    # Train the model
-    load_data()
-    # Evaluate the model
-    #evaluate_model()
-    #model.test()
+    mode = sys.argv[-1]
+    if mode == "train":
+        # Train the model
+        load_data()
+    elif mode == "test":
+        # Evaluate the model
+        evaluate_model()
+    else:
+        print(f"Error: Unknown mode '{mode}'. Use 'train' or 'test'.")
+        sys.exit(1)
+  
     
 
 
