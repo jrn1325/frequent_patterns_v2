@@ -1,8 +1,6 @@
-import collections
-import io
+
 import itertools
 import json
-import networkx as nx
 import numpy as np
 import os
 import pandas as pd
@@ -162,6 +160,17 @@ def merge_schemas(schema1, schema2):
 
 
 def discover_schema(value):
+    """Determine the structure of the key's value
+
+    Args:
+        value (_type_): JSON key's value. It can be of any type
+
+    Raises:
+        TypeError: Raise an error if the value does not have a common type
+
+    Returns:
+        _type_: object representing the structure of the JSON key's value
+    """
     if isinstance(value, str):
         return {"type": "string"}
     elif isinstance(value, float):
@@ -186,7 +195,7 @@ def discover_schema(value):
 def discover_schema_from_values(values):
     if not values:
         # Handle the case when values is empty
-        return []
+        return {}
     else:
         return reduce(merge_schemas, (discover_schema(v) for v in values))
 
@@ -266,6 +275,14 @@ def create_dataframe(paths_dict):
 
     
 def clean_ref_defn_paths(json_schema): 
+    """Remove keywords associated with JSON Schema that do not exist in JSON documents format
+
+    Args:
+        json_schema (dict): JSON Schema object
+
+    Returns:
+        dict: dictionary of JSON paths without schem keywords
+    """
     ref_defn_paths = defaultdict(set)
 
     # Loop through pairs of referenced definitions and their paths
@@ -436,6 +453,15 @@ def get_ref_defn_of_type_obj(json_schema, ref_defn_paths, paths_to_exclude):
 
 
 def check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, jsonfile_paths):
+    """Check if the paths from JSON Schemas exist in JSON datasets
+
+    Args:
+        cleaned_ref_defn_paths (dict): dictionary of JSON definitions and their paths
+        jsonfile_paths (list): list of paths found in the collection of JSON documents associated with a schema
+
+    Returns:
+        dict: dictionary without paths that don't exist in the collection of JSON documents
+    """
     # Use set intersection to find schema paths that exist in both json file
     filtered_ref_defn_paths = {ref_defn: set(paths) & set(jsonfile_paths) for ref_defn, paths in cleaned_ref_defn_paths.items()}
     return filtered_ref_defn_paths
@@ -707,7 +733,7 @@ def preprocess_data(schemas, filename):
         }
 
         # Write each outer dictionary on a new line in the JSON file
-        with open("train_ground_truth.json", "w") as json_file:
+        with open("test_ground_truth.json", "w") as json_file:
             for key, value in ground_truths_serializable.items():
                 json_file.write(json.dumps({key: value}) + '\n')
 
@@ -718,7 +744,7 @@ def preprocess_data(schemas, filename):
 def prepare_data():
     train_schemas, test_schemas = split_data("/home/jrn1325/schemas", 0.80)
     preprocess_data(train_schemas, filename="train_data.csv")
-    preprocess_data(train_schemas, filename="test_data.csv")
+    preprocess_data(test_schemas, filename="test_data.csv")
 
 
 def main():

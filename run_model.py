@@ -8,31 +8,12 @@ from transformers import AutoTokenizer
 
 
 def load_data():
-    # Get the training data
+    # Get the training data and testing sets
     train_df = pd.read_csv("train_data.csv") 
-    #values_to_filter = ["label-commenter-config-yml.json"]
-    #train_filtered_df = train_df.loc[train_df["Filename"].isin(values_to_filter)]
-
-
-    # Get the testing data
-    #test_df = pd.read_csv("test_data_tokens.csv") 
-    #values_to_filter = ["gitpod-configuration.json"]
-    #test_filtered_df = test_df.loc[test_df["Filename"].isin(values_to_filter)]
-    #test_df = test_df[test_df["Filename"] != "openrpc-json.json"]
-    #values_to_filter = ["electron-builder-configuration-file.json", "plagiarize-me-yaml.json"]
-    #test_filtered_df = test_df.loc[test_df["Filename"].isin(values_to_filter)]
-    '''
-    test_ground_truth = {}
-    # Open the JSON file in read mode
-    with open("test_ground_truth.json", "r") as json_file:
-        # Read each line of the file
-        for line in json_file:
-            # Parse the JSON object in the line and update the loaded_data dictionary
-            test_ground_truth.update(json.loads(line))
-    '''
+    test_df = pd.read_csv("test_data.csv") 
         
     # Train the model
-    model.train_model(train_df)
+    model.train_model(train_df, test_df)
 
 
 def evaluate_model():
