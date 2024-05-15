@@ -1,0 +1,18 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = false
+name = "pip_conf_index_global"
+
+[packages]
+transformers = "*"
+pandas = "*"
+torch = "*"
+wandb = "*"
+adapters = "*"
+scikit-learn = "*"
+accelerate = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.9"
