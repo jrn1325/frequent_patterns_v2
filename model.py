@@ -2,7 +2,7 @@ import ast
 import collections
 import json
 import math
-import networkx as nx
+#import networkx as nx
 import numpy as np
 import pandas as pd
 import sys
@@ -19,7 +19,7 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 from transformers import AutoConfig, AutoTokenizer, get_scheduler, TrainingArguments, EvalPrediction
 
 
@@ -133,46 +133,87 @@ def merge_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer):
         return [tokenizer.bos_token_id] + tokenized_schema1.tolist() + newline_token + tokenized_schema2.tolist() + [tokenizer.eos_token_id]
 
 
-def transform_data(train_df, tokenizer):
-    # The transformers model expects the target class column to be named "labels"
-    train_df = train_df.rename(columns={"Label": "labels"})
+def transform_data(df, tokenizer, device, is_train=True):
+    """
+    Transforms the input DataFrame into a format suitable for the transformer model.
 
-    # Get the maximum length of tokenized schemas
-    max_length = max(len(schema) for schema in train_df["Tokenized_schema"])
+    Args:
+        df (pd.DataFrame): The input DataFrame with column "Tokenized_schema". For training, it also includes "Label".
+        tokenizer (PreTrainedTokenizer): The tokenizer used for processing text data.
+        device (torch.device): The device (CPU or GPU) to which tensors should be moved.
+        is_train (bool): Whether the input DataFrame is for training or testing.
 
-    # Create an empty list to store padded schemas
-    padded_schemas = []
-    for schema in train_df["Tokenized_schema"]:
-        # Pad each schema to the maximum length
-        padded_schema = torch.nn.functional.pad(torch.tensor(schema), (0, max_length - len(schema)), value=tokenizer.pad_token_id)
-        padded_schemas.append(padded_schema)
+    Returns:
+        list: A list of dictionaries, each containing "input_ids", "attention_mask", and "labels" tensors (for training).
+              For testing, the dictionaries contain only "input_ids" and "attention_mask".
+    """
+    if is_train:
+        df = df.rename(columns={"Label": "labels"})
 
-    # Stack the padded schemas into a tensor
-    input_ids = torch.stack(padded_schemas)
+    max_length = max(len(schema) for schema in df["Tokenized_schema"])
+    pad_token_id = tokenizer.pad_token_id
 
-    # Create an empty list to store attention masks
-    attention_masks = []
-    for padded_schema in padded_schemas:
-        # Create attention mask based on the presence of tokens
-        attention_mask = torch.where(padded_schema != tokenizer.pad_token_id, torch.tensor(1), torch.tensor(0))
-        attention_masks.append(attention_mask)
+    dataset = []
+    for item in df.itertuples(index=False):
+        schema = item.Tokenized_schema
+        schema_tensor = torch.tensor(schema)
+        padded_schema = torch.nn.functional.pad(schema_tensor, (0, max_length - len(schema)), value=pad_token_id)
+        attention_mask = (padded_schema != pad_token_id).long()
 
-    # Stack the attention masks into a tensor
-    attention_masks = torch.stack(attention_masks)
+        if is_train:
+            label = item.labels
+            label_tensor = torch.tensor(label)
+            dictionary = {
+                "input_ids": padded_schema.to(device),
+                "attention_mask": attention_mask.to(device),
+                "labels": label_tensor.to(device)
+            }
+        else:
+            dictionary = {
+                "input_ids": padded_schema.to(device),
+                "attention_mask": attention_mask.to(device)
+            }
+        dataset.append(dictionary)
 
-    # Get the labels
-    labels = torch.tensor(train_df["labels"].values)
-
-    train_data_dict = [{"input_ids": input_id, "attention_mask": mask, "labels": label} for input_id, mask, label in zip(input_ids, attention_masks, labels)]
-    return train_data_dict
+    return dataset
 
 
-def train_model(train_df):
-    model_name = "microsoft/codebert-base"
+def transform_train_data(train_df, tokenizer, device):
+    """
+    Transforms the input training DataFrame into a format suitable for a transformer model.
+
+    Args:
+        train_df (pd.DataFrame): The training DataFrame with columns "Tokenized_schema" and "Label".
+        tokenizer (PreTrainedTokenizer): The tokenizer used for processing text data.
+        device (torch.device): The device (CPU or GPU) to which tensors should be moved.
+
+    Returns:
+        list: A list of dictionaries, each containing "input_ids", "attention_mask", and "labels" tensors.
+    """
+    return transform_data(train_df, tokenizer, device, is_train=True)
+
+
+def transform_test_data(test_df, tokenizer, device):
+    """
+    Transforms the input test DataFrame into a format suitable for a transformer model.
+
+    Args:
+        test_df (pd.DataFrame): The test DataFrame with the column "Tokenized_schema".
+        tokenizer (PreTrainedTokenizer): The tokenizer used for processing text data.
+        device (torch.device): The device (CPU or GPU) to which tensors should be moved.
+
+    Returns:
+        list: A list of dictionaries, each containing "input_ids" and "attention_mask" tensors.
+    """
+    return transform_data(test_df, tokenizer, device, is_train=False)
+
+
+def train_model(train_df, test_df):
+    model_name = "microsoft/codebert-base" 
     accumulation_steps = 4
-    batch_size = 16
+    batch_size = 4
     learning_rate = 1e-6
-    num_epochs = 25
+    num_epochs = 10
 
     # Start a new wandb run to track this script
     wandb.init(
@@ -190,19 +231,22 @@ def train_model(train_df):
     # Initialize tokenizer, model with adapter and classification head
     model, tokenizer = initialize_model(model_name)
 
-    # Tokenize the data
-    train_df_with_tokens = tokenize_schemas(train_df, tokenizer)
-
-    # Transform data into dict
-    train_data_dict = transform_data(train_df_with_tokens, tokenizer)
-
-    # Set up optimizer
-    optimizer = AdamW(model.parameters(), lr=learning_rate)
-
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
+    # Tokenize the data
+    train_df_with_tokens = tokenize_schemas(train_df, tokenizer)
+    test_df_with_tokens = tokenize_test_schemas(test_df, tokenizer)
+
+    # Transform data into dict
+    train_dataset = transform_train_data(train_df_with_tokens, tokenizer, device)
+    test_dataset = transform_test_data(test_df_with_tokens, tokenizer, device)
+
+    # Set up optimizer
+    optimizer = AdamW(model.parameters(), lr=learning_rate)
+
+    
     # Setup the training arguments
     training_args = TrainingArguments(
         report_to="wandb",
@@ -217,10 +261,11 @@ def train_model(train_df):
         overwrite_output_dir=True,
         # The next line is important to ensure the dataset labels are properly passed to the model
         remove_unused_columns=False,
+        dataloader_pin_memory=False,
     )
 
      # Calculate total steps
-    total_steps = len(train_data_dict) // training_args.per_device_train_batch_size * training_args.num_train_epochs
+    total_steps = len(train_dataset) // training_args.per_device_train_batch_size * training_args.num_train_epochs
 
     # Define warm-up steps
     warmup_steps = int(0.1 * total_steps)
@@ -237,8 +282,8 @@ def train_model(train_df):
     trainer = AdapterTrainer(
         model=model,
         args=training_args,
-        train_dataset=train_data_dict,
-        eval_dataset=train_data_dict,
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,
         compute_metrics=compute_accuracy,
         optimizers=(optimizer, lr_scheduler),
     )
@@ -295,7 +340,6 @@ def load_model_and_adapter():
 def get_predicted_label(model, tokenized_pair):
     outputs = model(input_ids=torch.tensor([tokenized_pair]), attention_mask=torch.tensor([[1] * len(tokenized_pair)]))
     logits = outputs.logits
-    print(outputs.logits)
     predictions = torch.argmax(logits, dim=1)
     return int(predictions[0])
 
