@@ -1,19 +1,29 @@
-
+import collections
+import io
 import itertools
 import json
+import networkx as nx
 import numpy as np
 import os
 import pandas as pd
 import random
 import sys
+import torch
 import tqdm
 import warnings
 
-
-from collections import defaultdict
+from adapters import AutoAdapterModel
+from collections import Counter, defaultdict
 from copy import copy, deepcopy
 from functools import reduce
+from scipy.spatial.distance import cosine
 from sklearn.model_selection import GroupShuffleSplit
+from transformers import AutoTokenizer
+
+model_name = "microsoft/codebert-base" 
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoAdapterModel.from_pretrained(model_name)
+
 
 
 warnings.filterwarnings("ignore")
@@ -21,6 +31,8 @@ sys.setrecursionlimit(30000) # I had to increase the recursion limit because of 
 
 # Create constant variables
 DISTINCT_SUBKEYS_UPPER_BOUND = 1000
+RANDOM_VALUE = 101
+TRAIN_RATIO = 0.80
 REF_KEYWORD = "$ref"
 ITEMS_KEYWORD = "items"
 COMPLEX_PROPERTIES_KEYWORD = {"patternProperties", "additionalProperties"}
@@ -28,8 +40,9 @@ DEFINITION_KEYS = {"$defs", "definitions"}
 JSON_SCHEMA_KEYWORDS = {"properties", "allOf", "oneOf", "anyOf"}
 JSON_SUBSCHEMA_KEYWORDS = {"allOf", "oneOf", "anyOf"}
 
-SCHEMA_FOLDER = "/home/jrn1325/schemas"
-JSON_FOLDER = "/home/jrn1325/jsons"
+SCHEMA_FOLDER = "schemas"
+JSON_FOLDER = "jsons"
+
 
 
 
@@ -96,7 +109,9 @@ def get_paths_and_values(json_schema, filename):
         dict: dictionary of all the paths and values
     """
     paths_dict = defaultdict(set)
-    prefix_paths_dict = defaultdict(set)
+    #prefix_paths_dict = defaultdict(set)
+    prefix_paths_dict = defaultdict(list)
+
 
     with open(filename, 'r') as f:
         for line in f:
@@ -111,7 +126,9 @@ def get_paths_and_values(json_schema, filename):
                     
                     if len(path) > 1:
                         prefix = path[:-1]
-                        prefix_paths_dict.setdefault(prefix, set()).add(path)
+                        #prefix_paths_dict.setdefault(prefix, set()).add(path)
+                        prefix_paths_dict.setdefault(prefix, []).append(path)
+
                     
                     if isinstance(value, dict) and len(value) > 0:
                         value = json.dumps(value)
@@ -142,35 +159,58 @@ def match_properties(schema, document):
 
 
 def merge_schemas(schema1, schema2):
+    """
+    Merges two JSON schemas recursively.
+
+    Args:
+        schema1 (dict): The first JSON schema.
+        schema2 (dict): The second JSON schema.
+
+    Returns:
+        dict: The merged JSON schema.
+    """
+    # Check if both schemas have the same type
     if schema1.get("type") == schema2.get("type"):
+        # Create a deep copy of the first schema to avoid modifying the original
         new_schema = deepcopy(schema1)
+        
+        # If both schemas are objects, merge their properties
         if schema1.get("type") == "object":
-            for prop in schema2["properties"]:
-                if prop in new_schema["properties"]:
-                    new_schema["properties"][prop] = merge_schemas(
-                        new_schema["properties"][prop], schema2["properties"][prop]
-                    )
-                else:
-                    new_schema["properties"][prop] = schema2["properties"][prop]
+            if "properties" in schema2:  # Ensure schema2 has properties to merge
+                for prop, value in schema2["properties"].items():
+                    if prop in new_schema["properties"]:
+                        # Recursively merge properties
+                        new_schema["properties"][prop] = merge_schemas(new_schema["properties"][prop], value)
+                    else:
+                        # Add the new property
+                        new_schema["properties"][prop] = value
+        
+        # If both schemas are arrays, merge their items
         elif schema1.get("type") == "array":
-            new_schema["items"] = merge_schemas(schema1["items"], schema2["items"])
+            if "items" in schema2:  # Ensure schema2 has items to merge
+                new_schema["items"] = merge_schemas(schema1["items"], schema2["items"])
+        
         return new_schema
+    
+    # If schemas have different types, return a oneOf schema
     else:
         return {"oneOf": [schema1, schema2]}
 
 
 def discover_schema(value):
-    """Determine the structure of the key's value
+    """
+    Determine the structure of the JSON key's value.
 
     Args:
-        value (_type_): JSON key's value. It can be of any type
+        value: The value of the JSON key. It can be of any type.
 
     Raises:
-        TypeError: Raise an error if the value does not have a common type
+        TypeError: Raised if the value does not have a recognized type.
 
     Returns:
-        _type_: object representing the structure of the JSON key's value
+        dict: An object representing the structure of the JSON key's value.
     """
+
     if isinstance(value, str):
         return {"type": "string"}
     elif isinstance(value, float):
@@ -189,15 +229,24 @@ def discover_schema(value):
     elif value is None:
         return {"type": "null"}
     else:
-        raise TypeError
+        raise TypeError(f"Unsupported value type: {type(value)}")
 
 
 def discover_schema_from_values(values):
+    """
+    Determine the schema for a list of values.
+
+    Args:
+        values (list): The list of values to determine the schema for.
+
+    Returns:
+        dict: The schema representing the structure of the list of values.
+    """
     if not values:
-        # Handle the case when values is empty
-        return {}
+        return {"type": "null"}
     else:
         return reduce(merge_schemas, (discover_schema(v) for v in values))
+
 
 '''
 def create_dataframe(prefix_paths_dict):
@@ -214,14 +263,14 @@ def create_dataframe(prefix_paths_dict):
 
     # Iterate over paths under the current prefix to get all the unique nested keys
     for prefix, path_list in prefix_paths_dict.items():
-        distinct_subkeys = set()
-        #distinct_subkeys = []
+        #distinct_subkeys = set()
+        distinct_subkeys = []
         for path in path_list:
             if path[-1] == '*':
                 continue
 
-            #distinct_subkeys.append(path[-1])
-            distinct_subkeys.add(path[-1])
+            distinct_subkeys.append(path[-1])
+            #distinct_subkeys.add(path[-1])
 
             if len(distinct_subkeys) > DISTINCT_SUBKEYS_UPPER_BOUND:
                 break
@@ -230,10 +279,10 @@ def create_dataframe(prefix_paths_dict):
             # print(f"No distinct subkeys for path: {prefix}")
             continue
 
-        #if len(distinct_subkeys) == 1 and '*' in distinct_subkeys:
-        #    continue
+        if len(distinct_subkeys) == 1 and '*' in distinct_subkeys:
+            continue
 
-        #distinct_subkeys = get_modes(distinct_subkeys, nested_keys)
+        distinct_subkeys = get_modes(distinct_subkeys)
         distinct_subkeys = sorted(list(distinct_subkeys))
         
         # Construct row data for DataFrame
@@ -255,20 +304,15 @@ def create_dataframe(paths_dict):
     Returns:
         DataFrame: DataFrame containing schema embeddings.
     """
-    #model = AutoModel.from_pretrained("microsoft/codebert-base")
-    #tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
 
     df_data = []
     
     for path, values in paths_dict.items():
         values = [json.loads(v) for v in values]
         schema = discover_schema_from_values(values)
-        #embeddings = get_codebert_embedding(json.dumps(schema), model, tokenizer)
-        #embedding_columns = [f"Embedding_{i+1}" for i in range(len(embeddings))]
-        #row_data.extend(embeddings)
         row_data = [path, schema] 
         df_data.append(row_data)
-    columns = ["Path", "Schema"]# + embedding_columns
+    columns = ["Path", "Schema"]
     df = pd.DataFrame(df_data, columns=columns)
     df_sorted = df.sort_values(by="Path")
     return df_sorted
@@ -394,6 +438,7 @@ def get_ref_defn_of_type_obj(json_schema, ref_defn_paths, paths_to_exclude):
     Args:
         json_schema (dict): json schema object
         ref_defn_paths (dict): dictionary of referenced definitions 
+        paths_to_exclude (list): paths to excludes from the json datasets
     Returns:
         dict: filtered dictionary
     """
@@ -500,68 +545,165 @@ def print_items(dictionary):
     print()
 
 
-def get_samples(train_df, train_ground_truth_dict):
+def calculate_cosine_distance(a_df, all_paths, all_good_pairs):
+    """
+    Calculate the cosine distances between the embeddings of all paths.
+
+    Args:
+        a_df (pd.DataFrame): DataFrame containing the paths and their corresponding schemas.
+        all_paths (list): List of all paths.
+        all_good_pairs (set): Set of good pairs of paths.
+
+    Returns:
+        list: List of tuples containing path pairs and their cosine distance, sorted in ascending order of distance.
+    """
+
+    # Calculate embeddings for all paths
+    path_embeddings = {}
+    for path in all_paths:
+        # Get the schema associated with the current path
+        schema = a_df[a_df["Path"] == path].iloc[0]["Schema"]
+
+        # Tokenize the schema
+        inputs = tokenizer(json.dumps(schema), return_tensors="pt", truncation=True, padding=True, max_length=512)
+
+        # Calculate the embedding without computing gradients
+        with torch.no_grad():
+            outputs = model(**inputs)
+    
+        # Calculate the mean of the last hidden state to get the embedding
+        embedding = outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
+        path_embeddings[path] = embedding
+
+    # Normalize embeddings
+    for path in path_embeddings:
+        path_embeddings[path] = path_embeddings[path] / np.linalg.norm(path_embeddings[path])
+
+    # Calculate cosine distances for all possible pairs
+    all_pairs = list(itertools.combinations(all_paths, 2))
+    cosine_distances = []
+    for path1, path2 in all_pairs:
+        # Skip pairs that are in the set of good pairs
+        if (path1, path2) not in all_good_pairs and (path2, path1) not in all_good_pairs:
+            distance = cosine(path_embeddings[path1], path_embeddings[path2])
+            cosine_distances.append(((path1, path2), distance))
+
+    # Sort pairs by their cosine distance in ascending order
+    cosine_distances.sort(key=lambda x: x[1])
+    return cosine_distances
+
+
+def get_samples(df, filename, ground_truth_dict):
+    """
+    Generate labeled samples of good and bad pairs from the DataFrame based on ground truth definitions.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing paths and schemas.
+        filename (str): Filename to save the resulting DataFrame.
+        ground_truth_dict (dict): Dictionary with schema names as keys and frequent reference definition paths as values.
+    """
+
     frames = []
 
-    for schema, frequent_ref_defn_paths in train_ground_truth_dict.items():
+    # Iterate over each schema and its corresponding frequent referenced definition paths
+    for schema, frequent_ref_defn_paths in ground_truth_dict.items():
         good_pairs = set()
         all_good_pairs = set()
         bad_pairs = set()
         ref_path_dict = {}
 
         # Get the DataFrame for the current schema
-        a_train_df = train_df[train_df["Filename"] == schema]
+        a_df = df[df["Filename"] == schema]
 
-        all_paths = list(a_train_df["Path"])
+        # List of all paths in the current schema
+        all_paths = list(a_df["Path"])
 
-        # Create pair combinations of paths (good pairs)
+        # Generate good pairs from frequent referenced definition paths
         for ref_defn, paths in frequent_ref_defn_paths.items():
-            
+            # Generate all possible pairs and limited pairs (up to 1000)
             pairs_for_paths = itertools.combinations(paths, 2)
             all_good_pairs.update(pairs_for_paths)
             limited_pairs = itertools.islice(itertools.combinations(paths, 2), 1000)
             good_pairs.update(limited_pairs)
 
-            # Create a dictionary with path as the key and definition as the value
+            # Map paths to their reference definition
             for path in paths:
                 ref_path_dict[path] = ref_defn
 
-        # Check if there are more good pairs than bad pairs
-        if len(ref_path_dict.keys()) > len(all_paths) / 2:
-            diff = set(all_paths).difference(set(ref_path_dict.keys()))
-            pairs_for_paths = itertools.combinations(diff, 2)
+        # Calculate cosine distances for all pairs
+        cosine_distances = calculate_cosine_distance(a_df, all_paths, all_good_pairs)
+        
+        # Select pairs with the smallest distances as bad pairs
+        for pair, distance in cosine_distances:
+            if len(bad_pairs) < len(good_pairs):
+                bad_pairs.add(pair)
+            else:
+                break
 
-            # Create pair combinations of paths (bad pairs)
-            for pair in pairs_for_paths:
-                if len(bad_pairs) < len(good_pairs):  # Limit the number of bad pairs
-                    if pair not in all_good_pairs:
-                        bad_pairs.add(pair)
-                else:
-                    break
-        else:
-            # Set a seed to reproduce the results
-            random.seed(101)
+        # Label data and append to frames
+        new_df = label_samples(a_df, good_pairs, bad_pairs)
+        frames.append(new_df)
 
-            # Create pairs of paths that should not be grouped together (bad pairs)
-            for i in range(len(good_pairs)):
-                path1, path2 = random.sample(all_paths, 2)
-                while (path1, path2) in all_good_pairs or \
-                    (path2, path1) in all_good_pairs or \
-                    (path1, path2) in bad_pairs or \
-                    (path2, path1) in bad_pairs:    
-                    path1, path2 = random.sample(all_paths, 2)
-                bad_pairs.add((path1, path2))
-
-        # Label training data and append to frames
-        df = label_samples(a_train_df, good_pairs, bad_pairs)
-        frames.append(df)
-
-    # Merge training data and save to CSV
+    # Merge data and save to parquet
     merged_df = pd.concat(frames, ignore_index=True)
-    merged_df.to_csv("train_data.csv", index=False)
+    merged_df.to_parquet(filename, index=False)
+
+
+def get_all_test_data(df, filename, ground_truth_dict):
+    """
+    Generate labeled good and bad pairs for all test data based on ground truth definitions.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing paths and schemas.
+        filename (str): Filename to save the resulting DataFrame.
+        ground_truth_dict (dict): Dictionary with schema names as keys and frequent reference definition paths as values.
+    """
+    frames = []
+
+    # Iterate over each schema and its corresponding frequent referenced definition paths
+    for schema, frequent_ref_defn_paths in ground_truth_dict.items():
+        good_pairs = set()
+        bad_pairs = set()
+
+        # Get the DataFrame for the current schema
+        a_df = df[df["Filename"] == schema]
+
+        # List of all paths in the current schema
+        all_paths = list(a_df["Path"])
+
+        # Generate good pairs from frequent referenced definition paths
+        for ref_defn, paths in frequent_ref_defn_paths.items():
+            pairs_for_paths = itertools.combinations(paths, 2)
+            good_pairs.update(pairs_for_paths)
+
+        # Generate bad pairs from all possible path combinations that are not in good pairs
+        pairs_for_paths = itertools.combinations(all_paths, 2)
+        for pair in pairs_for_paths:
+            if pair not in good_pairs:
+                bad_pairs.add(pair)
+           
+        # Label data and append to frames
+        new_df = label_samples(a_df, good_pairs, bad_pairs)
+        frames.append(new_df)
+
+    # Merge all the DataFrames and save to a parquet file
+    merged_df = pd.concat(frames, ignore_index=True)
+    merged_df.to_parquet(filename, index=False)
 
 
 def label_samples(train_df, good_pairs, bad_pairs):
+    """
+    Label the samples in the training DataFrame based on good and bad pairs.
+
+    Args:
+        train_df (pd.DataFrame): DataFrame containing paths, schemas, and filenames.
+        good_pairs (set): Set of paths that should be groupe together.
+        bad_pairs (set): Set of paths that should not be grouped together.
+
+    Returns:
+        pd.DataFrame: DataFrame containing labeled pairs, schemas, and filenames.
+    """
+
     # Create lists to store data
     pairs = []
     labels = []
@@ -569,50 +711,68 @@ def label_samples(train_df, good_pairs, bad_pairs):
     schemas2 = []  
     filenames = []  
 
-    # Add good pairs, label them 1 (positive), get their schemas and filename from the original dataframe
+    # Process good pairs: label them as 1 (positive)
     for pair in good_pairs:
         pairs.append(pair)
         labels.append(1)
 
-        # Extract matching rows from the DataFrame and append schemas and filename for both paths
+        # Extract schemas and filename for both paths in the pair
         path1_row = train_df[train_df["Path"] == pair[0]].iloc[0]
         path2_row = train_df[train_df["Path"] == pair[1]].iloc[0]
+        filenames.append(path1_row["Filename"])
         schemas1.append(path1_row["Schema"])
         schemas2.append(path2_row["Schema"])
-        filenames.append(path1_row["Filename"])
+        
 
-    # Add bad pairs, label them 0 (negative), get their schemas and filename from the original dataframe
+    # Process bad pairs: label them as 0 (negative)
     for pair in bad_pairs:
         pairs.append(pair)
         labels.append(0)
         
-        # Extract matching rows from the DataFrame and append schemas and filename for both paths
+        # Extract schemas and filename for both paths in the pair
         path1_row = train_df[train_df["Path"] == pair[0]].iloc[0]
         path2_row = train_df[train_df["Path"] == pair[1]].iloc[0]
+        filenames.append(path1_row["Filename"])
         schemas1.append(path1_row["Schema"])
         schemas2.append(path2_row["Schema"])
-        filenames.append(path1_row["Filename"])
+        
 
-    # Create a new DataFrame containing the pairs, labels, schemas1, schemas2, and filenames
+    # Create a new DataFrame containing the labeled pairs, schemas, and filenames
     labeled_df = pd.DataFrame({"Pairs": pairs,
                                "Label": labels,
+                               "Filename": filenames,
                                "Schema1": schemas1,
-                               "Schema2": schemas2,
-                               "Filename": filenames})
+                               "Schema2": schemas2
+                               })
 
     return labeled_df
 
 
-def split_data(schema_folder, train_ratio):
-    schemas = os.listdir(schema_folder)
-    gss = GroupShuffleSplit(train_size=train_ratio, random_state=42)
+def split_data():
+    """
+    Split the list of schemas into training and testing sets.
+
+    Returns:
+        tuple: A tuple containing the training set and testing set.
+    """
+
+    # Get the list of schema filenames
+    schemas = os.listdir(SCHEMA_FOLDER)
+
+    # Use GroupShuffleSplit to split the schemas into train and test sets
+    gss = GroupShuffleSplit(train_size=TRAIN_RATIO, random_state=RANDOM_VALUE)
+
+    # Make sure that schema names with the same first 3 letters are grouped together because they are likely from the same source
     train_idx, test_idx = next(gss.split(schemas, groups=[s[:3] for s in schemas]))
+
+    # Create lists of filenames for the train and test sets
     train_set = [schemas[i] for i in train_idx]
     test_set = [schemas[i] for i in test_idx]
+
     return train_set, test_set
 
 
-def preprocess_data(schemas, filename):
+def preprocess_data(schemas, filename, ground_truth_file):
     """Process all the data from the JSON files to get their embeddings
 
     Args:
@@ -626,17 +786,9 @@ def preprocess_data(schemas, filename):
     ground_truths = defaultdict()
     
     for schema in tqdm.tqdm(schemas, position=1, leave=False, total=len(schemas)):
+
         schema_path = os.path.join(SCHEMA_FOLDER, schema)
         if os.path.exists(schema_path):
-            # Create a file path for saving the distance matrix
-            #filename = os.path.splitext(schema)[0] + ".parquet"
-            #filepath = os.path.join("distance_matrices_schemas", filename)
-
-            # Check if the distance matrix file already exists
-            #if os.path.isfile(filepath):
-            #    continue
-            #if schema != "lgtm-yml.json" or schema != "label-commenter-config-yml.json":
-            #    continue
 
             if schema == "grunt-clean-task.json" or schema == "swagger-api-2-0.json":
                 continue
@@ -705,6 +857,7 @@ def preprocess_data(schemas, filename):
                             #schemas_with_frequent_definitions.add(schema)
                             #count_4 += len(frequent_ref_defn_paths.keys())
 
+                            print(f"Creating a dataframe for {schema}...")
                             df = create_dataframe(paths_dict)
                             #df = create_dataframe(prefix_paths_dict)
 
@@ -720,38 +873,35 @@ def preprocess_data(schemas, filename):
                                 frames.append(filtered_df)
                                 ground_truths[schema] = frequent_ref_defn_paths
 
+
+    # Merge the dataframes of the datasets
     merged_df = pd.concat(frames, ignore_index=True)   
 
-    if filename == "train_data.csv":
-        # Get the good and bad pair samples for the training data
-        get_samples(merged_df, ground_truths)      
-    else:       
-        # Convert sets to lists in the inner dictionaries
-        ground_truths_serializable = {
-            key: {subkey: list(values) if isinstance(values, set) else values for subkey, values in subdict.items()}
-            for key, subdict in ground_truths.items()
-        }
+    # Sample the good and bad pair samples from the data
+    get_samples(merged_df, filename, ground_truths) 
 
-        # Write each outer dictionary on a new line in the JSON file
-        with open("test_ground_truth.json", "w") as json_file:
-            for key, value in ground_truths_serializable.items():
-                json_file.write(json.dumps({key: value}) + '\n')
+    if filename == "test_data.csv":   
+        get_all_test_data(merged_df, "original_test_data.csv", ground_truths) 
 
-        # Save DataFrame to CSV file
-        merged_df.to_csv("test_data.csv")
+    # Convert sets to lists in the inner dictionaries
+    ground_truths_serializable = {
+        key: {subkey: list(values) if isinstance(values, set) else values for subkey, values in subdict.items()}
+        for key, subdict in ground_truths.items()
+    }
 
-
-def prepare_data():
-    train_schemas, test_schemas = split_data("/home/jrn1325/schemas", 0.80)
-    preprocess_data(train_schemas, filename="train_data.csv")
-    preprocess_data(test_schemas, filename="test_data.csv")
+    # Write each outer dictionary on a new line in the JSON file
+    with open(ground_truth_file, "w") as json_file:
+        for key, value in ground_truths_serializable.items():
+            json_file.write(json.dumps({key: value}) + '\n')
 
 
 def main():
-    prepare_data()
+    train_schemas, test_schemas = split_data()
+    preprocess_data(train_schemas, filename="train_data.csv", ground_truth_file="train_ground_truth.json")
+    preprocess_data(test_schemas, filename="test_data.csv", ground_truth_file="test_ground_truth.json")
     
     
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
