@@ -45,6 +45,7 @@ JSON_SUBSCHEMA_KEYWORDS = {"allOf", "oneOf", "anyOf"}
 
 SCHEMA_FOLDER = "schemas"
 JSON_FOLDER = "jsons"
+MAX_TOK_LEN = 512
 
 
 
@@ -252,6 +253,20 @@ def discover_schema_from_values(values):
         return reduce(merge_schemas, (discover_schema(v) for v in values))
 
 
+def tokenize_schema(schema):
+    """Tokenize schema.
+
+    Args:
+        schema (dict): DataFrame containing pairs, labels, filenames, and schemas of each path in pair
+
+    Returns:
+        torch.tensor: tokenized schema
+    """
+
+    # Tokenize the schema, removing the first and last tokens
+    tokenized_schema = tokenizer(schema, return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True).to(device)
+    return tokenized_schema
+
 '''
 def create_dataframe(prefix_paths_dict):
     """Create a DataFrame of paths, distinct subkeys, and numerical representations using FastText embeddings.
@@ -306,7 +321,7 @@ def create_dataframe(paths_dict):
         paths_dict (dict): Dictionary of paths and their values.
 
     Returns:
-        DataFrame: DataFrame containing schema embeddings.
+        pd.DataFrame: DataFrame with tokenized schema added.
     """
 
     df_data = []
@@ -314,9 +329,10 @@ def create_dataframe(paths_dict):
     for path, values in paths_dict.items():
         values = [json.loads(v) for v in values]
         schema = discover_schema_from_values(values)
-        row_data = [path, schema] 
+        tokenized_schema = tokenize_schema(json.dumps(schema))
+        row_data = [path, tokenized_schema] 
         df_data.append(row_data)
-    columns = ["Path", "Schema"]
+    columns = ["Path", "Tokenized_schema"]
     df = pd.DataFrame(df_data, columns=columns)
     df_sorted = df.sort_values(by="Path")
     return df_sorted
@@ -549,35 +565,28 @@ def print_items(dictionary):
     print()
 
 
-def calculate_cosine_distance(df, paths, all_good_pairs, batch_size=8):
+def calculate_embeddings(df):
     """
-    Calculate the cosine distances between the embeddings of all paths.
+    Calculate the embeddings for each path.
 
     Args:
         df (pd.DataFrame): DataFrame containing the paths and their corresponding schemas.
-        paths (list): List of all paths.
-        all_good_pairs (set): Set of good pairs of paths.
-        tokenizer: The tokenizer used for tokenizing schemas.
-        model: The pre-trained model used for generating embeddings.
-        device: The device (CPU or GPU) on which computations are performed.
-        batch_size (int): Size of the batches for processing.
 
     Returns:
-        list: List of tuples containing path pairs and their cosine distance, sorted in ascending order of distance.
+        dict: Dictionary containing paths and their corresponding embeddings.
     """
     
-    path_embeddings = {}
-    path_to_schema = {path: json.dumps(df[df["Path"] == path].iloc[0]["Schema"]) for path in paths}
+    schema_embeddings = {}
 
+    # Process paths and calculate embeddings
+    for index, row in df.iterrows():
+        inputs = row["Tokenized_schema"]
+        bad_path = row["Path"]
 
-    # Process paths in batches
-    for i in range(0, len(paths), batch_size):
-        batch_paths = paths[i:i + batch_size]
-        batch_schemas = [path_to_schema[path] for path in batch_paths]
-
-        # Tokenize the batch of schemas
-        inputs = tokenizer(batch_schemas, return_tensors="pt", truncation=True, padding=True, max_length=512).to(device)
-
+        # Move inputs to the device
+        for key in inputs:
+            inputs[key] = inputs[key].to(device)
+        
         # Calculate embeddings without computing gradients
         with torch.no_grad():
             outputs = model(**inputs)
@@ -585,23 +594,36 @@ def calculate_cosine_distance(df, paths, all_good_pairs, batch_size=8):
         # Calculate the mean of the last hidden state to get the embeddings
         embeddings = outputs.last_hidden_state.mean(dim=1)
         
-
         # Store the embeddings in the dictionary
-        for j, path in enumerate(batch_paths):
-            path_embeddings[path] = embeddings[j].cpu()
+        schema_embeddings[bad_path] = embeddings.squeeze().cpu() 
+    
+    return schema_embeddings
 
+
+def calculate_cosine_distance(schema_embeddings, all_good_pairs):
+    """
+    Calculate the cosine distances between the embeddings of all paths.
+
+    Args:
+        schema_embeddings (dict): Dictionary containing paths and their corresponding embeddings.
+        all_good_pairs (set): Set of good pairs of paths.
+
+    Returns:
+        list: List of tuples containing path pairs and their cosine distance, sorted in ascending order of distance.
+    """
+    
     # Convert embeddings to a tensor
-    paths_list = list(path_embeddings.keys())
-    embeddings_tensor = torch.stack([path_embeddings[path] for path in paths_list]).to(device)
+    paths_list = list(schema_embeddings.keys())
+    embeddings_tensor = torch.stack([schema_embeddings[path] for path in paths_list])
 
     # Normalize embeddings
     normalized_embeddings = normalize(embeddings_tensor, p=2, dim=1)
 
     # Calculate cosine distances for all possible pairs
-    all_bad_pairs = list(itertools.combinations(range(len(paths_list)), 2))
+    all_pairs = list(itertools.combinations(range(len(paths_list)), 2))
     cosine_distances = []
 
-    for path1_idx, path2_idx in all_bad_pairs:
+    for path1_idx, path2_idx in all_pairs:
         path1 = paths_list[path1_idx]
         path2 = paths_list[path2_idx]
 
@@ -653,8 +675,12 @@ def get_samples(df, frequent_ref_defn_paths):
     bad_paths = list(set(paths) - set(ref_path_dict.keys()))
 
     if bad_paths:
+        # Filter the DataFrame for bad paths
+        filtered_df = df[df["Path"].isin(bad_paths)]
+        # Calculate the embeddings of the tokenized schema
+        schema_embeddings = calculate_embeddings(filtered_df)
         # Calculate cosine distances for all pairs
-        cosine_distances = calculate_cosine_distance(df, bad_paths, all_good_pairs)
+        cosine_distances = calculate_cosine_distance(schema_embeddings, all_good_pairs)
         
         # Select pairs with the smallest distances as bad pairs
         for pair, distance in cosine_distances:
@@ -668,13 +694,12 @@ def get_samples(df, frequent_ref_defn_paths):
     return labeled_df
 
 
-def get_test_data(df, paths, frequent_ref_defn_paths):
+def generate_pairs(df, frequent_ref_defn_paths):
     """
     Generate labeled good and bad pairs for all test data based on ground truth definitions.
 
     Args:
         df (pd.DataFrame): DataFrame containing paths and schemas.
-        paths (list): List of all paths not in referenced definitions
         frequent_ref_defn_paths (dict): Dictionary of frequent referenced definition and their paths.
     
     Return
@@ -712,14 +737,14 @@ def label_samples(df, good_pairs, bad_pairs):
         bad_pairs (set): Set of paths that should not be grouped together.
 
     Returns:
-        pd.DataFrame: DataFrame containing labeled pairs, schemas, and filenames.
+        pd.DataFrame: DataFrame containing labeled pairs, tokenized schemas, and filenames.
     """
 
     # Create lists to store data
     pairs = []
     labels = []
-    schemas1 = [] 
-    schemas2 = []  
+    tokenized_schemas1 = [] 
+    tokenized_schemas2 = []  
     filenames = []  
 
     # Process good pairs: label them as 1 (positive)
@@ -731,8 +756,8 @@ def label_samples(df, good_pairs, bad_pairs):
         path1_row = df[df["Path"] == pair[0]].iloc[0]
         path2_row = df[df["Path"] == pair[1]].iloc[0]
         filenames.append(path1_row["Filename"])
-        schemas1.append(path1_row["Schema"])
-        schemas2.append(path2_row["Schema"])
+        tokenized_schemas1.append(path1_row["Tokenized_schema"])
+        tokenized_schemas2.append(path2_row["Tokenized_schema"])
         
 
     # Process bad pairs: label them as 0 (negative)
@@ -744,16 +769,16 @@ def label_samples(df, good_pairs, bad_pairs):
         path1_row = df[df["Path"] == pair[0]].iloc[0]
         path2_row = df[df["Path"] == pair[1]].iloc[0]
         filenames.append(path1_row["Filename"])
-        schemas1.append(path1_row["Schema"])
-        schemas2.append(path2_row["Schema"])
+        tokenized_schemas1.append(path1_row["Tokenized_schema"])
+        tokenized_schemas2.append(path2_row["Tokenized_schema"])
         
 
     # Create a new DataFrame containing the labeled pairs, schemas, and filenames
     labeled_df = pd.DataFrame({"Pairs": pairs,
                                "Label": labels,
                                "Filename": filenames,
-                               "Schema1": schemas1,
-                               "Schema2": schemas2
+                               "Tokenized_schema1": tokenized_schemas1,
+                               "Tokenized_schema2": tokenized_schemas2
                                })
 
     return labeled_df
@@ -875,7 +900,18 @@ def save_ground_truths(ground_truths, ground_truth_file):
             json_file.write(json.dumps({key: value}) + '\n')
 
 
-def concatenate_df_in_chunks(dfs):
+def concatenate_dataframes(dfs):
+    """
+    Concatenate a list of pandas DataFrames efficiently using Dask.
+
+    Args:
+        dfs (list of pd.DataFrame): A list of pandas DataFrames to concatenate.
+
+    Returns:
+        pd.DataFrame: A single pandas DataFrame resulting from the concatenation
+                      of the input DataFrames.
+    """
+     
     # Convert the list of DataFrames to Dask DataFrame
     dask_dfs = [dd.from_pandas(df, npartitions=4) for df in dfs]
 
@@ -904,38 +940,24 @@ def preprocess_data(schemas, filename, ground_truth_file):
         filtered_df, frequent_ref_defn_paths = process_schema(schema, JSON_FOLDER, SCHEMA_FOLDER)
         if filtered_df is not None and frequent_ref_defn_paths is not None:
             ground_truths[schema] = frequent_ref_defn_paths
-        
-            if filename == "test_data.parquet":
-                df = get_test_data(filtered_df, filename, frequent_ref_defn_paths)
-            else:
-                print(f"Sampling data for {schema}...")
-                df = get_samples(filtered_df, frequent_ref_defn_paths)
+            print(f"Sampling data for {schema}...")
+            df = get_samples(filtered_df, frequent_ref_defn_paths)
             frames.append(df)
 
     if frames:
         print("Merging dataframes...")
         
-        merged_df = concatenate_df_in_chunks(frames)
+        merged_df = concatenate_dataframes(frames)
         merged_df.to_parquet(filename, index=False)
-
-        if filename != "test_data.parquet":
-            save_ground_truths(ground_truths, ground_truth_file)
-
-        # Free up memory
-        del merged_df
-        gc.collect()
-
+        save_ground_truths(ground_truths, ground_truth_file)
 
 
 def main():
     train_schemas, test_schemas = split_data()
     preprocess_data(train_schemas, filename="sample_train_data.parquet", ground_truth_file="train_ground_truth.json")
     preprocess_data(test_schemas, filename="sample_test_data.parquet", ground_truth_file="test_ground_truth.json")
-    preprocess_data(test_schemas, filename="test_data.parquet", ground_truth_file="test_ground_truth.json")
 
     
-    
-
 
 if __name__ == "__main__":
     main()
