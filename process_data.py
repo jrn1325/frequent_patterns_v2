@@ -264,10 +264,16 @@ def tokenize_schema(schema):
         torch.tensor: inputs_ids tensor
     """
 
-    # Tokenize the schema, removing the first and last tokens
-    tokenized_schema = tokenizer(schema, return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True).to(device)
-    input_ids = (tokenizer(schema, return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True)["input_ids"][0][1:-1]).cpu().numpy()
-    return tokenized_schema, input_ids
+    # Tokenize the schema
+    tokenized_schema = tokenizer(schema, return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True)
+    input_ids_tensor = tokenized_schema["input_ids"]
+
+    # Remove the first and last tokens
+    input_ids_tensor_sliced = input_ids_tensor[0][1:-1]
+
+    # Convert tensor to a numpy array
+    input_ids_numpy = input_ids_tensor_sliced.cpu().numpy()
+    return tokenized_schema, [input_ids_numpy]
 
 '''
 def create_dataframe(prefix_paths_dict):
@@ -758,8 +764,8 @@ def label_samples(df, good_pairs, bad_pairs):
         path1_row = df[df["Path"] == pair[0]].iloc[0]
         path2_row = df[df["Path"] == pair[1]].iloc[0]
         filenames.append(path1_row["Filename"])
-        tokenized_schemas1.append(path1_row["Tokenized_schema"])
-        tokenized_schemas2.append(path2_row["Tokenized_schema"])
+        tokenized_schemas1.append(path1_row["Input_ids"])
+        tokenized_schemas2.append(path2_row["Input_ids"])
         
 
     # Process bad pairs: label them as 0 (negative)
@@ -771,8 +777,8 @@ def label_samples(df, good_pairs, bad_pairs):
         path1_row = df[df["Path"] == pair[0]].iloc[0]
         path2_row = df[df["Path"] == pair[1]].iloc[0]
         filenames.append(path1_row["Filename"])
-        tokenized_schemas1.append(path1_row["Tokenized_schema"])
-        tokenized_schemas2.append(path2_row["Tokenized_schema"])
+        tokenized_schemas1.append(path1_row["Input_ids"])
+        tokenized_schemas2.append(path2_row["Input_ids"])
         
 
     # Create a new DataFrame containing the labeled pairs, schemas, and filenames
