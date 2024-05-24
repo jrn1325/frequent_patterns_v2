@@ -261,11 +261,13 @@ def tokenize_schema(schema):
 
     Returns:
         torch.tensor: tokenized schema
+        torch.tensor: inputs_ids tensor
     """
 
     # Tokenize the schema, removing the first and last tokens
     tokenized_schema = tokenizer(schema, return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True).to(device)
-    return tokenized_schema
+    input_ids = (tokenizer(schema, return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True)["input_ids"][0][1:-1]).cpu().numpy()
+    return tokenized_schema, input_ids
 
 '''
 def create_dataframe(prefix_paths_dict):
@@ -329,10 +331,10 @@ def create_dataframe(paths_dict):
     for path, values in paths_dict.items():
         values = [json.loads(v) for v in values]
         schema = discover_schema_from_values(values)
-        tokenized_schema = tokenize_schema(json.dumps(schema))
-        row_data = [path, tokenized_schema] 
+        tokenized_schema, input_ids = tokenize_schema(json.dumps(schema))
+        row_data = [path, tokenized_schema, input_ids] 
         df_data.append(row_data)
-    columns = ["Path", "Tokenized_schema"]
+    columns = ["Path", "Tokenized_schema", "Input_ids"]
     df = pd.DataFrame(df_data, columns=columns)
     df_sorted = df.sort_values(by="Path")
     return df_sorted
