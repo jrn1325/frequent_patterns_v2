@@ -273,7 +273,7 @@ def tokenize_schema(schema):
 
     # Convert tensor to a numpy array
     input_ids_numpy = input_ids_tensor_sliced.cpu().numpy()
-    return tokenized_schema, [input_ids_numpy]
+    return tokenized_schema, list(input_ids_numpy)
 
 '''
 def create_dataframe(prefix_paths_dict):
