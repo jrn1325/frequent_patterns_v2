@@ -267,12 +267,15 @@ def tokenize_schema(schema):
     # Tokenize the schema
     tokenized_schema = tokenizer(schema, return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True)
     input_ids_tensor = tokenized_schema["input_ids"]
+    input_ids_tensor = input_ids_tensor[input_ids_tensor != tokenizer.pad_token_id]
+
 
     # Remove the first and last tokens
-    input_ids_tensor_sliced = input_ids_tensor[0][1:-1]
+    input_ids_tensor_sliced = input_ids_tensor[1:-1]
 
     # Convert tensor to a numpy array
     input_ids_numpy = input_ids_tensor_sliced.cpu().numpy()
+   
     return tokenized_schema, list(input_ids_numpy)
 
 '''
@@ -689,6 +692,8 @@ def get_samples(df, frequent_ref_defn_paths):
         schema_embeddings = calculate_embeddings(filtered_df)
         # Calculate cosine distances for all pairs
         cosine_distances = calculate_cosine_distance(schema_embeddings, all_good_pairs)
+        #for i in cosine_distances[:10]:
+            #print(i)
         
         # Select pairs with the smallest distances as bad pairs
         for pair, distance in cosine_distances:
