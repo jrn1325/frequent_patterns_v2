@@ -273,7 +273,7 @@ def tokenize_schema(schema):
     # Remove the first and last tokens
     input_ids_tensor_sliced = input_ids_tensor[1:-1]
 
-    # Convert tensor to a numpy array
+    # Convert tensor to a numpy array and then list
     input_ids_numpy = input_ids_tensor_sliced.cpu().numpy()
    
     return tokenized_schema, list(input_ids_numpy)

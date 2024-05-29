@@ -1,5 +1,4 @@
 import ast
-import collections
 import json
 import math
 import networkx as nx
@@ -13,18 +12,17 @@ import wandb
 
 from adapters import AdapterTrainer, AutoAdapterModel
 from collections import defaultdict
-from itertools import combinations
-
-from sklearn.model_selection import train_test_split
-
-from torch.nn.utils.rnn import pad_sequence
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset, TensorDataset
-from transformers import AutoConfig, AutoTokenizer, get_scheduler, TrainingArguments, EvalPrediction
+from transformers import AutoTokenizer, get_scheduler, TrainingArguments, EvalPrediction
+
+import process_data
 
 
 MAX_TOK_LEN = 512
 ADAPTER_PATH = "./adapter"
+ADAPTER_NAME = "mrpc"
+SCHEMA_FOLDER = "schemas"
+JSON_FOLDER = "jsons"
 
 # https://stackoverflow.com/a/73704579
 class EarlyStopper:
@@ -45,72 +43,70 @@ class EarlyStopper:
         return False
 
 
-def initialize_model(model_name, adapter_name="mrpc"):
+def initialize_model(model_name, adapter_name=ADAPTER_NAME):
+    """
+    Initializes a pre-trained model with an adapter for classification tasks.
+    
+    Args:
+        model_name (str): The name of the pre-trained model to load.
+        adapter_name (str): The name of the adapter to add to the model. Defaults to ADAPTER_NAME.
+    
+    Returns:
+        tuple: A tuple containing the initialized model and tokenizer.
+    """
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoAdapterModel.from_pretrained(model_name)
-    model.add_classification_head(adapter_name, num_labels=2)
     model.add_adapter(adapter_name, config="seq_bn")
     model.set_active_adapters(adapter_name)
+    model.add_classification_head(adapter_name, num_labels=2)
     model.train_adapter(adapter_name)
     wandb.watch(model)
     return model, tokenizer
 
 
-def merge_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer):
-    """Merge the tokens of the schemas of the paths with in pair
+def merge_schema_tokens(df, tokenizer):
+    """Merge the tokens of the schemas of the paths with in pair.
 
     Args:
-        tokenized_schema1 (Tensor): Tokenized schema of path1.
-        tokenized_schema2 (Tensor): Tokenized schema of path2.
-        tokenizer (_type_): Tokenizer.
+        df (pd.DataFrame): DataFrame containing pairs, labels, filenames, and tokenized schema of each path in pair
+        tokenizer (PreTrainedTokenizer): The tokenizer used for processing schemas.
 
     Returns:
-        list: list of merged tokens.
+        DataFrame: dafaframe with merged tokenized schemas
     """
     
     newline_token = tokenizer("\n")["input_ids"][1:-1]
-
-    total_len = len(tokenized_schema1) + len(tokenized_schema2)
-    max_tokenized_len = MAX_TOK_LEN - 1 - 2 # Account for BOS, EOS, and newline token lengths
-
-    # Make sure both tokenized schemas are proportionally truncated and represented
-    if total_len > max_tokenized_len:
-        truncate_len = total_len - max_tokenized_len
-        truncate_len1 = math.ceil(len(tokenized_schema1) / (total_len) * truncate_len)
-        truncate_len2 = math.ceil(len(tokenized_schema2) / (total_len) * truncate_len)
-        return [tokenizer.bos_token_id] + tokenized_schema1[:-truncate_len1].tolist() + newline_token + tokenized_schema2[:-truncate_len2].tolist() + [tokenizer.eos_token_id]
-
-    else:
-        return [tokenizer.bos_token_id] + tokenized_schema1.tolist() + newline_token + tokenized_schema2.tolist() + [tokenizer.eos_token_id]
-
-
-def tokenize_schemas(df, tokenizer):
-    """Tokenize schemas and add tokenized versions as new columns to the DataFrame. Remove first and last token.
-
-    Args:
-        df (pd.DataFrame): DataFrame containing pairs, labels, filenames, and schemas of each path in pair
-        tokenizer: Microsoft CodeBERT tokenizer.
-
-    Returns:
-        DataFrame: dafaframe with tokenized schemas
-    """
     tokenized_schemas = []
 
-    # Loop over the schemas of the pairs of paths
-    for idx, (schema1, schema2) in df[["Schema1", "Schema2"]].iterrows():
+    # Loop over the schemas of the pairs of tokenized schemas
+    for idx, (tokenized_schema1, tokenized_schema2) in df[["Tokenized_schema1", "Tokenized_schema2"]].iterrows():
+        if not isinstance(tokenized_schema1, list) or not isinstance(tokenized_schema2, list):
+            # Convert string representations of lists to actual lists
+            tokenized_schema1 = ast.literal_eval(tokenized_schema1)
+            tokenized_schema2 = ast.literal_eval(tokenized_schema2)
 
-        # Tokenize the schemas, removing the first and last tokens
-        tokenized_schema1 = tokenizer(schema1, return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True)["input_ids"][0][1:-1]
-        tokenized_schema2 = tokenizer(schema2, return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True)["input_ids"][0][1:-1]
+        total_len = len(tokenized_schema1) + len(tokenized_schema2)
+        max_tokenized_len = MAX_TOK_LEN - 1 - 2  # Account for BOS, EOS, and newline token lengths
 
-        # Merge the tokenized schemas
-        tokenized_schema = merge_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer)
-        tokenized_schemas.append(tokenized_schema)
-    
-    # Add a new column for tokenized schemas
+        # Proportionally truncate tokenized schemas if they exceed the maximum token length
+        if total_len > max_tokenized_len:
+            truncate_len = total_len - max_tokenized_len
+            truncate_len1 = math.ceil(len(tokenized_schema1) / total_len * truncate_len)
+            truncate_len2 = math.ceil(len(tokenized_schema2) / total_len * truncate_len)
+            tokenized_schema1 = tokenized_schema1[:-truncate_len1]
+            tokenized_schema2 = tokenized_schema2[:-truncate_len2]
+
+        merged_tokenized_schema = (
+            [tokenizer.bos_token_id] + tokenized_schema1 + newline_token + tokenized_schema2 + [tokenizer.eos_token_id]
+        )
+
+        tokenized_schemas.append(merged_tokenized_schema)
+
+    # Add a new column for tokenized schemas and drop old ones
     df["Tokenized_schema"] = tokenized_schemas
+    df = df.drop(["Tokenized_schema1", "Tokenized_schema2", "Filename"], axis=1)
 
-    # Shuffle the DataFrame
+    # Shuffle all the rows in the DataFrame
     df = df.sample(frac=1).reset_index(drop=True)
 
     return df
@@ -118,36 +114,36 @@ def tokenize_schemas(df, tokenizer):
 
 def transform_data(df, tokenizer, device):
     """
-    Transforms the input training DataFrame into a format suitable for a transformer model.
+    Transforms the input training DataFrame into a format suitable for our model.
 
     Args:
         df (pd.DataFrame): The training DataFrame with columns "Tokenized_schema" and "Label".
-        tokenizer (PreTrainedTokenizer): The tokenizer used for processing text data.
+        tokenizer (PreTrainedTokenizer): The tokenizer used for processing schemas.
         device (torch.device): The device (CPU or GPU) to which tensors should be moved.
 
     Returns:
         list: A list of dictionaries, each containing "input_ids", "attention_mask", and "labels" tensors.
     """
-    # Rename the target column to "labels"
-    df = df.rename(columns={"Label": "labels"})
 
-    # Get the maximum length of tokenized schemas
     max_length = max(len(schema) for schema in df["Tokenized_schema"])
-
     pad_token_id = tokenizer.pad_token_id
 
     dataset = []
-    for schema, label in zip(df["Tokenized_schema"], df["labels"]):
-        schema_tensor = torch.tensor(schema, device=device)
+    for idx in range(len(df)):
+        schema = df["Tokenized_schema"].iloc[idx]
+        label = df["Label"].iloc[idx]
+
+        schema_tensor = torch.tensor(schema)
         padded_schema = torch.nn.functional.pad(schema_tensor, (0, max_length - len(schema)), value=pad_token_id)
         attention_mask = (padded_schema != pad_token_id).long()
-        label_tensor = torch.tensor(label, device=device)
+        label_tensor = torch.tensor(label)
 
         dictionary = {
-            "input_ids": padded_schema,
+            "input_ids": padded_schema.to(device),
             "attention_mask": attention_mask.to(device),
-            "labels": label_tensor
+            "labels": label_tensor.to(device)
         }
+
         dataset.append(dictionary)
 
     return dataset
@@ -156,8 +152,8 @@ def transform_data(df, tokenizer, device):
 def train_model(train_df, test_df):
     model_name = "microsoft/codebert-base" 
     accumulation_steps = 4
-    batch_size = 8
-    learning_rate = 1e-6
+    batch_size = 16
+    learning_rate = 2e-5
     num_epochs = 25
 
     # Start a new wandb run to track this script
@@ -176,23 +172,23 @@ def train_model(train_df, test_df):
     # Initialize tokenizer, model with adapter and classification head
     model, tokenizer = initialize_model(model_name)
 
-    # Tokenize the train and test schemas
-    train_df_with_tokens = tokenize_schemas(train_df, tokenizer)
-    test_df_with_tokens = tokenize_schemas(test_df, tokenizer)
+    # Merge tokenized schemas
+    train_df_with_tokens = merge_schema_tokens(train_df, tokenizer) 
+    test_df_with_tokens = merge_schema_tokens(test_df, tokenizer)
 
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
     # Transform data into dict
-    train_dataset = transform_data(train_df_with_tokens, tokenizer, device)
-    test_dataset = transform_data(test_df_with_tokens, tokenizer, device)
+    train_data = transform_data(train_df_with_tokens, tokenizer, device)
+    test_data = transform_data(test_df_with_tokens, tokenizer, device)
 
     # Set up optimizer
     optimizer = AdamW(model.parameters(), lr=learning_rate)
 
      # Calculate total steps
-    total_steps = len(train_dataset) // batch_size * num_epochs
+    total_steps = len(train_data) // batch_size * num_epochs
 
     # Define warm-up steps
     warmup_steps = int(0.1 * total_steps)
@@ -226,11 +222,12 @@ def train_model(train_df, test_df):
     trainer = AdapterTrainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=test_dataset,
+        train_dataset=train_data,
+        eval_dataset=test_data,
         compute_metrics=compute_accuracy,
         optimizers=(optimizer, lr_scheduler),
     )
+    
 
     # Train the model
     trainer.train()
@@ -238,8 +235,7 @@ def train_model(train_df, test_df):
         
     # Save the adapter
     save_adapter(model)
-    wandb.save("./adapter/*")
-  
+    
 
 def compute_accuracy(p: EvalPrediction):
   """
@@ -265,20 +261,18 @@ def save_adapter(model):
         save_path (str): The directory path where the adapter will be saved.
     """
     # Save the adapter
-    model.save_adapter(ADAPTER_PATH, "mrpc", with_head=True)
+    model.save_adapter(ADAPTER_PATH, ADAPTER_NAME, with_head=True)
 
     # Log the adapter artifact
     artifact = wandb.Artifact("customized_codebert_frequent_patterns", type="model")
     artifact.add_dir(ADAPTER_PATH)
     wandb.log_artifact(artifact)
+    wandb.save("./adapter/*")
 
 
 def load_model_and_adapter():
     """
     Load the model and adapter from the specified path.
-
-    Args:
-        adapter_path (str): The directory path where the adapter is saved.
 
     Returns:
         PreTrainedModel: The model with the loaded adapter.
@@ -287,21 +281,19 @@ def load_model_and_adapter():
     config_file_path = f"{ADAPTER_PATH}/adapter_config.json"
     with open(config_file_path, "r") as config_file:
         adapter_config = json.load(config_file)
-    
+
     # Initialize the model with the same configuration as during saving
     model_name = adapter_config["model_name"]
     adapter_name = adapter_config["name"]
+    m = AutoAdapterModel.from_pretrained(model_name)
 
-    config = AutoConfig.from_pretrained(model_name)
-    model = AutoAdapterModel.from_pretrained(model_name, config=config)
+    # Load the adapter
+    m.load_adapter(ADAPTER_PATH, config=adapter_config["config"])
 
-    # Load the adapter parameters
-    model.load_adapter(ADAPTER_PATH, config=adapter_config)
+    # Activate the adapter
+    m.set_active_adapters(adapter_name)
 
-     # Activate the adapter
-    model.set_active_adapters(adapter_name)
-
-    return model
+    return m
 
 
 def get_predicted_label(model, tokenized_pair, device):
@@ -327,12 +319,12 @@ def get_predicted_label(model, tokenized_pair, device):
     return int(predictions[0])
 
 
-def build_definition_graph(group, model, device):
+def build_definition_graph(df, model, device):
     """
     Build a definition graph from tokenized schema pairs using the given model.
 
     Args:
-        group (pd.DataFrame): A DataFrame containing pairs and tokenized schemas.
+        df (pd.DataFrame): A DataFrame containing pairs and tokenized schemas.
         model (PreTrainedModel): The model used for predicting connections.
         device (torch.device): The device (CPU or GPU) to run the model on.
 
@@ -343,15 +335,8 @@ def build_definition_graph(group, model, device):
     graph = nx.Graph()
 
     # Loop over tokenized schemas
-    for _, row in group.iterrows():
-        pair_str = row["Pairs"]
-        # Convert string representation of tuple to tuple
-        try:
-            pair = ast.literal_eval(pair_str)
-        except (ValueError, SyntaxError) as e:
-            print(f"Error parsing pair: {pair_str} - {e}")
-            continue
-
+    for _, row in df.iterrows():
+        pair = row["Pairs"]
         tokenized_schema = row["Tokenized_schema"]
 
         # If the predicted label is 1, add an edge between the paths' nodes
@@ -400,14 +385,13 @@ def find_definitions_from_graph(graph):
     return processed_cliques
 
 
-def evaluate_data(test_df, test_ground_truth, model, tokenizer):
+def evaluate_data(test_ground_truth, model, tokenizer):
     """
     Evaluate the model on test data.
 
     Args:
-        test_df (pd.DataFrame): The DataFrame containing test data.
         test_ground_truth (dict): Dictionary containing ground truth information for test data.
-        model (): The trained model to be evaluated.
+        model (PreTrainedModel): The trained model to be evaluated.
         tokenizer: The tokenizer used for processing schema.
     """
 
@@ -415,53 +399,49 @@ def evaluate_data(test_df, test_ground_truth, model, tokenizer):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # Tokenize the schema
-    test_df = tokenize_schemas(test_df, tokenizer)
+    # Get the test schemas
+    test_schemas = test_ground_truth.keys()
 
-    # Clear CUDA cache
-    torch.cuda.empty_cache()
-    
-     # Evaluate the model
-    model.eval()
+    for schema in tqdm.tqdm(test_schemas, position=1, leave=False, total=len(test_schemas)):
+        filtered_df, frequent_ref_defn_paths = process_data.process_schema(schema, JSON_FOLDER, SCHEMA_FOLDER)
+        if filtered_df is not None and frequent_ref_defn_paths is not None:
+            # Generate good and bad pairs
+            labeled_df = process_data.generate_pairs(filtered_df, frequent_ref_defn_paths)
+            pd.set_option('display.max_columns', None)
 
-    # Group by "Filename" columns
-    grouped = test_df.groupby(["Filename"])
-    
-    # Loop over each group
-    for filename, group in tqdm.tqdm(grouped, position=0, leave=False, total=len(grouped)):
-        filename = filename[0]
+            # Merge tokenized schemas
+            df = merge_schema_tokens(labeled_df, tokenizer) 
         
-        # Build definition graph
-        graph = build_definition_graph(group, model, device)
-   
-        # Predict clusters
-        predicted_clusters = find_definitions_from_graph(graph)
+            # Build definition graph
+            graph = build_definition_graph(df, model, device)
+    
+            # Predict clusters
+            predicted_clusters = find_definitions_from_graph(graph)
 
-        # Get the ground truth clusters
-        ground_truth_dict = test_ground_truth.get(filename, {})
-        actual_clusters = [[tuple(inner_list) for inner_list in outer_list] for outer_list in ground_truth_dict.values()]
+            # Get the ground truth clusters
+            ground_truth_dict = test_ground_truth.get(schema, {})
+            actual_clusters = [[tuple(inner_list) for inner_list in outer_list] for outer_list in ground_truth_dict.values()]
 
-        # Calculate precision, recall, and F1-score
-        precision, recall, f1_score = calc_scores(actual_clusters, predicted_clusters)
+            # Calculate precision, recall, and F1-score
+            precision, recall, f1_score = calc_scores(actual_clusters, predicted_clusters)
 
-        # Print evaluation metrics
-        print(f"Schema: {filename}, Precision: {precision}, Recall: {recall}, F1-score: {f1_score}")
+            # Print evaluation metrics
+            print(f"Schema: {schema}, Precision: {precision}, Recall: {recall}, F1-score: {f1_score}")
 
-        # Print actual and predicted clusters
-        print("Actual clusters")
-        for actual_cluster in actual_clusters:
-            print(actual_cluster)
+            # Print actual and predicted clusters
+            print("Actual clusters")
+            for actual_cluster in actual_clusters:
+                print(actual_cluster)
 
-        print()
+            print()
 
-        print("Predicted clusters:")
-        for predicted_cluster in predicted_clusters:
-            print(predicted_cluster)
-        print("-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------")
-        print()
+            print("Predicted clusters:")
+            for predicted_cluster in predicted_clusters:
+                print(predicted_cluster)
+            print("-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------")
+            print()
         
   
-
 def calc_jaccard_index(actual_cluster, predicted_cluster):
     """Measure the similarity between actual and predicted clusters
 
@@ -526,8 +506,6 @@ def calc_scores(actual_clusters, predicted_clusters, threshold=0.5):
         if not found_match:
             FP += 1
 
-    
-    
     try:
         precision = TP / (TP + FP)
         recall = TP / (TP + FN)
