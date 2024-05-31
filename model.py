@@ -3,15 +3,12 @@ import json
 import math
 import networkx as nx
 import numpy as np
-import pandas as pd
 import sys
 import torch
-import torch.nn.functional as F
 import tqdm
 import wandb
 
 from adapters import AdapterTrainer, AutoAdapterModel
-from collections import defaultdict
 from torch.optim import AdamW
 from transformers import AutoTokenizer, get_scheduler, TrainingArguments, EvalPrediction
 
@@ -79,7 +76,7 @@ def merge_schema_tokens(df, tokenizer):
     tokenized_schemas = []
 
     # Loop over the schemas of the pairs of tokenized schemas
-    for idx, (tokenized_schema1, tokenized_schema2) in df[["Tokenized_schema1", "Tokenized_schema2"]].iterrows():
+    for idx, (tokenized_schema1, tokenized_schema2) in tqdm.tqdm(df[["Tokenized_schema1", "Tokenized_schema2"]].iterrows(), position=4, leave=False, total=len(df), desc="merge tokens"):
         if not isinstance(tokenized_schema1, list) or not isinstance(tokenized_schema2, list):
             # Convert string representations of lists to actual lists
             tokenized_schema1 = ast.literal_eval(tokenized_schema1)
@@ -150,6 +147,17 @@ def transform_data(df, tokenizer, device):
 
 
 def train_model(train_df, test_df):
+    """
+    Train a model
+    
+    Args:
+        train_df (pd.DataFrame): The training dataset.
+        test_df (pd.DataFrame): The testing dataset.
+
+    Returns:
+        None
+    """
+     
     model_name = "microsoft/codebert-base" 
     accumulation_steps = 4
     batch_size = 16
@@ -227,7 +235,6 @@ def train_model(train_df, test_df):
         compute_metrics=compute_accuracy,
         optimizers=(optimizer, lr_scheduler),
     )
-    
 
     # Train the model
     trainer.train()
@@ -335,7 +342,7 @@ def build_definition_graph(df, model, device):
     graph = nx.Graph()
 
     # Loop over tokenized schemas
-    for _, row in df.iterrows():
+    for _, row in tqdm.tqdm(df.iterrows(), position=5, leave=False, total=len(df), desc="making graph"):
         pair = row["Pairs"]
         tokenized_schema = row["Tokenized_schema"]
 
@@ -365,6 +372,10 @@ def find_definitions_from_graph(graph):
     # Get all the cliques from the graph and sort them based on their lengths in ascending order
     cliques = list(nx.algorithms.find_cliques(graph))
     cliques.sort(key=lambda a: len(a))
+    print("Cliques")
+    for clique in cliques:
+        print(clique)
+    print()
     
     # Make sure a path only appears in one definition
     processed_cliques = []
@@ -387,12 +398,12 @@ def find_definitions_from_graph(graph):
 
 def evaluate_data(test_ground_truth, model, tokenizer):
     """
-    Evaluate the model on test data.
+    Evaluate the model on the entire test data.
 
     Args:
         test_ground_truth (dict): Dictionary containing ground truth information for test data.
         model (PreTrainedModel): The trained model to be evaluated.
-        tokenizer: The tokenizer used for processing schema.
+        tokenizer: The tokenizer used for processing schemas.
     """
 
     # Set device
@@ -403,16 +414,16 @@ def evaluate_data(test_ground_truth, model, tokenizer):
     test_schemas = test_ground_truth.keys()
 
     for schema in tqdm.tqdm(test_schemas, position=1, leave=False, total=len(test_schemas)):
+        # Create a dataframe for schema that meets all the conditions
         filtered_df, frequent_ref_defn_paths = process_data.process_schema(schema, JSON_FOLDER, SCHEMA_FOLDER)
         if filtered_df is not None and frequent_ref_defn_paths is not None:
             # Generate good and bad pairs
             labeled_df = process_data.generate_pairs(filtered_df, frequent_ref_defn_paths)
-            pd.set_option('display.max_columns', None)
 
-            # Merge tokenized schemas
+            # Merge the tokenized schemas
             df = merge_schema_tokens(labeled_df, tokenizer) 
         
-            # Build definition graph
+            # Build a definition graph
             graph = build_definition_graph(df, model, device)
     
             # Predict clusters
@@ -422,13 +433,13 @@ def evaluate_data(test_ground_truth, model, tokenizer):
             ground_truth_dict = test_ground_truth.get(schema, {})
             actual_clusters = [[tuple(inner_list) for inner_list in outer_list] for outer_list in ground_truth_dict.values()]
 
-            # Calculate precision, recall, and F1-score
+            # Calculate the precision, recall, and F1-score
             precision, recall, f1_score = calc_scores(actual_clusters, predicted_clusters)
 
-            # Print evaluation metrics
+            # Print the evaluation metrics
             print(f"Schema: {schema}, Precision: {precision}, Recall: {recall}, F1-score: {f1_score}")
 
-            # Print actual and predicted clusters
+            # Print the actual and predicted clusters
             print("Actual clusters")
             for actual_cluster in actual_clusters:
                 print(actual_cluster)

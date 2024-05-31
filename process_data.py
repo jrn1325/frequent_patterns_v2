@@ -1,5 +1,4 @@
 import dask.dataframe as dd
-import gc
 import itertools
 import json
 import os
@@ -12,8 +11,6 @@ import warnings
 from adapters import AutoAdapterModel
 from collections import defaultdict
 from copy import copy, deepcopy
-
-from dask import delayed, compute
 from functools import reduce
 from sklearn.model_selection import GroupShuffleSplit
 from torch.nn.functional import normalize
@@ -23,6 +20,7 @@ from transformers import AutoTokenizer
 model_name = "microsoft/codebert-base" 
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoAdapterModel.from_pretrained(model_name)
+
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
@@ -732,7 +730,7 @@ def generate_pairs(df, frequent_ref_defn_paths):
 
     # Generate bad pairs from all possible path combinations that are not in good pairs
     pairs_for_paths = itertools.combinations(paths, 2)
-    for pair in pairs_for_paths:
+    for pair in tqdm.tqdm(pairs_for_paths, position=3, leave=False, total=len(list(pairs_for_paths)), desc="bad pairs"):
         if pair not in good_pairs:
             bad_pairs.add(pair)
     # Label data
@@ -946,7 +944,7 @@ def preprocess_data(schemas, filename, ground_truth_file):
     frames = []
     ground_truths = defaultdict(dict)
 
-    for schema in tqdm.tqdm(schemas, position=1, leave=False, total=len(schemas)):
+    for schema in tqdm.tqdm(schemas, position=2, leave=False, total=len(schemas)):
         if schema in ["grunt-clean-task.json", "swagger-api-2-0.json"]:
             continue
 
