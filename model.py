@@ -1,8 +1,10 @@
 import ast
 import json
+import jsonref
 import math
 import networkx as nx
 import numpy as np
+import os
 import sys
 import torch
 import tqdm
@@ -16,7 +18,7 @@ import process_data
 
 
 MAX_TOK_LEN = 512
-ADAPTER_PATH = "./adapter"
+ADAPTER_PATH = "./adapter_50"
 ADAPTER_NAME = "mrpc"
 SCHEMA_FOLDER = "schemas"
 JSON_FOLDER = "jsons"
@@ -162,7 +164,7 @@ def train_model(train_df, test_df):
     accumulation_steps = 4
     batch_size = 16
     learning_rate = 2e-5
-    num_epochs = 25
+    num_epochs = 50
 
     # Start a new wandb run to track this script
     wandb.init(
@@ -274,7 +276,7 @@ def save_adapter(model):
     artifact = wandb.Artifact("customized_codebert_frequent_patterns", type="model")
     artifact.add_dir(ADAPTER_PATH)
     wandb.log_artifact(artifact)
-    wandb.save("./adapter/*")
+    wandb.save("./adapter_50/*")
 
 
 def load_model_and_adapter():
@@ -525,3 +527,147 @@ def calc_scores(actual_clusters, predicted_clusters, threshold=0.5):
         precision, recall, f1_score = 0, 0, 0
     
     return precision, recall, f1_score
+
+
+def group_paths(df, test_ground_truth, min_common_keys=2):
+    """
+    Group paths that have at least two distinct nested keys in common per filename.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing columns "Path", "Distinct_keys", and "Filename".
+        min_common_keys (int, optional): Minimum number of distinct nested keys required for paths to be grouped together. The default is 2.
+
+    Returns:
+        dict: Dictionary where keys are filenames and values are lists of groups of paths
+              with at least the specified number of distinct keys in common.
+    """
+
+    # Group data by filename
+    for filename, group in tqdm.tqdm(df.groupby("Filename"), position=1, leave=False, total=len(df.groupby("Filename")), desc="group"):
+        paths = group["Path"].tolist()
+        distinct_keys = group["Distinct_keys"].tolist()
+
+        # Use a list to keep track of groups
+        groups = []
+        
+        # Iterate through each path and try to group them
+        for i, (path, keys) in enumerate(zip(paths, distinct_keys)):
+            path = ast.literal_eval(path)
+            keys = ast.literal_eval(keys)
+
+            added_to_group = False
+            for group in groups:
+                # Check if this path shares at least min_common_keys with any path in the current group
+                if any(len(set(keys) & set(other_keys)) >= min_common_keys for other_path, other_keys in group):
+                    group.append((path, keys))
+                    added_to_group = True
+                    break
+            if not added_to_group:
+                # Create a new group if it doesn't fit in any existing group
+                groups.append([(path, keys)])
+        
+        # Convert groups of tuples to groups of paths
+        valid_groups = [group for group in groups if len(group) > 1]
+        grouped_paths = [[path for path, _ in group] for group in valid_groups]
+    
+
+        # Get the ground truth clusters
+        ground_truth_dict = test_ground_truth.get(filename, {})
+
+        # Evaluate
+        evaluate_grouped_paths(grouped_paths, ground_truth_dict, filename)
+
+
+def evaluate_grouped_paths(predicted_clusters, ground_truth_dict, filename):
+
+    actual_clusters = [[tuple(inner_list) for inner_list in outer_list] for outer_list in ground_truth_dict.values()]
+
+    # Calculate the precision, recall, and F1-score
+    precision, recall, f1_score = calc_scores(actual_clusters, predicted_clusters)
+
+    # Print the evaluation metrics
+    print(f"Schema: {filename}, Precision: {precision}, Recall: {recall}, F1-score: {f1_score}")
+
+    # Print the actual and predicted clusters
+    print("Actual clusters")
+    for actual_cluster in actual_clusters:
+        print(actual_cluster)
+
+    print()
+
+    print("Predicted clusters:")
+    for predicted_cluster in predicted_clusters:
+        print(predicted_cluster)
+    print("-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------")
+    print()
+
+
+class CustomJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        # Convert non-serializable objects to a string representation
+        return str(obj)
+
+def dereference(obj, schema, definitions_to_keep):
+    if isinstance(obj, dict):
+        if "$ref" in obj:
+            ref = obj["$ref"]
+            if ref not in definitions_to_keep and isinstance(ref, str) and len(ref) > 0:
+                referenced_obj = dereference(get_definition(ref, schema), schema, definitions_to_keep)
+                obj = referenced_obj
+        else:
+            for key, value in obj.items():
+                obj[key] = dereference(value, schema, definitions_to_keep)
+    elif isinstance(obj, list):
+        obj = [dereference(item, schema, definitions_to_keep) for item in obj]
+    return obj
+
+def get_definition(ref, schema):
+    if ref.startswith("#/definitions/"):
+        parts = ref.split("/")
+        definition = schema["definitions"]
+        for part in parts[2:]:
+            if part:
+                definition = definition[part]
+        return definition
+    elif ref.startswith("$defs/"):
+        parts = ref.split("/")
+        definition = schema["$defs"]
+        for part in parts[1:]:
+            if part:
+                definition = definition[part]
+        return definition
+    else:
+        # Handle other reference formats if needed
+        pass
+
+    
+def dereference_and_calculate_schema_size(schema, definitions_to_keep=None):
+    """
+    Load, dereference, and calculate the size of the JSON schema in bytes.
+
+    Args:
+        schema (str): Name of the JSON schema file.
+        definitions_to_keep (list, optional): List of definitions to exclude from dereferencing.
+
+    Returns:
+        tuple: The dereferenced JSON schema and its size in bytes.
+    """
+
+    schema_path = os.path.join(SCHEMA_FOLDER, schema)
+
+    # Load the JSON schema from the file
+    with open(schema_path, 'r') as file:
+        schema = json.load(file)
+
+    # If definitions_to_keep is not provided, initialize it as an empty list
+    if definitions_to_keep is None:
+        definitions_to_keep = []
+
+    # Dereference the schema
+    dereferenced_schema = dereference(schema, schema, definitions_to_keep)
+
+    # Calculate the size of the dereferenced schema in bytes using a custom JSON encoder
+    schema_str = json.dumps(dereferenced_schema, separators=(',', ':'))
+    schema_size = len(schema_str.encode("utf-8"))
+    
+    return schema_size
