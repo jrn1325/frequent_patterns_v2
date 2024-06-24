@@ -2,6 +2,7 @@ import json
 import model
 import pandas as pd
 import sys
+import time
 
 from transformers import AutoTokenizer
 
@@ -44,8 +45,10 @@ def main():
         # Train the model
         load_data()
     elif mode == "test":
+        start_time = time.time()
         # Evaluate the model
         evaluate_model()
+        print(time.time() - start_time)
     else:
         print(f"Error: Unknown mode '{mode}'. Use 'train' or 'test'.")
         sys.exit(1)

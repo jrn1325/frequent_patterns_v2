@@ -339,9 +339,9 @@ def create_dataframe(paths_dict):
         values = [json.loads(v) for v in values]
         schema = discover_schema_from_values(values)
         tokenized_schema, input_ids = tokenize_schema(json.dumps(schema))
-        row_data = [path, tokenized_schema, input_ids] 
+        row_data = [path, tokenized_schema, input_ids, schema] 
         df_data.append(row_data)
-    columns = ["Path", "Tokenized_schema", "Input_ids"]
+    columns = ["Path", "Tokenized_schema", "Input_ids", "Schema"]
     df = pd.DataFrame(df_data, columns=columns)
     df_sorted = df.sort_values(by="Path")
     return df_sorted
@@ -705,6 +705,38 @@ def get_samples(df, frequent_ref_defn_paths):
     return labeled_df
 
 
+def get_nested_keys(schema):
+    """
+    Extract nested keys from the schema. Placeholder for actual implementation.
+    """
+  
+    return set(schema.keys())  # Assuming schema is a dict for this example
+
+
+def process_pair(pair, df, good_pairs):
+    """
+    Process a pair of paths to determine if it should be considered a bad pair.
+
+    Args:
+        pair (tuple): A tuple containing two path strings.
+        df (pd.DataFrame): DataFrame containing paths and schemas.
+        good_pairs (set): Set of good pairs.
+
+    Returns:
+        tuple or None: The pair if it is a bad pair, otherwise None.
+    """
+
+    if (pair[0], pair[1]) not in good_pairs and (pair[0], pair[1]) not in good_pairs:
+        schema1 = df.loc[df["Path"] == pair[0], "Schema"].iloc[0]
+        nested_keys1 = get_nested_keys(schema1)
+        schema2 = df.loc[df["Path"] == pair[1], "Schema"].iloc[0]
+        nested_keys2 = get_nested_keys(schema2)
+    
+    if pair not in good_pairs and not nested_keys1.isdisjoint(nested_keys2):
+        return pair
+    return None
+
+
 def generate_pairs(df, frequent_ref_defn_paths):
     """
     Generate labeled good and bad pairs for all test data based on ground truth definitions.
@@ -731,8 +763,11 @@ def generate_pairs(df, frequent_ref_defn_paths):
     # Generate bad pairs from all possible path combinations that are not in good pairs
     pairs_for_paths = itertools.combinations(paths, 2)
     for pair in tqdm.tqdm(pairs_for_paths, position=3, leave=False, total=len(list(pairs_for_paths)), desc="bad pairs"):
-        if pair not in good_pairs:
+        pair = process_pair(pair, df, good_pairs)
+        if pair is not None:
             bad_pairs.add(pair)
+        #if pair not in good_pairs:
+        #    bad_pairs.add(pair)
     # Label data
     labeled_df = label_samples(df, good_pairs, bad_pairs)
     return labeled_df
