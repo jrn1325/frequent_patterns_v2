@@ -111,8 +111,8 @@ def get_paths_and_values(json_schema, filename):
         dict: dictionary of all the paths and values
     """
     paths_dict = defaultdict(set)
-    prefix_paths_dict = defaultdict(set)
-    #prefix_paths_dict = defaultdict(list)
+    #prefix_paths_dict = defaultdict(set)
+    prefix_paths_dict = defaultdict(list)
 
 
     with open(filename, 'r') as f:
@@ -125,17 +125,18 @@ def get_paths_and_values(json_schema, filename):
             if isinstance(doc, dict) and len(doc) > 0 and match_properties(json_schema, doc):
                 # Get the paths and values of type object and non-empty in the json document
                 for path, value in parse_document(doc):
-                    
+                    '''
                     if len(path) > 1:
                         prefix = path[:-1]
-                        prefix_paths_dict.setdefault(prefix, set()).add(path)
-                        #prefix_paths_dict.setdefault(prefix, []).append(path)
-                    
+                        #prefix_paths_dict.setdefault(prefix, set()).add(path)
+                        prefix_paths_dict.setdefault(prefix, []).append(path)
+                    '''
+
                     
                     if isinstance(value, dict) and len(value) > 0:
                         value = json.dumps(value)
                         paths_dict[path].add(value)                           
-                    
+
     return paths_dict, prefix_paths_dict
 
 
@@ -266,7 +267,6 @@ def tokenize_schema(schema):
     input_ids_tensor = tokenized_schema["input_ids"]
     input_ids_tensor = input_ids_tensor[input_ids_tensor != tokenizer.pad_token_id]
 
-
     # Remove the first and last tokens
     input_ids_tensor_sliced = input_ids_tensor[1:-1]
 
@@ -275,7 +275,7 @@ def tokenize_schema(schema):
    
     return tokenized_schema, list(input_ids_numpy)
 
-
+'''
 def create_dataframe(prefix_paths_dict):
     """Create a DataFrame of paths, distinct subkeys, and numerical representations using FastText embeddings.
 
@@ -290,12 +290,14 @@ def create_dataframe(prefix_paths_dict):
 
     # Iterate over paths under the current prefix to get all the unique nested keys
     for prefix, path_list in prefix_paths_dict.items():
-        distinct_subkeys = set()
+        #distinct_subkeys = set()
+        distinct_subkeys = []
         for path in path_list:
             if path[-1] == '*':
                 continue
 
-            distinct_subkeys.add(path[-1])
+            distinct_subkeys.append(path[-1])
+            #distinct_subkeys.add(path[-1])
 
             if len(distinct_subkeys) > DISTINCT_SUBKEYS_UPPER_BOUND:
                 break
@@ -307,6 +309,7 @@ def create_dataframe(prefix_paths_dict):
         if len(distinct_subkeys) == 1 and '*' in distinct_subkeys:
             continue
 
+        distinct_subkeys = get_modes(distinct_subkeys)
         distinct_subkeys = sorted(list(distinct_subkeys))
         
         # Construct row data for DataFrame
@@ -314,34 +317,13 @@ def create_dataframe(prefix_paths_dict):
         df_data.append(row_data)
 
     # Create DataFrame
-    df = pd.DataFrame(df_data, columns=["Path", "Distinct_keys"])
+    df = pd.DataFrame(df_data, columns=["Path", "Schema"])
      # Sort the DataFrame by the "Path" column
     df_sorted = df.sort_values(by="Path")
     return df_sorted
 
 '''
-def create_dataframe(paths_dict):
-    """Create a DataFrame of paths and their values schema
-    Args:
-        paths_dict (dict): Dictionary of paths and their values.
 
-    Returns:
-        pd.DataFrame: DataFrame with tokenized schema added.
-    """
-
-    df_data = []
-    
-    for path, values in paths_dict.items():
-        values = [json.loads(v) for v in values]
-        schema = discover_schema_from_values(values)
-        tokenized_schema, input_ids = tokenize_schema(json.dumps(schema))
-        row_data = [path, tokenized_schema, input_ids, schema] 
-        df_data.append(row_data)
-    columns = ["Path", "Tokenized_schema", "Input_ids", "Schema"]
-    df = pd.DataFrame(df_data, columns=columns)
-    df_sorted = df.sort_values(by="Path")
-    return df_sorted
-'''
     
 def clean_ref_defn_paths(json_schema): 
     """Remove keywords associated with JSON Schema that do not exist in JSON documents format
@@ -522,18 +504,24 @@ def get_ref_defn_of_type_obj(json_schema, ref_defn_paths, paths_to_exclude):
     return paths_to_exclude
 
 
-def check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, jsonfile_paths):
+def check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, json_paths):
     """Check if the paths from JSON Schemas exist in JSON datasets
 
     Args:
         cleaned_ref_defn_paths (dict): dictionary of JSON definitions and their paths
+        df (pd.DataFrame): DataFrame containing paths and schemas.
         jsonfile_paths (list): list of paths found in the collection of JSON documents associated with a schema
 
     Returns:
         dict: dictionary without paths that don't exist in the collection of JSON documents
     """
     # Use set intersection to find schema paths that exist in both json file
-    filtered_ref_defn_paths = {ref_defn: set(paths) & set(jsonfile_paths) for ref_defn, paths in cleaned_ref_defn_paths.items()}
+    filtered_ref_defn_paths = {}
+    
+    for ref_defn, paths in cleaned_ref_defn_paths.items():
+        intersecting_paths = set(paths) & set(json_paths)
+        filtered_ref_defn_paths[ref_defn] = intersecting_paths
+        
     return filtered_ref_defn_paths
 
 
@@ -568,6 +556,36 @@ def print_items(dictionary):
     for k, v in dictionary.items():
         print("ref:", k, ", paths:", v)
     print()
+
+
+def create_dataframe(paths_dict, paths_to_exclude):
+    """Create a DataFrame of paths and their values schema
+    Args:
+        paths_dict (dict): Dictionary of paths and their values.
+        paths_to_exclude (set): Paths to remove from JSON files
+
+    Returns:
+        pd.DataFrame: DataFrame with tokenized schema added.
+    """
+
+    df_data = []
+    
+    for path, values in paths_dict.items():
+        values = [json.loads(v) for v in values]
+        schema = discover_schema_from_values(values)
+        
+        # Extract the first two keys from the properties
+        first_two_keys = list(schema["properties"].keys())[:2]
+        if len(first_two_keys) >= 2:
+            tokenized_schema, input_ids = tokenize_schema(json.dumps(schema))
+            df_data.append([path, tokenized_schema, input_ids, schema])
+            
+        else:
+            paths_to_exclude.add(path)
+        
+    columns = ["Path", "Tokenized_schema", "Input_ids", "Schema"]
+    df = pd.DataFrame(df_data, columns=columns)
+    return df.sort_values(by="Path")
 
 
 def calculate_embeddings(df):
@@ -667,7 +685,7 @@ def get_samples(df, frequent_ref_defn_paths):
     # Generate good pairs from frequent referenced definition paths
     for ref_defn, good_paths in frequent_ref_defn_paths.items():
         good_paths_pairs = list(itertools.combinations(good_paths, 2))
-        all_good_pairs.update(good_pairs)
+        all_good_pairs.update(good_paths_pairs)
 
         limited_pairs = itertools.islice(good_paths_pairs, 1000)
         good_pairs.update(limited_pairs)
@@ -744,10 +762,10 @@ def generate_pairs(df, frequent_ref_defn_paths):
     Return
         pd.DataFrame: DataFrame containing labeled pairs, schemas, and filenames.
     """
-
+    
     good_pairs = set()
     bad_pairs = set()
-
+    '''
     # Generate good pairs from frequent referenced definition paths
     for ref_defn, good_paths in frequent_ref_defn_paths.items():
         pairs_for_paths = itertools.combinations(good_paths, 2)
@@ -766,7 +784,38 @@ def generate_pairs(df, frequent_ref_defn_paths):
         #    bad_pairs.add(pair)
     # Label data
     labeled_df = label_samples(df, good_pairs, bad_pairs)
-    return labeled_df
+    '''
+    # Get all paths in the schema
+    paths = list(df["Path"])
+
+    # Generate pairs
+    pairs_for_paths = itertools.combinations(paths, 2)
+
+    # Create lists to store data
+    pairs = []
+    tokenized_schemas1 = [] 
+    tokenized_schemas2 = []  
+    filenames = []  
+
+    # Process pairs
+    for pair in pairs_for_paths:
+        pairs.append(pair)
+
+        # Extract schemas and filename for both paths in the pair
+        path1_row = df[df["Path"] == pair[0]].iloc[0]
+        path2_row = df[df["Path"] == pair[1]].iloc[0]
+        filenames.append(path1_row["Filename"])
+        tokenized_schemas1.append(path1_row["Input_ids"])
+        tokenized_schemas2.append(path2_row["Input_ids"])
+        
+    # Create a new DataFrame containing the pairs, schemas, and filenames
+    df = pd.DataFrame({"Pairs": pairs,
+                               "Filename": filenames,
+                               "Tokenized_schema1": tokenized_schemas1,
+                               "Tokenized_schema2": tokenized_schemas2
+                               })
+    
+    return df
 
 
 def label_samples(df, good_pairs, bad_pairs):
@@ -908,21 +957,27 @@ def process_schema(schema, json_folder, schema_folder):
 
     if not filtered_ref_defn_paths:
         return None, None
-
+    
     frequent_ref_defn_paths = find_frequent_definitions(filtered_ref_defn_paths, paths_to_exclude)
 
     if not frequent_ref_defn_paths:
         return None, None
 
-    #df = create_dataframe(paths_dict)
-    df = create_dataframe(prefix_paths_dict)
+    df = create_dataframe(paths_dict, paths_to_exclude)
+    updated_ref_defn_paths = {}
+
+    for ref_defn, paths in frequent_ref_defn_paths.items():
+        intersecting_paths = set(paths) & set(df["Path"])
+        if len(intersecting_paths) >= 2:
+            updated_ref_defn_paths[ref_defn] = intersecting_paths
+
     filtered_df = df[~df["Path"].isin(paths_to_exclude)]
     if filtered_df.empty:
         return None, None
 
     filtered_df["Filename"] = schema
     filtered_df.reset_index(drop=True, inplace=True)
-    return filtered_df, frequent_ref_defn_paths
+    return filtered_df, updated_ref_defn_paths
 
 
 def save_ground_truths(ground_truths, ground_truth_file):
@@ -977,29 +1032,30 @@ def preprocess_data(schemas, filename, ground_truth_file):
     ground_truths = defaultdict(dict)
 
     for schema in tqdm.tqdm(schemas, position=2, leave=False, total=len(schemas)):
-        if schema in ["grunt-clean-task.json", "swagger-api-2-0.json"]:
+        if schema in ["grunt-clean-task.json", "swagger-api-2-0.json"]:#, "web-types.json"]:#, "openrpc-json.json"]:
             continue
 
         filtered_df, frequent_ref_defn_paths = process_schema(schema, JSON_FOLDER, SCHEMA_FOLDER)
         if filtered_df is not None and frequent_ref_defn_paths is not None:
             ground_truths[schema] = frequent_ref_defn_paths
             print(f"Sampling data for {schema}...")
-            #df = get_samples(filtered_df, frequent_ref_defn_paths)
-            #frames.append(df)
-            frames.append(filtered_df)
-
+            df = get_samples(filtered_df, frequent_ref_defn_paths)
+            frames.append(df)
+        
+    #merged_df = concatenate_dataframes(frames)
+    #merged_df[["Path", "Schema"]].to_csv("df.csv", index=False)
+    
     if frames:
         print("Merging dataframes...")
-        
         merged_df = concatenate_dataframes(frames)
-        #merged_df.to_parquet(filename, index=False)
-        merged_df.to_csv("test_data.csv")
-        #save_ground_truths(ground_truths, ground_truth_file)
+        merged_df.to_parquet(filename, index=False)
+        save_ground_truths(ground_truths, ground_truth_file)
+    
 
 
 def main():
     train_schemas, test_schemas = split_data()
-    #preprocess_data(train_schemas, filename="sample_train_data.parquet", ground_truth_file="train_ground_truth.json")
+    preprocess_data(train_schemas, filename="sample_train_data.parquet", ground_truth_file="train_ground_truth.json")
     preprocess_data(test_schemas, filename="sample_test_data.parquet", ground_truth_file="test_ground_truth.json")
 
     

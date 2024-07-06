@@ -1,6 +1,6 @@
 import ast
+import itertools
 import json
-import jsonref
 import math
 import networkx as nx
 import numpy as np
@@ -18,7 +18,7 @@ import process_data
 
 
 MAX_TOK_LEN = 512
-ADAPTER_PATH = "./adapter_50"
+ADAPTER_PATH = "./adapter"
 ADAPTER_NAME = "mrpc"
 SCHEMA_FOLDER = "schemas"
 JSON_FOLDER = "jsons"
@@ -130,7 +130,7 @@ def transform_data(df, tokenizer, device):
     dataset = []
     for idx in range(len(df)):
         schema = df["Tokenized_schema"].iloc[idx]
-        label = df["Label"].iloc[idx]
+        label = int(df["Label"].iloc[idx])
 
         schema_tensor = torch.tensor(schema)
         padded_schema = torch.nn.functional.pad(schema_tensor, (0, max_length - len(schema)), value=pad_token_id)
@@ -159,14 +159,15 @@ def train_model(train_df, test_df):
     Returns:
         None
     """
-     
+
     model_name = "microsoft/codebert-base" 
     accumulation_steps = 4
-    batch_size = 16
+    batch_size = 8
     learning_rate = 2e-5
-    num_epochs = 50
+    num_epochs = 75
 
     # Start a new wandb run to track this script
+    wandb.require("core")
     wandb.init(
         project="custom-codebert_frequent_patterns",
         config={
@@ -276,7 +277,7 @@ def save_adapter(model):
     artifact = wandb.Artifact("customized_codebert_frequent_patterns", type="model")
     artifact.add_dir(ADAPTER_PATH)
     wandb.log_artifact(artifact)
-    wandb.save("./adapter_50/*")
+    wandb.save("./adapter/*")
 
 
 def load_model_and_adapter():
@@ -328,14 +329,64 @@ def get_predicted_label(model, tokenized_pair, device):
     return int(predictions[0])
 
 
-def build_definition_graph(df, model, device):
+def find_pairs_in_common(df):
+    all_keys = {}
+    for (i, schema) in enumerate(df["Schema"]):
+        for key in schema.get("properties", {}).keys():
+            if key in all_keys:
+                all_keys[key].append(i)
+            else:
+                all_keys[key] = [i]
+
+    explored_pairs = set()
+    for schema_indexes in all_keys.values():
+        for (i1, i2) in itertools.combinations(schema_indexes, 2):
+            (i1, i2) = sorted((i1, i2))
+            if (i1, i2) not in explored_pairs:
+                yield i1, i2
+                explored_pairs.add((i1, i2))
+
+
+def merge_eval_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer):
+    """Merge the tokens of the schemas of the paths with in pair.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing paths, tokenized schemas, filenames
+        tokenizer (PreTrainedTokenizer): The tokenizer used for processing schemas.
+
+    Returns:
+        list: List of merged tokenized schemas.
+    """
+    
+    newline_token = tokenizer("\n")["input_ids"][1:-1]
+
+    total_len = len(tokenized_schema1) + len(tokenized_schema2)
+    max_tokenized_len = MAX_TOK_LEN - 1 - 2  # Account for BOS, EOS, and newline token lengths
+
+    # Proportionally truncate tokenized schemas if they exceed the maximum token length
+    if total_len > max_tokenized_len:
+        truncate_len = total_len - max_tokenized_len
+        truncate_len1 = math.ceil(len(tokenized_schema1) / total_len * truncate_len)
+        truncate_len2 = math.ceil(len(tokenized_schema2) / total_len * truncate_len)
+        tokenized_schema1 = tokenized_schema1[:-truncate_len1]
+        tokenized_schema2 = tokenized_schema2[:-truncate_len2]
+
+    merged_tokenized_schema = (
+        [tokenizer.bos_token_id] + tokenized_schema1 + newline_token + tokenized_schema2 + [tokenizer.eos_token_id]
+    )
+
+    return merged_tokenized_schema
+
+
+def build_definition_graph(df, model, device, tokenizer):
     """
     Build a definition graph from tokenized schema pairs using the given model.
 
     Args:
-        df (pd.DataFrame): A DataFrame containing pairs and tokenized schemas.
+        df (pd.DataFrame): A DataFrame containing paths and their tokenized schemas.
         model (PreTrainedModel): The model used for predicting connections.
         device (torch.device): The device (CPU or GPU) to run the model on.
+        tokenizer (PreTrainedTokenizer): The tokenizer used for processing schemas.
 
     Returns:
         nx.Graph: A graph with edges representing predicted connections between pairs.
@@ -343,15 +394,23 @@ def build_definition_graph(df, model, device):
     # Create a graph
     graph = nx.Graph()
     
+<<<<<<< HEAD
+    # Find pairs
+    for i1, i2 in find_pairs_in_common(df):     
+           
+        # We just need the tokenized schemas that is being combined one at a time.
+        tokenized_schema = merge_eval_schema_tokens(df["Input_ids"].iloc[i1], df["Input_ids"].iloc[i2], tokenizer)
+=======
     # Loop over tokenized schemas
     for _, row in tqdm.tqdm(df.iterrows(), position=5, leave=False, total=len(df), desc="making graph"):
         pair = row["Pairs"]
         tokenized_schema = row["Tokenized_schema"]
+>>>>>>> c7d92a88f0665625e08617c8bf06d0b54309b97c
 
         # If the predicted label is 1, add an edge between the paths' nodes
         predicted_label = get_predicted_label(model, tokenized_schema, device)
         if predicted_label:  
-            graph.add_edge(pair[0], pair[1])
+            graph.add_edge(df["Path"].iloc[i1], df["Path"].iloc[i2])
 
     return graph
 
@@ -366,18 +425,10 @@ def find_definitions_from_graph(graph):
     Returns:
         List[List]: A list of lists, each containing nodes representing a definition.
     """
-    #print("Graph edges")
-    #print(graph.number_of_edges())
-    #for e in graph.edges():
-    #    print(e)
 
     # Get all the cliques from the graph and sort them based on their lengths in ascending order
     cliques = list(nx.algorithms.find_cliques(graph))
     cliques.sort(key=lambda a: len(a))
-    print("Cliques")
-    for clique in cliques:
-        print(clique)
-    print()
     
     # Make sure a path only appears in one definition
     processed_cliques = []
@@ -416,17 +467,16 @@ def evaluate_data(test_ground_truth, model, tokenizer):
     test_schemas = test_ground_truth.keys()
 
     for schema in tqdm.tqdm(test_schemas, position=1, leave=False, total=len(test_schemas)):
+        if schema == "openrpc-json.json":
+            continue
         # Create a dataframe for schema that meets all the conditions
         filtered_df, frequent_ref_defn_paths = process_data.process_schema(schema, JSON_FOLDER, SCHEMA_FOLDER)
         if filtered_df is not None and frequent_ref_defn_paths is not None:
-            # Generate good and bad pairs
-            labeled_df = process_data.generate_pairs(filtered_df, frequent_ref_defn_paths)
-
-            # Merge the tokenized schemas
-            df = merge_schema_tokens(labeled_df, tokenizer) 
+            #print(filtered_df)
+            #filtered_df.to_csv("test.csv", columns=["Path", "Schema"], index=False)
         
             # Build a definition graph
-            graph = build_definition_graph(df, model, device)
+            graph = build_definition_graph(filtered_df, model, device, tokenizer)
     
             # Predict clusters
             predicted_clusters = find_definitions_from_graph(graph)
@@ -453,6 +503,7 @@ def evaluate_data(test_ground_truth, model, tokenizer):
                 print(predicted_cluster)
             print("-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------")
             print()
+            
         
   
 def calc_jaccard_index(actual_cluster, predicted_cluster):
@@ -527,147 +578,3 @@ def calc_scores(actual_clusters, predicted_clusters, threshold=0.5):
         precision, recall, f1_score = 0, 0, 0
     
     return precision, recall, f1_score
-
-
-def group_paths(df, test_ground_truth, min_common_keys=2):
-    """
-    Group paths that have at least two distinct nested keys in common per filename.
-
-    Args:
-        df (pd.DataFrame): DataFrame containing columns "Path", "Distinct_keys", and "Filename".
-        min_common_keys (int, optional): Minimum number of distinct nested keys required for paths to be grouped together. The default is 2.
-
-    Returns:
-        dict: Dictionary where keys are filenames and values are lists of groups of paths
-              with at least the specified number of distinct keys in common.
-    """
-
-    # Group data by filename
-    for filename, group in tqdm.tqdm(df.groupby("Filename"), position=1, leave=False, total=len(df.groupby("Filename")), desc="group"):
-        paths = group["Path"].tolist()
-        distinct_keys = group["Distinct_keys"].tolist()
-
-        # Use a list to keep track of groups
-        groups = []
-        
-        # Iterate through each path and try to group them
-        for i, (path, keys) in enumerate(zip(paths, distinct_keys)):
-            path = ast.literal_eval(path)
-            keys = ast.literal_eval(keys)
-
-            added_to_group = False
-            for group in groups:
-                # Check if this path shares at least min_common_keys with any path in the current group
-                if any(len(set(keys) & set(other_keys)) >= min_common_keys for other_path, other_keys in group):
-                    group.append((path, keys))
-                    added_to_group = True
-                    break
-            if not added_to_group:
-                # Create a new group if it doesn't fit in any existing group
-                groups.append([(path, keys)])
-        
-        # Convert groups of tuples to groups of paths
-        valid_groups = [group for group in groups if len(group) > 1]
-        grouped_paths = [[path for path, _ in group] for group in valid_groups]
-    
-
-        # Get the ground truth clusters
-        ground_truth_dict = test_ground_truth.get(filename, {})
-
-        # Evaluate
-        evaluate_grouped_paths(grouped_paths, ground_truth_dict, filename)
-
-
-def evaluate_grouped_paths(predicted_clusters, ground_truth_dict, filename):
-
-    actual_clusters = [[tuple(inner_list) for inner_list in outer_list] for outer_list in ground_truth_dict.values()]
-
-    # Calculate the precision, recall, and F1-score
-    precision, recall, f1_score = calc_scores(actual_clusters, predicted_clusters)
-
-    # Print the evaluation metrics
-    print(f"Schema: {filename}, Precision: {precision}, Recall: {recall}, F1-score: {f1_score}")
-
-    # Print the actual and predicted clusters
-    print("Actual clusters")
-    for actual_cluster in actual_clusters:
-        print(actual_cluster)
-
-    print()
-
-    print("Predicted clusters:")
-    for predicted_cluster in predicted_clusters:
-        print(predicted_cluster)
-    print("-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------")
-    print()
-
-
-class CustomJSONEncoder(json.JSONEncoder):
-    def default(self, obj):
-        # Convert non-serializable objects to a string representation
-        return str(obj)
-
-def dereference(obj, schema, definitions_to_keep):
-    if isinstance(obj, dict):
-        if "$ref" in obj:
-            ref = obj["$ref"]
-            if ref not in definitions_to_keep and isinstance(ref, str) and len(ref) > 0:
-                referenced_obj = dereference(get_definition(ref, schema), schema, definitions_to_keep)
-                obj = referenced_obj
-        else:
-            for key, value in obj.items():
-                obj[key] = dereference(value, schema, definitions_to_keep)
-    elif isinstance(obj, list):
-        obj = [dereference(item, schema, definitions_to_keep) for item in obj]
-    return obj
-
-def get_definition(ref, schema):
-    if ref.startswith("#/definitions/"):
-        parts = ref.split("/")
-        definition = schema["definitions"]
-        for part in parts[2:]:
-            if part:
-                definition = definition[part]
-        return definition
-    elif ref.startswith("$defs/"):
-        parts = ref.split("/")
-        definition = schema["$defs"]
-        for part in parts[1:]:
-            if part:
-                definition = definition[part]
-        return definition
-    else:
-        # Handle other reference formats if needed
-        pass
-
-    
-def dereference_and_calculate_schema_size(schema, definitions_to_keep=None):
-    """
-    Load, dereference, and calculate the size of the JSON schema in bytes.
-
-    Args:
-        schema (str): Name of the JSON schema file.
-        definitions_to_keep (list, optional): List of definitions to exclude from dereferencing.
-
-    Returns:
-        tuple: The dereferenced JSON schema and its size in bytes.
-    """
-
-    schema_path = os.path.join(SCHEMA_FOLDER, schema)
-
-    # Load the JSON schema from the file
-    with open(schema_path, 'r') as file:
-        schema = json.load(file)
-
-    # If definitions_to_keep is not provided, initialize it as an empty list
-    if definitions_to_keep is None:
-        definitions_to_keep = []
-
-    # Dereference the schema
-    dereferenced_schema = dereference(schema, schema, definitions_to_keep)
-
-    # Calculate the size of the dereferenced schema in bytes using a custom JSON encoder
-    schema_str = json.dumps(dereferenced_schema, separators=(',', ':'))
-    schema_size = len(schema_str.encode("utf-8"))
-    
-    return schema_size
