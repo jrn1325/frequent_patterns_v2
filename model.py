@@ -342,7 +342,7 @@ def build_definition_graph(df, model, device):
     """
     # Create a graph
     graph = nx.Graph()
-
+    
     # Loop over tokenized schemas
     for _, row in tqdm.tqdm(df.iterrows(), position=5, leave=False, total=len(df), desc="making graph"):
         pair = row["Pairs"]
