@@ -32,6 +32,34 @@ def evaluate_model():
 
     model.evaluate_data(test_ground_truth, m, tokenizer)
 
+
+def evaluate_simple_model():
+    
+    df = pd.read_csv("test_data.csv")
+
+    test_ground_truth = {}
+    with open("test_ground_truth.json", 'r') as json_file:
+        for line in json_file:
+            test_ground_truth.update(json.loads(line))
+
+    model.group_paths(df, test_ground_truth)
+
+
+def deref_schemas():
+    test_ground_truth = {}
+    with open("modified_ground_truth.json", 'r') as json_file:
+        for line in json_file:
+            test_ground_truth.update(json.loads(line))
+
+    for schema, ground_truth in test_ground_truth.items():
+        definitions_to_keep = list(ground_truth.keys())
+
+        # Calculate the size of the dereferenced schema in bytes
+        schema_size = model.dereference_and_calculate_schema_size(schema, definitions_to_keep)
+        print(f"The size of the dereferenced schema {schema} is {schema_size} bytes")
+    
+
+
                         
 def main():
     """
@@ -49,6 +77,11 @@ def main():
         # Evaluate the model
         evaluate_model()
         print(time.time() - start_time)
+    elif mode == "simple":
+        # Evaluate the simple model
+        evaluate_simple_model()
+    elif mode == "size":
+        deref_schemas()
     else:
         print(f"Error: Unknown mode '{mode}'. Use 'train' or 'test'.")
         sys.exit(1)

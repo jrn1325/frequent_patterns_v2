@@ -111,8 +111,8 @@ def get_paths_and_values(json_schema, filename):
         dict: dictionary of all the paths and values
     """
     paths_dict = defaultdict(set)
-    #prefix_paths_dict = defaultdict(set)
-    prefix_paths_dict = defaultdict(list)
+    prefix_paths_dict = defaultdict(set)
+    #prefix_paths_dict = defaultdict(list)
 
 
     with open(filename, 'r') as f:
@@ -125,18 +125,17 @@ def get_paths_and_values(json_schema, filename):
             if isinstance(doc, dict) and len(doc) > 0 and match_properties(json_schema, doc):
                 # Get the paths and values of type object and non-empty in the json document
                 for path, value in parse_document(doc):
-                    '''
+                    
                     if len(path) > 1:
                         prefix = path[:-1]
-                        #prefix_paths_dict.setdefault(prefix, set()).add(path)
-                        prefix_paths_dict.setdefault(prefix, []).append(path)
-                    '''
-
+                        prefix_paths_dict.setdefault(prefix, set()).add(path)
+                        #prefix_paths_dict.setdefault(prefix, []).append(path)
+                    
                     
                     if isinstance(value, dict) and len(value) > 0:
                         value = json.dumps(value)
                         paths_dict[path].add(value)                           
-
+                    
     return paths_dict, prefix_paths_dict
 
 
@@ -276,7 +275,7 @@ def tokenize_schema(schema):
    
     return tokenized_schema, list(input_ids_numpy)
 
-'''
+
 def create_dataframe(prefix_paths_dict):
     """Create a DataFrame of paths, distinct subkeys, and numerical representations using FastText embeddings.
 
@@ -291,14 +290,12 @@ def create_dataframe(prefix_paths_dict):
 
     # Iterate over paths under the current prefix to get all the unique nested keys
     for prefix, path_list in prefix_paths_dict.items():
-        #distinct_subkeys = set()
-        distinct_subkeys = []
+        distinct_subkeys = set()
         for path in path_list:
             if path[-1] == '*':
                 continue
 
-            distinct_subkeys.append(path[-1])
-            #distinct_subkeys.add(path[-1])
+            distinct_subkeys.add(path[-1])
 
             if len(distinct_subkeys) > DISTINCT_SUBKEYS_UPPER_BOUND:
                 break
@@ -310,7 +307,6 @@ def create_dataframe(prefix_paths_dict):
         if len(distinct_subkeys) == 1 and '*' in distinct_subkeys:
             continue
 
-        distinct_subkeys = get_modes(distinct_subkeys)
         distinct_subkeys = sorted(list(distinct_subkeys))
         
         # Construct row data for DataFrame
@@ -318,7 +314,7 @@ def create_dataframe(prefix_paths_dict):
         df_data.append(row_data)
 
     # Create DataFrame
-    df = pd.DataFrame(df_data, columns=["Path", "Schema"])
+    df = pd.DataFrame(df_data, columns=["Path", "Distinct_keys"])
      # Sort the DataFrame by the "Path" column
     df_sorted = df.sort_values(by="Path")
     return df_sorted
@@ -345,7 +341,7 @@ def create_dataframe(paths_dict):
     df = pd.DataFrame(df_data, columns=columns)
     df_sorted = df.sort_values(by="Path")
     return df_sorted
-
+'''
     
 def clean_ref_defn_paths(json_schema): 
     """Remove keywords associated with JSON Schema that do not exist in JSON documents format
@@ -918,7 +914,8 @@ def process_schema(schema, json_folder, schema_folder):
     if not frequent_ref_defn_paths:
         return None, None
 
-    df = create_dataframe(paths_dict)
+    #df = create_dataframe(paths_dict)
+    df = create_dataframe(prefix_paths_dict)
     filtered_df = df[~df["Path"].isin(paths_to_exclude)]
     if filtered_df.empty:
         return None, None
@@ -987,20 +984,22 @@ def preprocess_data(schemas, filename, ground_truth_file):
         if filtered_df is not None and frequent_ref_defn_paths is not None:
             ground_truths[schema] = frequent_ref_defn_paths
             print(f"Sampling data for {schema}...")
-            df = get_samples(filtered_df, frequent_ref_defn_paths)
-            frames.append(df)
+            #df = get_samples(filtered_df, frequent_ref_defn_paths)
+            #frames.append(df)
+            frames.append(filtered_df)
 
     if frames:
         print("Merging dataframes...")
         
         merged_df = concatenate_dataframes(frames)
-        merged_df.to_parquet(filename, index=False)
-        save_ground_truths(ground_truths, ground_truth_file)
+        #merged_df.to_parquet(filename, index=False)
+        merged_df.to_csv("test_data.csv")
+        #save_ground_truths(ground_truths, ground_truth_file)
 
 
 def main():
     train_schemas, test_schemas = split_data()
-    preprocess_data(train_schemas, filename="sample_train_data.parquet", ground_truth_file="train_ground_truth.json")
+    #preprocess_data(train_schemas, filename="sample_train_data.parquet", ground_truth_file="train_ground_truth.json")
     preprocess_data(test_schemas, filename="sample_test_data.parquet", ground_truth_file="test_ground_truth.json")
 
     
