@@ -558,11 +558,10 @@ def print_items(dictionary):
     print()
 
 
-def create_dataframe(paths_dict, paths_to_exclude):
+def create_dataframe(paths_dict):
     """Create a DataFrame of paths and their values schema
     Args:
         paths_dict (dict): Dictionary of paths and their values.
-        paths_to_exclude (set): Paths to remove from JSON files
 
     Returns:
         pd.DataFrame: DataFrame with tokenized schema added.
@@ -573,15 +572,8 @@ def create_dataframe(paths_dict, paths_to_exclude):
     for path, values in paths_dict.items():
         values = [json.loads(v) for v in values]
         schema = discover_schema_from_values(values)
-        
-        # Extract the first two keys from the properties
-        first_two_keys = list(schema["properties"].keys())[:2]
-        if len(first_two_keys) >= 2:
-            tokenized_schema, input_ids = tokenize_schema(json.dumps(schema))
-            df_data.append([path, tokenized_schema, input_ids, schema])
-            
-        else:
-            paths_to_exclude.add(path)
+        tokenized_schema, input_ids = tokenize_schema(json.dumps(schema))
+        df_data.append([path, tokenized_schema, input_ids, schema])
         
     columns = ["Path", "Tokenized_schema", "Input_ids", "Schema"]
     df = pd.DataFrame(df_data, columns=columns)
@@ -687,7 +679,7 @@ def get_samples(df, frequent_ref_defn_paths):
         good_paths_pairs = list(itertools.combinations(good_paths, 2))
         all_good_pairs.update(good_paths_pairs)
 
-        limited_pairs = itertools.islice(good_paths_pairs, 1500)
+        limited_pairs = itertools.islice(good_paths_pairs, 1000)
         good_pairs.update(limited_pairs)
 
         # Map paths to their reference definition
@@ -719,103 +711,6 @@ def get_samples(df, frequent_ref_defn_paths):
     return labeled_df
 
 
-def get_nested_keys(schema):
-    """
-    Extract nested keys from the schema. Placeholder for actual implementation.
-    """
-  
-    return set(schema.keys())  # Assuming schema is a dict for this example
-
-
-def process_pair(pair, df, good_pairs):
-    """
-    Process a pair of paths to determine if it should be considered a bad pair.
-
-    Args:
-        pair (tuple): A tuple containing two path strings.
-        df (pd.DataFrame): DataFrame containing paths and schemas.
-        good_pairs (set): Set of good pairs.
-
-    Returns:
-        tuple or None: The pair if it is a bad pair, otherwise None.
-    """
-
-    if (pair[0], pair[1]) not in good_pairs and (pair[0], pair[1]) not in good_pairs:
-        schema1 = df.loc[df["Path"] == pair[0], "Schema"].iloc[0]
-        nested_keys1 = get_nested_keys(schema1)
-        schema2 = df.loc[df["Path"] == pair[1], "Schema"].iloc[0]
-        nested_keys2 = get_nested_keys(schema2)
-    
-    if pair not in good_pairs and not nested_keys1.isdisjoint(nested_keys2):
-        return pair
-    return None
-
-
-def generate_pairs(df, frequent_ref_defn_paths):
-    """
-    Generate labeled good and bad pairs for all test data based on ground truth definitions.
-
-    Args:
-        df (pd.DataFrame): DataFrame containing paths and schemas.
-        frequent_ref_defn_paths (dict): Dictionary of frequent referenced definition and their paths.
-    
-    Return
-        pd.DataFrame: DataFrame containing labeled pairs, schemas, and filenames.
-    """
-    
-    good_pairs = set()
-    bad_pairs = set()
-    '''
-    # Generate good pairs from frequent referenced definition paths
-    for ref_defn, good_paths in frequent_ref_defn_paths.items():
-        pairs_for_paths = itertools.combinations(good_paths, 2)
-        good_pairs.update(pairs_for_paths)
-
-    # Get all paths in the schema
-    paths = list(df["Path"])
-
-    # Generate bad pairs from all possible path combinations that are not in good pairs
-    pairs_for_paths = itertools.combinations(paths, 2)
-    for pair in tqdm.tqdm(pairs_for_paths, position=3, leave=False, total=len(list(pairs_for_paths)), desc="bad pairs"):
-        pair = process_pair(pair, df, good_pairs)
-        if pair is not None:
-            bad_pairs.add(pair)
-        #if pair not in good_pairs:
-        #    bad_pairs.add(pair)
-    # Label data
-    labeled_df = label_samples(df, good_pairs, bad_pairs)
-    '''
-    # Get all paths in the schema
-    paths = list(df["Path"])
-
-    # Generate pairs
-    pairs_for_paths = itertools.combinations(paths, 2)
-
-    # Create lists to store data
-    pairs = []
-    tokenized_schemas1 = [] 
-    tokenized_schemas2 = []  
-    filenames = []  
-
-    # Process pairs
-    for pair in pairs_for_paths:
-        pairs.append(pair)
-
-        # Extract schemas and filename for both paths in the pair
-        path1_row = df[df["Path"] == pair[0]].iloc[0]
-        path2_row = df[df["Path"] == pair[1]].iloc[0]
-        filenames.append(path1_row["Filename"])
-        tokenized_schemas1.append(path1_row["Input_ids"])
-        tokenized_schemas2.append(path2_row["Input_ids"])
-        
-    # Create a new DataFrame containing the pairs, schemas, and filenames
-    df = pd.DataFrame({"Pairs": pairs,
-                               "Filename": filenames,
-                               "Tokenized_schema1": tokenized_schemas1,
-                               "Tokenized_schema2": tokenized_schemas2
-                               })
-    
-    return df
 
 
 def label_samples(df, good_pairs, bad_pairs):
@@ -963,13 +858,7 @@ def process_schema(schema, json_folder, schema_folder):
     if not frequent_ref_defn_paths:
         return None, None
 
-    df = create_dataframe(paths_dict, paths_to_exclude)
-    updated_ref_defn_paths = {}
-
-    for ref_defn, paths in frequent_ref_defn_paths.items():
-        intersecting_paths = set(paths) & set(df["Path"])
-        if len(intersecting_paths) >= 2:
-            updated_ref_defn_paths[ref_defn] = intersecting_paths
+    df = create_dataframe(paths_dict)
 
     filtered_df = df[~df["Path"].isin(paths_to_exclude)]
     if filtered_df.empty:
@@ -977,7 +866,7 @@ def process_schema(schema, json_folder, schema_folder):
 
     filtered_df["Filename"] = schema
     filtered_df.reset_index(drop=True, inplace=True)
-    return filtered_df, updated_ref_defn_paths
+    return filtered_df, frequent_ref_defn_paths
 
 
 def save_ground_truths(ground_truths, ground_truth_file):
