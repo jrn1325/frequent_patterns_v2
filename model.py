@@ -164,7 +164,7 @@ def train_model(train_df, test_df):
     accumulation_steps = 4
     batch_size = 8
     learning_rate = 2e-5
-    num_epochs = 75
+    num_epochs = 50
 
     # Start a new wandb run to track this script
     wandb.require("core")
@@ -394,18 +394,11 @@ def build_definition_graph(df, model, device, tokenizer):
     # Create a graph
     graph = nx.Graph()
     
-<<<<<<< HEAD
     # Find pairs
     for i1, i2 in find_pairs_in_common(df):     
            
         # We just need the tokenized schemas that is being combined one at a time.
         tokenized_schema = merge_eval_schema_tokens(df["Input_ids"].iloc[i1], df["Input_ids"].iloc[i2], tokenizer)
-=======
-    # Loop over tokenized schemas
-    for _, row in tqdm.tqdm(df.iterrows(), position=5, leave=False, total=len(df), desc="making graph"):
-        pair = row["Pairs"]
-        tokenized_schema = row["Tokenized_schema"]
->>>>>>> c7d92a88f0665625e08617c8bf06d0b54309b97c
 
         # If the predicted label is 1, add an edge between the paths' nodes
         predicted_label = get_predicted_label(model, tokenized_schema, device)

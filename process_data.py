@@ -687,7 +687,7 @@ def get_samples(df, frequent_ref_defn_paths):
         good_paths_pairs = list(itertools.combinations(good_paths, 2))
         all_good_pairs.update(good_paths_pairs)
 
-        limited_pairs = itertools.islice(good_paths_pairs, 1000)
+        limited_pairs = itertools.islice(good_paths_pairs, 1500)
         good_pairs.update(limited_pairs)
 
         # Map paths to their reference definition
