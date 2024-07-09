@@ -711,8 +711,6 @@ def get_samples(df, frequent_ref_defn_paths):
     return labeled_df
 
 
-
-
 def label_samples(df, good_pairs, bad_pairs):
     """
     Label the samples in the DataFrame based on good and bad pairs.
@@ -930,9 +928,6 @@ def preprocess_data(schemas, filename, ground_truth_file):
             print(f"Sampling data for {schema}...")
             df = get_samples(filtered_df, frequent_ref_defn_paths)
             frames.append(df)
-        
-    #merged_df = concatenate_dataframes(frames)
-    #merged_df[["Path", "Schema"]].to_csv("df.csv", index=False)
     
     if frames:
         print("Merging dataframes...")
