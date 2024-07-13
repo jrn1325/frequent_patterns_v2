@@ -691,9 +691,9 @@ def get_samples(df, frequent_ref_defn_paths):
 
     if bad_paths:
         # Filter the DataFrame for bad paths
-        filtered_df = df[df["Path"].isin(bad_paths)]
+        #filtered_df = df[df["Path"].isin(bad_paths)]
         # Calculate the embeddings of the tokenized schema
-        schema_embeddings = calculate_embeddings(filtered_df)
+        schema_embeddings = calculate_embeddings(df)
         # Calculate cosine distances for all pairs
         cosine_distances = calculate_cosine_distance(schema_embeddings, all_good_pairs)
         #for i in cosine_distances[:10]:
@@ -935,7 +935,6 @@ def preprocess_data(schemas, filename, ground_truth_file):
         merged_df.to_parquet(filename, index=False)
         save_ground_truths(ground_truths, ground_truth_file)
     
-
 
 def main():
     train_schemas, test_schemas = split_data()
