@@ -344,7 +344,7 @@ def clean_ref_defn_paths(json_schema):
         # Remove JSON Schema keywords from the paths
         cleaned_path = tuple('*' if key == ITEMS_KEYWORD else key for key in path if key not in JSON_SCHEMA_KEYWORDS)
 
-        # XXX cannot handle paths with patternProperties or additionalProperties of tyoe object yet
+        # XXX cannot handle paths with patternProperties or additionalProperties of type object yet
         for keyword in COMPLEX_PROPERTIES_KEYWORD:
             if keyword in cleaned_path:
                 break
@@ -701,7 +701,7 @@ def get_samples(df, frequent_ref_defn_paths):
         
         # Select pairs with the smallest distances as bad pairs
         for pair, distance in cosine_distances:
-            if len(bad_pairs) < len(good_pairs):
+            if len(bad_pairs) < 10 * len(good_pairs):
                 bad_pairs.add(pair)
             else:
                 break
