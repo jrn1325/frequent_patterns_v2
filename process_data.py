@@ -131,7 +131,6 @@ def get_paths_and_values(json_schema, filename):
                         #prefix_paths_dict.setdefault(prefix, set()).add(path)
                         prefix_paths_dict.setdefault(prefix, []).append(path)
                     '''
-
                     
                     if isinstance(value, dict) and len(value) > 0:
                         value = json.dumps(value)
@@ -274,6 +273,7 @@ def tokenize_schema(schema):
     input_ids_numpy = input_ids_tensor_sliced.cpu().numpy()
    
     return tokenized_schema, list(input_ids_numpy)
+
 
 '''
 def create_dataframe(prefix_paths_dict):
@@ -460,13 +460,11 @@ def get_ref_defn_of_type_obj(json_schema, ref_defn_paths, paths_to_exclude):
         try:
             defn_obj = defn_root[defn_name]
         except (KeyError, AttributeError, TypeError):
-            #print(ref)
             ref_to_delete.append(ref)
             continue
 
         # Skip if the definition object is not a dictionary
         if not isinstance(defn_obj, dict):
-            #print("defn obj not dict", ref)
             ref_to_delete.append(ref)
             continue
 
@@ -474,11 +472,10 @@ def get_ref_defn_of_type_obj(json_schema, ref_defn_paths, paths_to_exclude):
 
         # Skip if additionalProperties is True or not specified
         if additional_properties_value is not False:
-            #print("addProp not false", ref)
             ref_to_delete.append(ref)
             continue
 
-        # Skip if definition has less than two properties
+        # Skip if definition has fewer than two properties
         if "properties" not in defn_obj or len(defn_obj["properties"]) <= 1:
             #print("not enough prop", ref)
             ref_to_delete.append(ref)
@@ -531,7 +528,7 @@ def find_frequent_definitions(good_ref_defn_paths, paths_to_exclude):
     Args:
         good_ref_defn_paths (dict): Dictionary of reference definitions and their paths.
         paths_to_exclude (set): Paths to remove from JSON files
-    Return:
+    Returns:
         dict: Dictionary of frequently referenced definitions
     """
     frequent_ref_defn_paths = {}
@@ -552,16 +549,11 @@ def find_frequent_definitions(good_ref_defn_paths, paths_to_exclude):
     return frequent_ref_defn_paths
 
 
-def print_items(dictionary):
-    for k, v in dictionary.items():
-        print("ref:", k, ", paths:", v)
-    print()
-
-
-def create_dataframe(paths_dict):
+def create_dataframe(paths_dict, paths_to_exclude):
     """Create a DataFrame of paths and their values schema
     Args:
         paths_dict (dict): Dictionary of paths and their values.
+        paths_to_exclude (set): Paths to remove from JSON files
 
     Returns:
         pd.DataFrame: DataFrame with tokenized schema added.
@@ -572,8 +564,11 @@ def create_dataframe(paths_dict):
     for path, values in paths_dict.items():
         values = [json.loads(v) for v in values]
         schema = discover_schema_from_values(values)
-        tokenized_schema, input_ids = tokenize_schema(json.dumps(schema))
-        df_data.append([path, tokenized_schema, input_ids, schema])
+        if len(schema["properties"]) > 1:
+            tokenized_schema, input_ids = tokenize_schema(json.dumps(schema))
+            df_data.append([path, tokenized_schema, input_ids, schema])
+        else:
+            paths_to_exclude.update(path)
         
     columns = ["Path", "Tokenized_schema", "Input_ids", "Schema"]
     df = pd.DataFrame(df_data, columns=columns)
@@ -678,9 +673,7 @@ def get_samples(df, frequent_ref_defn_paths):
     for ref_defn, good_paths in frequent_ref_defn_paths.items():
         good_paths_pairs = list(itertools.combinations(good_paths, 2))
         all_good_pairs.update(good_paths_pairs)
-
-        limited_pairs = itertools.islice(good_paths_pairs, 1000)
-        good_pairs.update(limited_pairs)
+        good_pairs.update(itertools.islice(good_paths_pairs, 1000))
 
         # Map paths to their reference definition
         for path in good_paths:
@@ -690,8 +683,6 @@ def get_samples(df, frequent_ref_defn_paths):
     bad_paths = list(set(paths) - set(ref_path_dict.keys()))
 
     if bad_paths:
-        # Filter the DataFrame for bad paths
-        #filtered_df = df[df["Path"].isin(bad_paths)]
         # Calculate the embeddings of the tokenized schema
         schema_embeddings = calculate_embeddings(df)
         # Calculate cosine distances for all pairs
@@ -701,7 +692,7 @@ def get_samples(df, frequent_ref_defn_paths):
         
         # Select pairs with the smallest distances as bad pairs
         for pair, distance in cosine_distances:
-            if len(bad_pairs) < 10 * len(good_pairs):
+            if len(bad_pairs) < len(good_pairs):
                 bad_pairs.add(pair)
             else:
                 break
@@ -850,21 +841,27 @@ def process_schema(schema, json_folder, schema_folder):
 
     if not filtered_ref_defn_paths:
         return None, None
-    
+
     frequent_ref_defn_paths = find_frequent_definitions(filtered_ref_defn_paths, paths_to_exclude)
 
     if not frequent_ref_defn_paths:
         return None, None
-
-    df = create_dataframe(paths_dict)
+    
+    df = create_dataframe(paths_dict, paths_to_exclude)
 
     filtered_df = df[~df["Path"].isin(paths_to_exclude)]
     if filtered_df.empty:
         return None, None
 
+    updated_ref_defn_paths = {}
+    for ref_defn, paths in frequent_ref_defn_paths.items():
+        intersecting_paths = set(paths) & set(filtered_df["Path"])
+        if len(intersecting_paths) >= 2:
+            updated_ref_defn_paths[ref_defn] = intersecting_paths
+
     filtered_df["Filename"] = schema
     filtered_df.reset_index(drop=True, inplace=True)
-    return filtered_df, frequent_ref_defn_paths
+    return filtered_df, updated_ref_defn_paths
 
 
 def save_ground_truths(ground_truths, ground_truth_file):
