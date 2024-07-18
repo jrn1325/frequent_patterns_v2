@@ -14,12 +14,13 @@ from copy import copy, deepcopy
 from functools import reduce
 from sklearn.model_selection import GroupShuffleSplit
 from torch.nn.functional import normalize
-from transformers import AutoTokenizer
-
+from transformers import AutoTokenizer, LongformerModel
 
 model_name = "microsoft/codebert-base" 
+#model_name = "allenai/longformer-base-4096"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoAdapterModel.from_pretrained(model_name)
+#model = LongformerModel.from_pretrained(model_name)
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -263,16 +264,16 @@ def tokenize_schema(schema):
 
     # Tokenize the schema
     tokenized_schema = tokenizer(schema, return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True)
-    input_ids_tensor = tokenized_schema["input_ids"]
-    input_ids_tensor = input_ids_tensor[input_ids_tensor != tokenizer.pad_token_id]
+    #input_ids_tensor = tokenized_schema["input_ids"]
+    #input_ids_tensor = input_ids_tensor[input_ids_tensor != tokenizer.pad_token_id]
 
     # Remove the first and last tokens
-    input_ids_tensor_sliced = input_ids_tensor[1:-1]
+    #input_ids_tensor_sliced = input_ids_tensor[1:-1]
 
     # Convert tensor to a numpy array and then list
-    input_ids_numpy = input_ids_tensor_sliced.cpu().numpy()
+    #input_ids_numpy = input_ids_tensor_sliced.cpu().numpy()
    
-    return tokenized_schema, list(input_ids_numpy)
+    return tokenized_schema#, list(input_ids_numpy)
 
 
 '''
@@ -565,12 +566,12 @@ def create_dataframe(paths_dict, paths_to_exclude):
         values = [json.loads(v) for v in values]
         schema = discover_schema_from_values(values)
         if len(schema["properties"]) > 1:
-            tokenized_schema, input_ids = tokenize_schema(json.dumps(schema))
-            df_data.append([path, tokenized_schema, input_ids, schema])
+            tokenized_schema = tokenize_schema(json.dumps(schema))
+            df_data.append([path, tokenized_schema, schema])
         else:
             paths_to_exclude.update(path)
         
-    columns = ["Path", "Tokenized_schema", "Input_ids", "Schema"]
+    columns = ["Path", "Tokenized_schema", "Schema"]
     df = pd.DataFrame(df_data, columns=columns)
     return df.sort_values(by="Path")
 
@@ -731,8 +732,8 @@ def label_samples(df, good_pairs, bad_pairs):
         path1_row = df[df["Path"] == pair[0]].iloc[0]
         path2_row = df[df["Path"] == pair[1]].iloc[0]
         filenames.append(path1_row["Filename"])
-        tokenized_schemas1.append(path1_row["Input_ids"])
-        tokenized_schemas2.append(path2_row["Input_ids"])
+        tokenized_schemas1.append(path1_row["Schema"])
+        tokenized_schemas2.append(path2_row["Schema"])
         
 
     # Process bad pairs: label them as 0 (negative)
@@ -744,16 +745,16 @@ def label_samples(df, good_pairs, bad_pairs):
         path1_row = df[df["Path"] == pair[0]].iloc[0]
         path2_row = df[df["Path"] == pair[1]].iloc[0]
         filenames.append(path1_row["Filename"])
-        tokenized_schemas1.append(path1_row["Input_ids"])
-        tokenized_schemas2.append(path2_row["Input_ids"])
+        tokenized_schemas1.append(path1_row["Schema"])
+        tokenized_schemas2.append(path2_row["Schema"])
         
 
     # Create a new DataFrame containing the labeled pairs, schemas, and filenames
     labeled_df = pd.DataFrame({"Pairs": pairs,
                                "Label": labels,
                                "Filename": filenames,
-                               "Tokenized_schema1": tokenized_schemas1,
-                               "Tokenized_schema2": tokenized_schemas2
+                               "Schema1": tokenized_schemas1,
+                               "Schema2": tokenized_schemas2
                                })
 
     return labeled_df

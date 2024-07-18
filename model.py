@@ -63,6 +63,72 @@ def initialize_model(model_name, adapter_name=ADAPTER_NAME):
     return model, tokenizer
 
 
+def extract_properties(schema):
+    """Extract properties from a JSON schema."""
+    if "properties" in schema:
+        return schema["properties"]
+    return {}
+
+
+def order_properties_by_commonality(schema1, schema2):
+    """
+    Orders the properties of two schemas based on their common properties.
+
+    Args:
+        schema1 (dict): The first JSON schema.
+        schema2 (dict): The second JSON schema.
+
+    Returns:
+        tuple: Two dictionaries representing the schemas with properties ordered by commonality.
+    """
+
+    # Extract properties from both schemas
+    properties1 = extract_properties(schema1)
+    properties2 = extract_properties(schema2)
+
+    # Find common properties
+    common_properties = set(properties1.keys()).intersection(set(properties2.keys()))
+
+    # Order properties by commonality
+    ordered_properties1 = {prop: properties1[prop] for prop in common_properties}
+    ordered_properties1.update({prop: properties1[prop] for prop in properties1 if prop not in common_properties})
+
+    ordered_properties2 = {prop: properties2[prop] for prop in common_properties}
+    ordered_properties2.update({prop: properties2[prop] for prop in properties2 if prop not in common_properties})
+
+    # Create new ordered schemas
+    ordered_schema1 = {**schema1, "properties": ordered_properties1}
+    ordered_schema2 = {**schema2, "properties": ordered_properties2}
+
+    return ordered_schema1, ordered_schema2
+
+
+def tokenize_schema(schema, tokenizer):
+    """Tokenize schema.
+
+    Args:
+        schema (dict): DataFrame containing pairs, labels, filenames, and schemas of each path in pair
+        tokenizer (PreTrainedTokenizer): The tokenizer used for processing schemas.
+
+    Returns:
+        torch.tensor: inputs_ids tensor
+    """
+
+    # Tokenize the schema
+    tokenized_schema = tokenizer(json.dumps(schema), return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True)
+    input_ids_tensor = tokenized_schema["input_ids"]
+    input_ids_tensor = input_ids_tensor[input_ids_tensor != tokenizer.pad_token_id]
+
+    # Remove the first and last tokens
+    input_ids_tensor_sliced = input_ids_tensor[1:-1]
+
+    # Convert tensor to a numpy array and then list
+    input_ids_numpy = input_ids_tensor_sliced.cpu().numpy()
+    input_ids_list = input_ids_numpy.tolist()
+   
+    return input_ids_list
+
+
 def merge_schema_tokens(df, tokenizer):
     """Merge the tokens of the schemas of the paths with in pair.
 
@@ -78,12 +144,15 @@ def merge_schema_tokens(df, tokenizer):
     tokenized_schemas = []
 
     # Loop over the schemas of the pairs of tokenized schemas
-    for idx, (tokenized_schema1, tokenized_schema2) in tqdm.tqdm(df[["Tokenized_schema1", "Tokenized_schema2"]].iterrows(), position=4, leave=False, total=len(df), desc="merge tokens"):
-        if not isinstance(tokenized_schema1, list) or not isinstance(tokenized_schema2, list):
-            # Convert string representations of lists to actual lists
-            tokenized_schema1 = ast.literal_eval(tokenized_schema1)
-            tokenized_schema2 = ast.literal_eval(tokenized_schema2)
-
+    for idx, (schema1, schema2) in tqdm.tqdm(df[["Schema1", "Schema2"]].iterrows(), position=4, leave=False, total=len(df), desc="merge tokens"):
+        #print(df.iloc[idx]["Pairs"])
+        schema1 = schema1.replace("'", '"')
+        schema2 = schema2.replace("'", '"')
+        schema1 = json.loads(schema1)
+        schema2 = json.loads(schema2)
+        ordered_schema1, ordered_schema2 = order_properties_by_commonality(schema1, schema2)
+        tokenized_schema1 = tokenize_schema(ordered_schema1, tokenizer)
+        tokenized_schema2 = tokenize_schema(ordered_schema2, tokenizer)
         total_len = len(tokenized_schema1) + len(tokenized_schema2)
         max_tokenized_len = MAX_TOK_LEN - 1 - 2  # Account for BOS, EOS, and newline token lengths
 
@@ -103,7 +172,7 @@ def merge_schema_tokens(df, tokenizer):
 
     # Add a new column for tokenized schemas and drop old ones
     df["Tokenized_schema"] = tokenized_schemas
-    df = df.drop(["Tokenized_schema1", "Tokenized_schema2", "Filename"], axis=1)
+    df = df.drop(["Schema1", "Schema2", "Filename"], axis=1)
 
     # Shuffle all the rows in the DataFrame
     df = df.sample(frac=1).reset_index(drop=True)
@@ -164,7 +233,7 @@ def train_model(train_df, test_df):
     accumulation_steps = 4
     batch_size = 8
     learning_rate = 2e-5
-    num_epochs = 50
+    num_epochs = 25
 
     # Start a new wandb run to track this script
     wandb.require("core")
@@ -347,7 +416,7 @@ def find_pairs_in_common(df):
                 explored_pairs.add((i1, i2))
 
 
-def merge_eval_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer):
+def merge_eval_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer):#, truncations):
     """Merge the tokens of the schemas of the paths with in pair.
 
     Args:
@@ -362,7 +431,7 @@ def merge_eval_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer):
 
     total_len = len(tokenized_schema1) + len(tokenized_schema2)
     max_tokenized_len = MAX_TOK_LEN - 1 - 2  # Account for BOS, EOS, and newline token lengths
-
+    #print("total length:", total_len, "max length:", max_tokenized_len)
     # Proportionally truncate tokenized schemas if they exceed the maximum token length
     if total_len > max_tokenized_len:
         truncate_len = total_len - max_tokenized_len
@@ -370,12 +439,13 @@ def merge_eval_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer):
         truncate_len2 = math.ceil(len(tokenized_schema2) / total_len * truncate_len)
         tokenized_schema1 = tokenized_schema1[:-truncate_len1]
         tokenized_schema2 = tokenized_schema2[:-truncate_len2]
+        #truncations += 1
 
     merged_tokenized_schema = (
         [tokenizer.bos_token_id] + tokenized_schema1 + newline_token + tokenized_schema2 + [tokenizer.eos_token_id]
     )
 
-    return merged_tokenized_schema
+    return merged_tokenized_schema#, truncations
 
 
 def build_definition_graph(df, model, device, tokenizer):
@@ -393,18 +463,24 @@ def build_definition_graph(df, model, device, tokenizer):
     """
     # Create a graph
     graph = nx.Graph()
-    
-    # Find pairs
-    for i1, i2 in find_pairs_in_common(df):     
-           
-        # We just need the tokenized schemas that is being combined one at a time.
-        tokenized_schema = merge_eval_schema_tokens(df["Input_ids"].iloc[i1], df["Input_ids"].iloc[i2], tokenizer)
 
+    # Find pairs
+    for i1, i2 in find_pairs_in_common(df):   
+        schema1 = df["Schema"].iloc[i1]
+        schema2 = df["Schema"].iloc[i2] 
+        ordered_schema1, ordered_schema2 = order_properties_by_commonality(schema1, schema2)
+        tokenized_schema1 = tokenize_schema(ordered_schema1, tokenizer)
+        tokenized_schema2 = tokenize_schema(ordered_schema2, tokenizer) 
+        tokenized_schema = merge_eval_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer)
+        
         # If the predicted label is 1, add an edge between the paths' nodes
         predicted_label = get_predicted_label(model, tokenized_schema, device)
+
         if predicted_label:  
+            #print(df["Path"].iloc[i1], df["Path"].iloc[i2])#, df["Schema"].iloc[i1], df["Schema"].iloc[i2])
             graph.add_edge(df["Path"].iloc[i1], df["Path"].iloc[i2])
 
+    print()
     return graph
 
 
@@ -458,6 +534,7 @@ def evaluate_data(test_ground_truth, model, tokenizer):
 
     # Get the test schemas
     test_schemas = test_ground_truth.keys()
+    f1_scores = []
 
     for schema in tqdm.tqdm(test_schemas, position=1, leave=False, total=len(test_schemas)):
         if schema == "openrpc-json.json":
@@ -465,12 +542,11 @@ def evaluate_data(test_ground_truth, model, tokenizer):
         # Create a dataframe for schema that meets all the conditions
         filtered_df, frequent_ref_defn_paths = process_data.process_schema(schema, JSON_FOLDER, SCHEMA_FOLDER)
         if filtered_df is not None and frequent_ref_defn_paths is not None:
-            #print(filtered_df)
-            #filtered_df.to_csv("test.csv", columns=["Path", "Schema"], index=False)
-        
+            #filtered_df.to_csv(schema, columns=["Path", "Schema"], index=False)
+            #print(schema)
             # Build a definition graph
             graph = build_definition_graph(filtered_df, model, device, tokenizer)
-    
+            #continue
             # Predict clusters
             predicted_clusters = find_definitions_from_graph(graph)
 
@@ -480,6 +556,7 @@ def evaluate_data(test_ground_truth, model, tokenizer):
 
             # Calculate the precision, recall, and F1-score
             precision, recall, f1_score = calc_scores(actual_clusters, predicted_clusters)
+            f1_scores.append(f1_score)
 
             # Print the evaluation metrics
             print(f"Schema: {schema}, Precision: {precision}, Recall: {recall}, F1-score: {f1_score}")
@@ -490,13 +567,13 @@ def evaluate_data(test_ground_truth, model, tokenizer):
                 print(actual_cluster)
 
             print()
-
             print("Predicted clusters:")
             for predicted_cluster in predicted_clusters:
                 print(predicted_cluster)
             print("-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------")
             print()
             
+    print("Average F1-score:", sum(f1_scores)/len(f1_scores))
         
   
 def calc_jaccard_index(actual_cluster, predicted_cluster):
@@ -515,7 +592,7 @@ def calc_jaccard_index(actual_cluster, predicted_cluster):
     return intersection / union
     
 
-def calc_scores(actual_clusters, predicted_clusters, threshold=0.5):
+def calc_scores(actual_clusters, predicted_clusters, threshold=1.0):
     """Use schema definition properties (actuals) to evaluate the predicted clusters
     TP: Definition from the schema that exists in the file
     FP: Definition from the file that does not exist in schema
