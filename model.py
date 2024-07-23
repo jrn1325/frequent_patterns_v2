@@ -145,17 +145,20 @@ def merge_schema_tokens(df, tokenizer):
 
     # Loop over the schemas of the pairs of tokenized schemas
     for idx, (schema1, schema2) in tqdm.tqdm(df[["Schema1", "Schema2"]].iterrows(), position=4, leave=False, total=len(df), desc="merge tokens"):
-        #print(df.iloc[idx]["Pairs"])
+        #pair = df.iloc[idx]["Pairs"]
         schema1 = schema1.replace("'", '"')
         schema2 = schema2.replace("'", '"')
         schema1 = json.loads(schema1)
         schema2 = json.loads(schema2)
+
         ordered_schema1, ordered_schema2 = order_properties_by_commonality(schema1, schema2)
+
         tokenized_schema1 = tokenize_schema(ordered_schema1, tokenizer)
         tokenized_schema2 = tokenize_schema(ordered_schema2, tokenizer)
+
         total_len = len(tokenized_schema1) + len(tokenized_schema2)
         max_tokenized_len = MAX_TOK_LEN - 1 - 2  # Account for BOS, EOS, and newline token lengths
-
+    
         # Proportionally truncate tokenized schemas if they exceed the maximum token length
         if total_len > max_tokenized_len:
             truncate_len = total_len - max_tokenized_len
