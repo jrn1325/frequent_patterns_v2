@@ -3,6 +3,7 @@ import itertools
 import json
 import os
 import pandas as pd
+import random
 import sys
 import torch
 import tqdm
@@ -114,13 +115,15 @@ def get_paths_and_values(json_schema, filename):
     paths_dict = defaultdict(set)
     #prefix_paths_dict = defaultdict(set)
     prefix_paths_dict = defaultdict(list)
+    paths_count = defaultdict(int)
+    total_documents = 0
 
 
     with open(filename, 'r') as f:
         for line in f:
             try:
                 doc = json.loads(line)
-            except:
+            except json.JSONDecodeError:
                 continue
             
             if isinstance(doc, dict) and len(doc) > 0 and match_properties(json_schema, doc):
@@ -132,12 +135,13 @@ def get_paths_and_values(json_schema, filename):
                         #prefix_paths_dict.setdefault(prefix, set()).add(path)
                         prefix_paths_dict.setdefault(prefix, []).append(path)
                     '''
-                    
+                    total_documents += 1
                     if isinstance(value, dict) and len(value) > 0:
                         value = json.dumps(value)
-                        paths_dict[path].add(value)                           
+                        paths_dict[path].add(value)  
+                        #paths_count[path] += 1                       
 
-    return paths_dict, prefix_paths_dict
+    return paths_dict, prefix_paths_dict, total_documents#, paths_count
 
 
 def match_properties(schema, document):
@@ -151,14 +155,11 @@ def match_properties(schema, document):
         boolean: True if there is a match, else False
     """
     # Extract schema properties #### Resolve references
-    if "properties" in schema: 
-        schema_properties = schema.get("properties", {})
-        # Count the number of properties in the document that are defined in the schema
-        matching_properties_count = sum(key in schema_properties for key in document)
-        # Return true if there is a match, else false
-        return matching_properties_count > 0
-    else:
-        return False
+    schema_properties = schema.get("properties", {})
+    # Count the number of properties in the document that are defined in the schema
+    matching_properties_count = sum(1 for key in document if key in schema_properties)
+    # Return true if there is a match, else false
+    return matching_properties_count > 0
 
 
 def merge_schemas(schema1, schema2):
@@ -187,11 +188,15 @@ def merge_schemas(schema1, schema2):
                     else:
                         # Add the new property
                         new_schema["properties"][prop] = value
-        
+
         # If both schemas are arrays, merge their items
         elif schema1.get("type") == "array":
             if "items" in schema2:  # Ensure schema2 has items to merge
                 new_schema["items"] = merge_schemas(schema1["items"], schema2["items"])
+
+        # Merge frequencies if they exist
+        if "frequency" in schema1 and "frequency" in schema2:
+            new_schema["frequency"] = schema1["frequency"] + schema2["frequency"]
         
         return new_schema
     
@@ -249,6 +254,28 @@ def discover_schema_from_values(values):
         return {"type": "null"}
     else:
         return reduce(merge_schemas, (discover_schema(v) for v in values))
+
+
+def normalize_schema_frequencies(schema, total_documents):
+    """
+    Normalize the frequencies in the schema by dividing by the total number of documents.
+
+    Args:
+        schema (dict): The schema with frequency counts.
+        total_documents (int): The total number of documents.
+
+    Returns:
+        dict: The schema with normalized frequencies.
+    """
+    new_schema = deepcopy(schema)
+    if "frequency" in new_schema:
+        new_schema["frequency"] /= total_documents
+    if "properties" in new_schema:
+        for prop, sub_schema in new_schema["properties"].items():
+            new_schema["properties"][prop] = normalize_schema_frequencies(sub_schema, total_documents)
+    if "items" in new_schema:
+        new_schema["items"] = normalize_schema_frequencies(new_schema["items"], total_documents)
+    return new_schema
 
 
 def tokenize_schema(schema):
@@ -483,16 +510,12 @@ def get_ref_defn_of_type_obj(json_schema, ref_defn_paths, paths_to_exclude):
             continue
 
         # Skip if the type is not object or oneOf/anyOf/allOf contain non-object types
-        type_is_object = defn_obj.get("type") == "object"
-        one_of_is_object = any(isinstance(item, dict) and item.get("type") == "object" for item in defn_obj.get("oneOf", []))
-        any_of_is_object = any(isinstance(item, dict) and item.get("type") == "object" for item in defn_obj.get("anyOf", []))
-        all_of_is_object = any(isinstance(item, dict) and item.get("type") == "object" for item in defn_obj.get("allOf", []))
-
-        type_is_object = looks_like_object(defn_obj)
-        one_of_is_object = any(looks_like_object(item) for item in defn_obj.get("oneOf", []))
-        any_of_is_object = any(looks_like_object(item) for item in defn_obj.get("anyOf", []))
-        all_of_is_object = any(looks_like_object(item) for item in defn_obj.get("allOf", []))
-        if not (type_is_object or one_of_is_object or any_of_is_object or all_of_is_object):
+        if not (
+            looks_like_object(defn_obj) or
+            any(looks_like_object(item) for item in defn_obj.get("oneOf", [])) or
+            any(looks_like_object(item) for item in defn_obj.get("anyOf", [])) or
+            any(looks_like_object(item) for item in defn_obj.get("allOf", []))
+        ):
             ref_to_delete.append(ref)
 
     for ref in ref_to_delete:
@@ -550,11 +573,12 @@ def find_frequent_definitions(good_ref_defn_paths, paths_to_exclude):
     return frequent_ref_defn_paths
 
 
-def create_dataframe(paths_dict, paths_to_exclude):
+def create_dataframe(paths_dict, paths_to_exclude, total_documents):
     """Create a DataFrame of paths and their values schema
     Args:
         paths_dict (dict): Dictionary of paths and their values.
-        paths_to_exclude (set): Paths to remove from JSON files
+        paths_to_exclude (set): Paths to remove from JSON files.
+        total_documents (int): The total number of documents.
 
     Returns:
         pd.DataFrame: DataFrame with tokenized schema added.
@@ -565,6 +589,7 @@ def create_dataframe(paths_dict, paths_to_exclude):
     for path, values in paths_dict.items():
         values = [json.loads(v) for v in values]
         schema = discover_schema_from_values(values)
+        #schema = normalize_schema_frequencies(schema, total_documents)
         if len(schema["properties"]) > 1:
             tokenized_schema = tokenize_schema(json.dumps(schema))
             df_data.append([path, tokenized_schema, schema])
@@ -693,7 +718,7 @@ def get_samples(df, frequent_ref_defn_paths):
         
         # Select pairs with the smallest distances as bad pairs
         for pair, distance in cosine_distances:
-            if len(bad_pairs) < len(good_pairs):
+            if len(bad_pairs) < 2 * len(good_pairs):
                 bad_pairs.add(pair)
             else:
                 break
@@ -837,7 +862,7 @@ def process_schema(schema, json_folder, schema_folder):
     if not cleaned_ref_defn_paths:
         return None, None
 
-    paths_dict, prefix_paths_dict = get_paths_and_values(json_schema, dataset)
+    paths_dict, prefix_paths_dict, total_documents = get_paths_and_values(json_schema, dataset)
     filtered_ref_defn_paths = check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, list(paths_dict.keys()))
 
     if not filtered_ref_defn_paths:
@@ -848,7 +873,7 @@ def process_schema(schema, json_folder, schema_folder):
     if not frequent_ref_defn_paths:
         return None, None
     
-    df = create_dataframe(paths_dict, paths_to_exclude)
+    df = create_dataframe(paths_dict, paths_to_exclude, total_documents)
 
     filtered_df = df[~df["Path"].isin(paths_to_exclude)]
     if filtered_df.empty:
@@ -862,7 +887,16 @@ def process_schema(schema, json_folder, schema_folder):
 
     filtered_df["Filename"] = schema
     filtered_df.reset_index(drop=True, inplace=True)
+    '''
+    for path in paths_to_exclude:
+        if path in paths_count:
+            del paths_count[path]
+    print(schema)
+    for k, v in paths_count.items():
+        print(k, v)
+    '''
     return filtered_df, updated_ref_defn_paths
+
 
 
 def save_ground_truths(ground_truths, ground_truth_file):
@@ -921,6 +955,7 @@ def preprocess_data(schemas, filename, ground_truth_file):
             continue
 
         filtered_df, frequent_ref_defn_paths = process_schema(schema, JSON_FOLDER, SCHEMA_FOLDER)
+        
         if filtered_df is not None and frequent_ref_defn_paths is not None:
             ground_truths[schema] = frequent_ref_defn_paths
             print(f"Sampling data for {schema}...")
