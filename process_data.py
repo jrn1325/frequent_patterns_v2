@@ -1,6 +1,7 @@
 import dask.dataframe as dd
 import itertools
 import json
+import jsonschema
 import os
 import pandas as pd
 import random
@@ -9,19 +10,19 @@ import torch
 import tqdm
 import warnings
 
+
 from adapters import AutoAdapterModel
 from collections import defaultdict
 from copy import copy, deepcopy
 from functools import reduce
+from jsonschema import validate, ValidationError
 from sklearn.model_selection import GroupShuffleSplit
 from torch.nn.functional import normalize
 from transformers import AutoTokenizer, LongformerModel
 
 model_name = "microsoft/codebert-base" 
-#model_name = "allenai/longformer-base-4096"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoAdapterModel.from_pretrained(model_name)
-#model = LongformerModel.from_pretrained(model_name)
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -103,47 +104,6 @@ def find_ref_paths(json_schema, current_path=('$',)):
             yield from find_ref_paths(value, current_path=updated_path)
 
 
-def get_paths_and_values(json_schema, filename):
-    """Get all the paths and their values. Values must be of type object and non empty
-
-    Args:
-        json_schema (dict): json schema
-        filename (str): name of the json dataset
-    Return:
-        dict: dictionary of all the paths and values
-    """
-    paths_dict = defaultdict(set)
-    #prefix_paths_dict = defaultdict(set)
-    prefix_paths_dict = defaultdict(list)
-    paths_count = defaultdict(int)
-    total_documents = 0
-
-
-    with open(filename, 'r') as f:
-        for line in f:
-            try:
-                doc = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            
-            if isinstance(doc, dict) and len(doc) > 0 and match_properties(json_schema, doc):
-                # Get the paths and values of type object and non-empty in the json document
-                for path, value in parse_document(doc):
-                    '''
-                    if len(path) > 1:
-                        prefix = path[:-1]
-                        #prefix_paths_dict.setdefault(prefix, set()).add(path)
-                        prefix_paths_dict.setdefault(prefix, []).append(path)
-                    '''
-                    total_documents += 1
-                    if isinstance(value, dict) and len(value) > 0:
-                        value = json.dumps(value)
-                        paths_dict[path].add(value)  
-                        #paths_count[path] += 1                       
-
-    return paths_dict, prefix_paths_dict, total_documents#, paths_count
-
-
 def match_properties(schema, document):
     """Check if there is an intersection between the properties in the schema with those from the document
 
@@ -160,6 +120,209 @@ def match_properties(schema, document):
     matching_properties_count = sum(1 for key in document if key in schema_properties)
     # Return true if there is a match, else false
     return matching_properties_count > 0
+
+
+def extract_definitions(schema):
+    """
+    Extract definitions from the schema.
+
+    Args:
+        schema (dict): The JSON schema.
+
+    Returns:
+        dict: A dictionary of definitions.
+    """
+    if "definitions" in schema:
+        return {(k,): v for k, v in schema["definitions"].items()}
+    elif "$defs" in schema:
+        return {(k,): v for k, v in schema["$defs"].items()}
+    return {}
+
+
+def handle_reference(item, current_path, paths, definitions, visited):
+    """
+    Handle schema references and replace them with actual paths.
+    Avoids circular references by tracking visited schemas.
+
+    Args:
+        item (dict): The current item with a reference.
+        current_path (tuple): The current path being processed.
+        paths (set): A set to store the extracted paths.
+        definitions (dict): A dictionary of schema definitions.
+        visited (set): Set of visited schema IDs to avoid circular references.
+    """
+    ref_path = item["$ref"]
+
+    if ref_path.startswith("#/definitions/"):
+        definition_key = ref_path[len("#/definitions/"):]
+    elif ref_path.startswith("#/$defs/"):
+        definition_key = ref_path[len("#/$defs/"):]
+    else:
+        return
+
+    definition_path = (definition_key,)
+    if definition_path in definitions:
+        definition_schema = definitions[definition_path]
+
+        if definition_path not in visited:
+            visited.add(definition_path)
+            process_item(definition_schema, current_path, paths, definitions, visited)
+            visited.remove(definition_path) 
+
+
+def process_item(item, current_path, paths, definitions, visited):
+    """
+    Recursively process items in the schema to extract all paths.
+
+    Args:
+        item (dict): The current schema item.
+        current_path (tuple): The current path being processed.
+        paths (set): A set to store the extracted paths.
+        definitions (dict): A dictionary of schema definitions.
+        visited (set): Set of visited schema to avoid circular references.
+    """
+    if isinstance(item, dict):
+        if "properties" in item:
+            for prop, subschema in item["properties"].items():
+                new_path = current_path + (prop,)
+                paths.add(new_path)
+                process_item(subschema, new_path, paths, definitions, visited)
+        if "items" in item:
+            new_path = current_path + ('*',)
+            paths.add(new_path)
+            process_item(item["items"], new_path, paths, definitions, visited)
+        if "$ref" in item:
+            handle_reference(item, current_path, paths, definitions, visited)
+        for key in ["oneOf", "anyOf", "allOf"]:
+            if key in item:
+                for subschema in item[key]:
+                    process_item(subschema, current_path, paths, definitions, visited)
+
+
+def extract_schema_paths(schema, path=('$',)):
+    """
+    Extract all possible paths from the JSON schema and replace references to definitions with actual paths.
+    Replace the 'items' keyword with '*' in paths that contain array items.
+
+    Args:
+        schema (dict): The JSON schema.
+        path (tuple): The current path being processed.
+
+    Returns:
+        set: A set of paths in the schema.
+    """
+    paths = set()
+    definitions = extract_definitions(schema)
+    visited = set()
+
+    process_item(schema, path, paths, definitions, visited)
+    return sorted(paths)
+
+
+def add_additional_properties_false(schema):
+    """
+    Recursively add "additionalProperties": false to all objects in a JSON schema
+    where "additionalProperties" is not explicitly declared.
+
+    This function ensures that no additional properties are allowed in the objects
+    defined by the schema unless specified.
+
+    Args:
+        schema (dict or list): The JSON schema to modify. Can be a dictionary representing
+                               the schema or a list of schemas.
+
+    Returns:
+        None
+
+    Modifies:
+        The input schema in place, adding "additionalProperties": false to all object definitions
+        where it is not already present.
+    """
+    if isinstance(schema, dict):
+        # Check if the schema defines an object type
+        if "type" in schema and schema["type"] == "object":
+            # Add "additionalProperties": false if not already present
+            if "additionalProperties" not in schema:
+                schema["additionalProperties"] = False
+
+        # Recursively handle all relevant keys that can contain subschemas
+        for key in ["properties", "patternProperties", "definitions", "$defs", "items", "oneOf", "anyOf", "allOf"]:
+            if key in schema:
+                if isinstance(schema[key], dict):
+                    # Recursively process each subschema in a dictionary
+                    for sub_key in schema[key]:
+                        add_additional_properties_false(schema[key][sub_key])
+                elif isinstance(schema[key], list):
+                    # Recursively process each subschema in a list
+                    for sub_schema in schema[key]:
+                        add_additional_properties_false(sub_schema)
+                        
+    elif isinstance(schema, list):
+        # If the schema is a list, process each item in the list
+        for item in schema:
+            add_additional_properties_false(item)
+
+
+def validate_document(schema, document):
+    """
+    Validate a JSON document against a given JSON schema.
+    
+    Args:
+        schema (dict): The JSON schema to validate against.
+        document (dict): The JSON document to validate.
+    
+    Returns:
+        True if it validate, otherwise false
+    """
+    try:
+        validate(instance=document, schema=schema)
+        return True
+    except ValidationError as e:
+        return False
+    except jsonschema.exceptions._WrappedReferencingError as e:
+        return False
+
+
+
+def get_paths_and_values(json_schema, filename):
+    """Get all the paths and their values. Values must be of type object and non empty
+
+    Args:
+        json_schema (dict): json schema
+        filename (str): name of the json dataset
+    Return:
+        dict: dictionary of all the paths and values
+    """
+    paths_dict = defaultdict(set)
+    prefix_paths_dict = defaultdict(list)
+
+    # Add additionalProperties if it is missing
+    add_additional_properties_false(json_schema)
+
+    with open(filename, 'r') as f:
+        for line in f:
+            try:
+                doc = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            
+            # Validate the document
+            if validate_document(json_schema, doc):
+                if isinstance(doc, dict) and len(doc) > 0 and match_properties(json_schema, doc):
+                    # Get the paths and values of type object and non-empty in the json document
+                    for path, value in parse_document(doc):
+                        '''
+                        if len(path) > 1:
+                            prefix = path[:-1]
+                            #prefix_paths_dict.setdefault(prefix, set()).add(path)
+                            prefix_paths_dict.setdefault(prefix, []).append(path)
+                        '''
+                
+                        if isinstance(value, dict) and len(value) > 0:
+                            value = json.dumps(value)
+                            paths_dict[path].add(value)  
+
+    return paths_dict, prefix_paths_dict
 
 
 def merge_schemas(schema1, schema2):
@@ -254,28 +417,6 @@ def discover_schema_from_values(values):
         return {"type": "null"}
     else:
         return reduce(merge_schemas, (discover_schema(v) for v in values))
-
-
-def normalize_schema_frequencies(schema, total_documents):
-    """
-    Normalize the frequencies in the schema by dividing by the total number of documents.
-
-    Args:
-        schema (dict): The schema with frequency counts.
-        total_documents (int): The total number of documents.
-
-    Returns:
-        dict: The schema with normalized frequencies.
-    """
-    new_schema = deepcopy(schema)
-    if "frequency" in new_schema:
-        new_schema["frequency"] /= total_documents
-    if "properties" in new_schema:
-        for prop, sub_schema in new_schema["properties"].items():
-            new_schema["properties"][prop] = normalize_schema_frequencies(sub_schema, total_documents)
-    if "items" in new_schema:
-        new_schema["items"] = normalize_schema_frequencies(new_schema["items"], total_documents)
-    return new_schema
 
 
 def tokenize_schema(schema):
@@ -573,12 +714,11 @@ def find_frequent_definitions(good_ref_defn_paths, paths_to_exclude):
     return frequent_ref_defn_paths
 
 
-def create_dataframe(paths_dict, paths_to_exclude, total_documents):
+def create_dataframe(paths_dict, paths_to_exclude):
     """Create a DataFrame of paths and their values schema
     Args:
         paths_dict (dict): Dictionary of paths and their values.
         paths_to_exclude (set): Paths to remove from JSON files.
-        total_documents (int): The total number of documents.
 
     Returns:
         pd.DataFrame: DataFrame with tokenized schema added.
@@ -589,10 +729,9 @@ def create_dataframe(paths_dict, paths_to_exclude, total_documents):
     for path, values in paths_dict.items():
         values = [json.loads(v) for v in values]
         schema = discover_schema_from_values(values)
-        #schema = normalize_schema_frequencies(schema, total_documents)
         if len(schema["properties"]) > 1:
             tokenized_schema = tokenize_schema(json.dumps(schema))
-            df_data.append([path, tokenized_schema, schema])
+            df_data.append([path, tokenized_schema, json.dumps(schema)])
         else:
             paths_to_exclude.update(path)
         
@@ -862,7 +1001,7 @@ def process_schema(schema, json_folder, schema_folder):
     if not cleaned_ref_defn_paths:
         return None, None
 
-    paths_dict, prefix_paths_dict, total_documents = get_paths_and_values(json_schema, dataset)
+    paths_dict, prefix_paths_dict = get_paths_and_values(json_schema, dataset)
     filtered_ref_defn_paths = check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, list(paths_dict.keys()))
 
     if not filtered_ref_defn_paths:
@@ -873,7 +1012,14 @@ def process_schema(schema, json_folder, schema_folder):
     if not frequent_ref_defn_paths:
         return None, None
     
-    df = create_dataframe(paths_dict, paths_to_exclude, total_documents)
+    # Get the schema paths
+    #schema_paths = extract_schema_paths(json_schema)
+    #print("Schema count")
+    # Remove paths not found in schema_paths
+    #filtered_paths_dict = {path: value for path, value in paths_dict.items() if path in schema_paths}
+
+    df = create_dataframe(paths_dict, paths_to_exclude)
+    #df = create_dataframe(filtered_paths_dict, paths_to_exclude)
 
     filtered_df = df[~df["Path"].isin(paths_to_exclude)]
     if filtered_df.empty:
@@ -887,16 +1033,8 @@ def process_schema(schema, json_folder, schema_folder):
 
     filtered_df["Filename"] = schema
     filtered_df.reset_index(drop=True, inplace=True)
-    '''
-    for path in paths_to_exclude:
-        if path in paths_count:
-            del paths_count[path]
-    print(schema)
-    for k, v in paths_count.items():
-        print(k, v)
-    '''
-    return filtered_df, updated_ref_defn_paths
 
+    return filtered_df, updated_ref_defn_paths
 
 
 def save_ground_truths(ground_truths, ground_truth_file):
@@ -951,12 +1089,15 @@ def preprocess_data(schemas, filename, ground_truth_file):
     ground_truths = defaultdict(dict)
 
     for schema in tqdm.tqdm(schemas, position=2, leave=False, total=len(schemas)):
+        #if schema != "graphql-mesh.json":
+        #    continue
         if schema in ["grunt-clean-task.json", "swagger-api-2-0.json"]:#, "web-types.json"]:#, "openrpc-json.json"]:
             continue
 
         filtered_df, frequent_ref_defn_paths = process_schema(schema, JSON_FOLDER, SCHEMA_FOLDER)
         
         if filtered_df is not None and frequent_ref_defn_paths is not None:
+            #filtered_df[["Path"]].to_csv(schema)
             ground_truths[schema] = frequent_ref_defn_paths
             print(f"Sampling data for {schema}...")
             df = get_samples(filtered_df, frequent_ref_defn_paths)
