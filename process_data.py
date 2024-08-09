@@ -15,7 +15,8 @@ from adapters import AutoAdapterModel
 from collections import defaultdict
 from copy import copy, deepcopy
 from functools import reduce
-from jsonschema import validate, ValidationError
+from jsonschema import validate, ValidationError, Draft7Validator
+from jsonschema.validators import validator_for
 from sklearn.model_selection import GroupShuffleSplit
 from torch.nn.functional import normalize
 from transformers import AutoTokenizer, LongformerModel
@@ -221,11 +222,8 @@ def extract_schema_paths(schema, path=('$',)):
 
 def add_additional_properties_false(schema):
     """
-    Recursively add "additionalProperties": false to all objects in a JSON schema
+    Add "additionalProperties": false to all objects in a JSON schema
     where "additionalProperties" is not explicitly declared.
-
-    This function ensures that no additional properties are allowed in the objects
-    defined by the schema unless specified.
 
     Args:
         schema (dict or list): The JSON schema to modify. Can be a dictionary representing
@@ -233,55 +231,142 @@ def add_additional_properties_false(schema):
 
     Returns:
         None
-
-    Modifies:
-        The input schema in place, adding "additionalProperties": false to all object definitions
-        where it is not already present.
     """
     if isinstance(schema, dict):
-        # Check if the schema defines an object type
-        if "type" in schema and schema["type"] == "object":
-            # Add "additionalProperties": false if not already present
-            if "additionalProperties" not in schema:
-                schema["additionalProperties"] = False
+        if "additionalProperties" not in schema and "type" in schema and schema["type"] == "object":
+            schema["additionalProperties"] = False
 
-        # Recursively handle all relevant keys that can contain subschemas
-        for key in ["properties", "patternProperties", "definitions", "$defs", "items", "oneOf", "anyOf", "allOf"]:
-            if key in schema:
-                if isinstance(schema[key], dict):
-                    # Recursively process each subschema in a dictionary
-                    for sub_key in schema[key]:
-                        add_additional_properties_false(schema[key][sub_key])
-                elif isinstance(schema[key], list):
-                    # Recursively process each subschema in a list
-                    for sub_schema in schema[key]:
-                        add_additional_properties_false(sub_schema)
-                        
+        for value in schema.values():
+            add_additional_properties_false(value)
     elif isinstance(schema, list):
-        # If the schema is a list, process each item in the list
         for item in schema:
             add_additional_properties_false(item)
 
 
-def validate_document(schema, document):
+def delete_key(data, key_path):
     """
-    Validate a JSON document against a given JSON schema.
+    Delete a key from a nested dictionary or list using a key path.
+
+    Args:
+    data (dict or list): The JSON data.
+    key_path (list): The path to the key to delete.
+    """
+    sub_data = data
+    for key in key_path[:-1]:
+        sub_data = sub_data[key]
+    del sub_data[key_path[-1]]
     
+    
+def validate_and_clean(data, schema, max_iterations=100):
+    """
+    Recursively validate and clean JSON data according to a schema.
+    The function iteratively removes parts of the document that make it invalid until it passes validation.
+
+    Args:
+    data (dict or list): The JSON data to validate and clean.
+    schema (dict): The JSON schema to validate against.
+    max_iterations (int): Maximum number of iterations to prevent infinite loops.
+
+    Returns:
+    dict or list: The cleaned JSON data with invalid parts removed, or None if the process fails.
+    """
+    try:
+        # Apply the modification to the schema
+        add_additional_properties_false(schema)
+        
+        cls = validator_for(schema)
+        cls.check_schema(schema)
+        validator = cls(schema)
+
+        iteration = 0
+        while iteration < max_iterations:
+            errors = sorted(validator.iter_errors(data), key=lambda e: e.path)
+            if not errors:
+                break  # Exit the loop if there are no errors
+            
+            for error in errors:
+                error_path = list(error.path)
+                
+                # If the error is due to additional properties, handle it accordingly
+                if error.validator == "additionalProperties":
+                    for extra_property in error.message.split("'")[1::2]:  # Extract extra properties
+                        #print(f"Removing additional property: {extra_property}")
+                        try:
+                            delete_key(data, error_path + [extra_property])
+                        except (KeyError, IndexError):
+                            pass
+                else:
+                    print(f"Removing invalid data at path: {error_path} due to error: {error.message}")
+                    try:
+                        delete_key(data, error_path)
+                    except (KeyError, IndexError) as e:
+                        print(f"Failed to delete key at path: {error_path}. Error: {e}")
+                        return None
+            
+            iteration += 1
+
+        if iteration == max_iterations:
+            print("Warning: Maximum iterations reached. Data may still be invalid.")
+            return None
+
+        return data
+    except ValidationError as ve:
+        print(f"Schema validation error: {ve}")
+        return None
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return None
+
+def is_valid(subschema, subdocument):
+    """
+    Check if a part of the document is valid according to the subschema.
+
+    Args:
+        subschema (dict): The JSON subschema to validate against.
+        subdocument (any): The part of the JSON document to validate.
+
+    Returns:
+        bool: True if valid, False otherwise.
+    """
+    try:
+        validate(instance=subdocument, schema=subschema)
+        return True
+    except ValidationError:
+        return False
+    except jsonschema.exceptions.SchemaError:
+        return False 
+
+
+def prune_invalid_parts(schema, document):
+    """
+    Validate a JSON document against a given JSON schema and remove invalid parts.
+
     Args:
         schema (dict): The JSON schema to validate against.
         document (dict): The JSON document to validate.
-    
-    Returns:
-        True if it validate, otherwise false
-    """
-    try:
-        validate(instance=document, schema=schema)
-        return True
-    except ValidationError as e:
-        return False
-    except jsonschema.exceptions._WrappedReferencingError as e:
-        return False
 
+    Returns:
+        dict: A pruned JSON document with invalid parts removed.
+    """
+    if isinstance(document, dict):
+        valid_document = {}
+        for key, value in document.items():
+            if key in schema.get("properties", {}):
+                # Check for additional properties
+                if is_valid(schema["properties"][key], value):
+                    valid_document[key] = prune_invalid_parts(schema["properties"][key], value)
+            elif "additionalProperties" in schema and not schema["additionalProperties"]:
+                continue  # Skip keys that are not in the schema's properties if additionalProperties is false
+        return valid_document
+
+    elif isinstance(document, list) and "items" in schema:
+        valid_document = []
+        for item in document:
+            if is_valid(schema["items"], item):
+                valid_document.append(prune_invalid_parts(schema["items"], item))
+        return valid_document
+
+    return document if is_valid(schema, document) else None
 
 
 def get_paths_and_values(json_schema, filename):
@@ -295,33 +380,38 @@ def get_paths_and_values(json_schema, filename):
     """
     paths_dict = defaultdict(set)
     prefix_paths_dict = defaultdict(list)
-
-    # Add additionalProperties if it is missing
-    add_additional_properties_false(json_schema)
+    total_docs = 0
+    valid_docs = 0
 
     with open(filename, 'r') as f:
-        for line in f:
+        for i, line in enumerate(f):
+            total_docs += 1
             try:
                 doc = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            
+        
             # Validate the document
-            if validate_document(json_schema, doc):
-                if isinstance(doc, dict) and len(doc) > 0 and match_properties(json_schema, doc):
-                    # Get the paths and values of type object and non-empty in the json document
-                    for path, value in parse_document(doc):
-                        '''
-                        if len(path) > 1:
-                            prefix = path[:-1]
-                            #prefix_paths_dict.setdefault(prefix, set()).add(path)
-                            prefix_paths_dict.setdefault(prefix, []).append(path)
-                        '''
-                
-                        if isinstance(value, dict) and len(value) > 0:
-                            value = json.dumps(value)
-                            paths_dict[path].add(value)  
-
+            doc = validate_and_clean(doc, json_schema)
+            
+            if isinstance(doc, dict) and len(doc) > 0 and match_properties(json_schema, doc):
+                valid_docs += 1
+                # Get the paths and values of type object and non-empty in the json document
+                for path, value in parse_document(doc):
+                    '''
+                    if len(path) > 1:
+                        prefix = path[:-1]
+                        #prefix_paths_dict.setdefault(prefix, set()).add(path)
+                        prefix_paths_dict.setdefault(prefix, []).append(path)
+                    '''
+            
+                    if isinstance(value, dict) and len(value) > 0:
+                        value = json.dumps(value)
+                        paths_dict[path].add(value)  
+    try:
+        print(f"Schema{filename} has {total_docs}, of which {valid_docs/total_docs} % are valid.")
+    except ZeroDivisionError as e:
+        print("Empty dataset.")
     return paths_dict, prefix_paths_dict
 
 
@@ -857,7 +947,7 @@ def get_samples(df, frequent_ref_defn_paths):
         
         # Select pairs with the smallest distances as bad pairs
         for pair, distance in cosine_distances:
-            if len(bad_pairs) < 2 * len(good_pairs):
+            if len(bad_pairs) < len(good_pairs):
                 bad_pairs.add(pair)
             else:
                 break
@@ -1081,7 +1171,7 @@ def preprocess_data(schemas, filename, ground_truth_file):
     Process all the data from the JSON files to get their embeddings.
 
     Args:
-        schemas (list): List of schema filenames.
+        schemas (list): List of schema filenames.[]
         filename (str): Filename to save the resulting DataFrame.
         ground_truth_file (str): Filename to save the ground truth definitions.
     """
@@ -1089,7 +1179,7 @@ def preprocess_data(schemas, filename, ground_truth_file):
     ground_truths = defaultdict(dict)
 
     for schema in tqdm.tqdm(schemas, position=2, leave=False, total=len(schemas)):
-        #if schema != "graphql-mesh.json":
+        #if schema != "docfx-json.json":
         #    continue
         if schema in ["grunt-clean-task.json", "swagger-api-2-0.json"]:#, "web-types.json"]:#, "openrpc-json.json"]:
             continue
@@ -1097,7 +1187,7 @@ def preprocess_data(schemas, filename, ground_truth_file):
         filtered_df, frequent_ref_defn_paths = process_schema(schema, JSON_FOLDER, SCHEMA_FOLDER)
         
         if filtered_df is not None and frequent_ref_defn_paths is not None:
-            #filtered_df[["Path"]].to_csv(schema)
+            filtered_df[["Path"]].to_csv(schema)
             ground_truths[schema] = frequent_ref_defn_paths
             print(f"Sampling data for {schema}...")
             df = get_samples(filtered_df, frequent_ref_defn_paths)
