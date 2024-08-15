@@ -9,6 +9,7 @@ import sys
 import torch
 import tqdm
 import warnings
+import traceback
 
 
 from adapters import AutoAdapterModel
@@ -233,11 +234,8 @@ def add_additional_properties_false(schema):
         None
     """
     if isinstance(schema, dict):
-        if "additionalProperties" not in schema and "type" in schema and schema["type"] == "object":
-            schema["additionalProperties"] = False
-
-        for value in schema.values():
-            add_additional_properties_false(value)
+        if "additionalProperties" not in schema:
+            schema["additionalProperties"] = {"not": {}}
     elif isinstance(schema, list):
         for item in schema:
             add_additional_properties_false(item)
@@ -251,10 +249,30 @@ def delete_key(data, key_path):
     data (dict or list): The JSON data.
     key_path (list): The path to the key to delete.
     """
+    
     sub_data = data
     for key in key_path[:-1]:
         sub_data = sub_data[key]
     del sub_data[key_path[-1]]
+    '''
+    if not key_path:
+        return
+
+    if isinstance(data, dict):
+        if len(key_path) == 1:
+            data.pop(key_path[0], None)
+        elif key_path[0] in data:
+            delete_key(data[key_path[0]], key_path[1:])
+    elif isinstance(data, list):
+        index = key_path[0]
+        if len(key_path) == 1:
+            if 0 <= index < len(data):
+                data.pop(index)
+        elif 0 <= index < len(data):
+            delete_key(data[index], key_path[1:])
+    '''
+
+
     
     
 def validate_and_clean(data, schema, max_iterations=100):
@@ -275,33 +293,24 @@ def validate_and_clean(data, schema, max_iterations=100):
         add_additional_properties_false(schema)
         
         cls = validator_for(schema)
-        cls.check_schema(schema)
+        cls.check_schema(schema) # If no error on this line, the schema is valid
         validator = cls(schema)
 
         iteration = 0
         while iteration < max_iterations:
             errors = sorted(validator.iter_errors(data), key=lambda e: e.path)
+            # Exit the loop if there are no errors
             if not errors:
-                break  # Exit the loop if there are no errors
+                break  
             
             for error in errors:
                 error_path = list(error.path)
-                
-                # If the error is due to additional properties, handle it accordingly
-                if error.validator == "additionalProperties":
-                    for extra_property in error.message.split("'")[1::2]:  # Extract extra properties
-                        #print(f"Removing additional property: {extra_property}")
-                        try:
-                            delete_key(data, error_path + [extra_property])
-                        except (KeyError, IndexError):
-                            pass
-                else:
-                    print(f"Removing invalid data at path: {error_path} due to error: {error.message}")
-                    try:
-                        delete_key(data, error_path)
-                    except (KeyError, IndexError) as e:
-                        print(f"Failed to delete key at path: {error_path}. Error: {e}")
-                        return None
+                print(f"Removing invalid data at path: {error_path} due to error: {error.message}")
+                try:
+                    delete_key(data, error_path)
+                except (KeyError, IndexError) as e:
+                    print(f"Failed to delete key at path: {error_path}. Error: {e}")
+                    return None
             
             iteration += 1
 
@@ -316,57 +325,6 @@ def validate_and_clean(data, schema, max_iterations=100):
     except Exception as e:
         print(f"Unexpected error: {e}")
         return None
-
-def is_valid(subschema, subdocument):
-    """
-    Check if a part of the document is valid according to the subschema.
-
-    Args:
-        subschema (dict): The JSON subschema to validate against.
-        subdocument (any): The part of the JSON document to validate.
-
-    Returns:
-        bool: True if valid, False otherwise.
-    """
-    try:
-        validate(instance=subdocument, schema=subschema)
-        return True
-    except ValidationError:
-        return False
-    except jsonschema.exceptions.SchemaError:
-        return False 
-
-
-def prune_invalid_parts(schema, document):
-    """
-    Validate a JSON document against a given JSON schema and remove invalid parts.
-
-    Args:
-        schema (dict): The JSON schema to validate against.
-        document (dict): The JSON document to validate.
-
-    Returns:
-        dict: A pruned JSON document with invalid parts removed.
-    """
-    if isinstance(document, dict):
-        valid_document = {}
-        for key, value in document.items():
-            if key in schema.get("properties", {}):
-                # Check for additional properties
-                if is_valid(schema["properties"][key], value):
-                    valid_document[key] = prune_invalid_parts(schema["properties"][key], value)
-            elif "additionalProperties" in schema and not schema["additionalProperties"]:
-                continue  # Skip keys that are not in the schema's properties if additionalProperties is false
-        return valid_document
-
-    elif isinstance(document, list) and "items" in schema:
-        valid_document = []
-        for item in document:
-            if is_valid(schema["items"], item):
-                valid_document.append(prune_invalid_parts(schema["items"], item))
-        return valid_document
-
-    return document if is_valid(schema, document) else None
 
 
 def get_paths_and_values(json_schema, filename):
@@ -385,12 +343,12 @@ def get_paths_and_values(json_schema, filename):
 
     with open(filename, 'r') as f:
         for i, line in enumerate(f):
-            total_docs += 1
             try:
                 doc = json.loads(line)
             except json.JSONDecodeError:
                 continue
         
+            total_docs += 1
             # Validate the document
             doc = validate_and_clean(doc, json_schema)
             
@@ -412,7 +370,7 @@ def get_paths_and_values(json_schema, filename):
         print(f"Schema{filename} has {total_docs}, of which {valid_docs/total_docs} % are valid.")
     except ZeroDivisionError as e:
         print("Empty dataset.")
-    return paths_dict, prefix_paths_dict
+    return paths_dict, prefix_paths_dict, total_docs, valid_docs
 
 
 def merge_schemas(schema1, schema2):
@@ -1071,15 +1029,15 @@ def process_schema(schema, json_folder, schema_folder):
     """
     schema_path = os.path.join(schema_folder, schema)
     if not os.path.exists(schema_path):
-        return None, None
+        return None, None, None, None
 
     json_schema = load_schema(schema_path)
     if json_schema is None:
-        return None, None
+        return None, None, None, None
 
     dataset = os.path.join(json_folder, schema)
     if not ("$defs" in json_schema or "definitions" in json_schema) or not os.path.isfile(dataset):
-        return None, None
+        return None, None, None, None
 
     ref_defn_paths = clean_ref_defn_paths(json_schema)
     new_ref_defn_paths = handle_nested_definitions(ref_defn_paths)
@@ -1089,18 +1047,18 @@ def process_schema(schema, json_folder, schema_folder):
     get_ref_defn_of_type_obj(json_schema, cleaned_ref_defn_paths, paths_to_exclude)
 
     if not cleaned_ref_defn_paths:
-        return None, None
+        return None, None, None, None
 
-    paths_dict, prefix_paths_dict = get_paths_and_values(json_schema, dataset)
+    paths_dict, prefix_paths_dict, total_docs, valid_docs = get_paths_and_values(json_schema, dataset)
     filtered_ref_defn_paths = check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, list(paths_dict.keys()))
 
     if not filtered_ref_defn_paths:
-        return None, None
+        return None, None, None, None
 
     frequent_ref_defn_paths = find_frequent_definitions(filtered_ref_defn_paths, paths_to_exclude)
 
     if not frequent_ref_defn_paths:
-        return None, None
+        return None, None, None, None
     
     # Get the schema paths
     #schema_paths = extract_schema_paths(json_schema)
@@ -1113,7 +1071,7 @@ def process_schema(schema, json_folder, schema_folder):
 
     filtered_df = df[~df["Path"].isin(paths_to_exclude)]
     if filtered_df.empty:
-        return None, None
+        return None, None, None, None
 
     updated_ref_defn_paths = {}
     for ref_defn, paths in frequent_ref_defn_paths.items():
@@ -1124,7 +1082,7 @@ def process_schema(schema, json_folder, schema_folder):
     filtered_df["Filename"] = schema
     filtered_df.reset_index(drop=True, inplace=True)
 
-    return filtered_df, updated_ref_defn_paths
+    return filtered_df, updated_ref_defn_paths, total_docs, valid_docs
 
 
 def save_ground_truths(ground_truths, ground_truth_file):
@@ -1177,17 +1135,21 @@ def preprocess_data(schemas, filename, ground_truth_file):
     """
     frames = []
     ground_truths = defaultdict(dict)
+    total = 0
+    valid = 0
 
     for schema in tqdm.tqdm(schemas, position=2, leave=False, total=len(schemas)):
-        #if schema != "docfx-json.json":
+        #if schema != "drone-json.json":
         #    continue
         if schema in ["grunt-clean-task.json", "swagger-api-2-0.json"]:#, "web-types.json"]:#, "openrpc-json.json"]:
             continue
 
-        filtered_df, frequent_ref_defn_paths = process_schema(schema, JSON_FOLDER, SCHEMA_FOLDER)
+        filtered_df, frequent_ref_defn_paths, total_docs, valid_docs = process_schema(schema, JSON_FOLDER, SCHEMA_FOLDER)
         
         if filtered_df is not None and frequent_ref_defn_paths is not None:
-            filtered_df[["Path"]].to_csv(schema)
+            total += total_docs
+            valid += valid_docs
+            #filtered_df[["Path"]].to_csv(schema)
             ground_truths[schema] = frequent_ref_defn_paths
             print(f"Sampling data for {schema}...")
             df = get_samples(filtered_df, frequent_ref_defn_paths)
@@ -1198,6 +1160,7 @@ def preprocess_data(schemas, filename, ground_truth_file):
         merged_df = concatenate_dataframes(frames)
         merged_df.to_parquet(filename, index=False)
         save_ground_truths(ground_truths, ground_truth_file)
+        print(f"Total valid docs: {valid}/{total}")
     
 
 def main():
