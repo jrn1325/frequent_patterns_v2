@@ -234,8 +234,8 @@ def add_additional_properties_false(schema):
         None
     """
     if isinstance(schema, dict):
-        if "additionalProperties" not in schema:
-            schema["additionalProperties"] = {"not": {}}
+        if "unevaluatedProperties" not in schema:
+            schema["unevaluatedProperties"] = {"not": {}}
     elif isinstance(schema, list):
         for item in schema:
             add_additional_properties_false(item)
@@ -272,8 +272,6 @@ def delete_key(data, key_path):
             delete_key(data[index], key_path[1:])
     '''
 
-
-    
     
 def validate_and_clean(data, schema, max_iterations=100):
     """
