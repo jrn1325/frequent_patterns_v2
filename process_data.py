@@ -357,11 +357,9 @@ def get_paths_and_values(json_schema, filename):
                 # Get the paths and values of type object and non-empty in the json document
                 for path, value in parse_document(doc):
                     
-                    if len(path) > 1:
+                    if len(path) > 1 and isinstance(value, dict) and len(value) > 0:
                         prefix = path[:-1]
-                        prefix_paths_dict.setdefault(prefix, set()).add(path)
-                    
-                    if isinstance(value, dict) and len(value) > 0:
+                        prefix_paths_dict[prefix].add(path)
                         value = json.dumps(value)
                         paths_dict[path].add(value)  
     try:
@@ -825,68 +823,86 @@ def get_distinct_subkeys(prefix_paths_dict):
     return result_dict
 
 
-def merge_paths_values(new_paths_values):
+def update_new_paths(group_paths, new_paths_dict):
     """
     Merge new paths values into the existing ones.
 
     Args:
-        new_paths_values (list): The list of new path values to be merged.
+        new_paths_dict (list): The list of new path values to be merged.
 
     Returns:
         dict: The merged path values.
     """
-    print(new_paths_values)
-    # Parse all string representations into dictionaries
-    parsed_dicts = [json.loads(item) for sublist in new_paths_values for item in sublist]
 
-    # Merge all the parsed dictionaries into one
-    #merged_paths_values = {k: json.dumps(v) for d in parsed_dicts for k, v in d.items()}
-    merged_paths_values = {}
-    for d in parsed_dicts:
-        for key, value in d.items():
-            merged_paths_values[key] = value
-    return merged_paths_values
+    for path, values in group_paths.items():
+        merged_paths_values = {}
+        for value in values:
+            dict_set = new_paths_dict[value]
+            for d in dict_set:
+                for k, v in json.loads(d).items():
+                    merged_paths_values[k] = v
+        new_paths_dict[value] = merged_paths_values
 
-def handle_sub_paths(paths_dict, wildcard_path):
+
+def handle_sub_paths(wildcard_path, prefix_paths_dict, group_paths):
     """
-    Find sub_paths, update them with wildcard paths, and merge paths values.
+    Find sub_paths, update them with wildcard paths, and group paths values.
 
     Args:
-        paths_dict (dict): Dictionary containing paths as keys and their associated values.
-        path (tuple): The base path to which sub_paths are related.
         wildcard_path (tuple): The wildcard path to replace sub_paths with.
+        prefix_paths_dict (dict): Dictionary of prefix paths and their sub_paths.
+        group_paths (dict): Dictionary of merged paths.
 
     Returns:
-        tuple: A tuple containing:
-            - dict: Updates with new wildcard paths.
-            - dict: Merged paths for the wildcard path.
-            - set: sub_paths marked for deletion.
+        None
     """
-    updates = {}
-    merged_paths = {}
-    sub_paths_to_delete = set()
-    print("wildcard_path:",wildcard_path)
+   
     prefix = wildcard_path[:-1]
-    print("prefix:",prefix)
-    # Loop over the paths
-    for path in list(paths_dict.keys()):
-        # Check if prefix exists in the path
-        if path[:len(prefix)] == prefix and path != prefix:
-            print("path:",path)
-            new_sub_path = wildcard_path + path[len(prefix):]
-            print("new_sub_path:",new_sub_path)
-            updates[new_sub_path] = paths_dict[path]
+    sub_paths = prefix_paths_dict.get(prefix, set())
 
-            if wildcard_path not in merged_paths:
-                merged_paths[wildcard_path] = [paths_dict[path]]
-            else:
-                merged_paths[wildcard_path].extend([paths_dict[path]])
+    if group_paths:
+        for key, value in copy(group_paths).items():
+            if prefix in value:
+                group_paths[key + (prefix[-1],)] = sub_paths
+    else:
+        group_paths[wildcard_path] = sub_paths
 
-            sub_paths_to_delete.add(path)
 
-    return updates, merged_paths, sub_paths_to_delete
+def update_new_paths(group_paths, new_paths_dict):
+    """
+    Merge new paths values into the existing ones.
 
-def incorporate_dynamic_paths(paths_dict, paths_to_exclude, nested_keys_dict, data_ambiguity_model):
+    Args:
+        group_paths (dict): The dictionary of group paths.
+        new_paths_dict (dict): The dictionary of new path values.
+    """
+    for wild_path, values in group_paths.items():
+        merged_paths_values = defaultdict(set)
+        for value in values:
+            dict_set = new_paths_dict.get(value, set()) 
+            for d in dict_set:
+                for k, v in json.loads(d).items():
+                    merged_paths_values[k].add(json.dumps(v))
+        
+        # Convert merged_paths_values from defaultdict(set) to a regular dictionary
+        merged_dict = {k: list(v) for k, v in merged_paths_values.items()}
+        
+        # Add merged paths to new_paths_dict
+        if wild_path not in new_paths_dict:
+            new_paths_dict[wild_path] = set() 
+        new_paths_dict[wild_path].add(json.dumps(merged_dict))
+
+        
+def delete_sub_paths(group_paths, new_paths_dict):
+    # Delete original sub_paths from the new paths
+    sub_paths_to_delete = group_paths.values()
+    for sub_path_list in sub_paths_to_delete:
+        for sub_path in sub_path_list:
+            if sub_path in new_paths_dict:
+                del new_paths_dict[sub_path]
+
+
+def incorporate_dynamic_paths(paths_dict, prefix_paths_dict, paths_to_exclude, nested_keys_dict, data_ambiguity_model):
     """
     Incorporate dynamic paths by merging schemas for wildcard paths and updating the paths dictionary.
 
@@ -904,36 +920,46 @@ def incorporate_dynamic_paths(paths_dict, paths_to_exclude, nested_keys_dict, da
     # Sort paths by length
     paths_dict = dict(sorted(paths_dict.items(), key=lambda item: len(item[0])))
 
-    # Store updates and sub_paths for deletion
-    all_updates = defaultdict(set)
-    all_sub_paths_to_delete = set()
+    new_paths_dict = {}
+    group_paths = {}
 
-    # Iterate over paths
-    for i, path in enumerate(list(paths_dict.keys())):
+    while paths_dict:
+        # Take the first path
+        path = next(iter(paths_dict))
         distinct_subkeys = nested_keys_dict.get(path, [])
+
+        # Determine if the path is dynamic
         prediction = is_dynamic(distinct_subkeys, tokenizer, data_ambiguity_model, device)
+        #prediction = 0
+        #if path == ('$','a','b'):
+        #    prediction = 1
     
         if prediction == 1:
-            # Create a wildcard path
+            print(f"Prediction for path {path}: {prediction}")
             wildcard_path = path + ("*",)
 
-            # Handle sub_paths and get updates
-            updates, merged_paths, sub_paths_to_delete = handle_sub_paths(paths_dict, wildcard_path)
-            all_updates.update(updates)
-            all_sub_paths_to_delete.update(sub_paths_to_delete)
+            # Group the sub_paths by each wildcard path
+            handle_sub_paths(wildcard_path, prefix_paths_dict, group_paths)
+            
+        # Move the path from paths_dict to new_paths_dict
+        new_paths_dict[path] = paths_dict.pop(path)
 
-            # Add the wildcard path to updates with merged schemas
-            all_updates[wildcard_path].add(json.dumps(merge_paths_values(merged_paths.get(wildcard_path, []))))
+    #for wild_path, values in group_paths.items():
+    #    print("wild_path",wild_path)
+    #    print("values",values)
 
-            # Apply updates and delete sub_paths
-            paths_dict.update(all_updates)
+    #print()
+    #print("new_paths_dict",new_paths_dict.keys())
+    # Merge the paths values into new_paths_dict based on group_paths
+    update_new_paths(group_paths, new_paths_dict)
+    #print("new_paths_dict",new_paths_dict)
 
-            for sub_path in all_sub_paths_to_delete:
-                del paths_dict[sub_path]
+    # Delete the original sub_paths from new_paths_dict
+    delete_sub_paths(group_paths, new_paths_dict)
+    #print("new_paths_dict",new_paths_dict)
+    
+    return new_paths_dict, paths_to_exclude
 
-    paths_to_exclude.update(all_sub_paths_to_delete)
-
-    return paths_dict, paths_to_exclude
 
 
 def create_dataframe(paths_dict, paths_to_exclude):
@@ -949,8 +975,6 @@ def create_dataframe(paths_dict, paths_to_exclude):
     df_data = []
     
     for path, values in paths_dict.items():
-        print("value:",values)
-        
         values = [json.loads(v) for v in values]
         schema = discover_schema_from_values(values)
         if len(schema["properties"]) > 1:
@@ -1239,8 +1263,12 @@ def process_schema(schema, json_folder, schema_folder, data_ambiguity_model):
 
     # Get distinct nested keys
     df_nested_keys = get_distinct_subkeys(prefix_paths_dict)
-    paths_dict, paths_to_exclude = incorporate_dynamic_paths(paths_dict, paths_to_exclude, df_nested_keys, data_ambiguity_model)
-    df = create_dataframe(paths_dict, paths_to_exclude)
+    new_paths_dict, paths_to_exclude = incorporate_dynamic_paths(paths_dict, prefix_paths_dict, paths_to_exclude, df_nested_keys, data_ambiguity_model)
+    
+    print("Number of old paths",len(paths_dict))
+    print("Number of new paths",len(new_paths_dict))
+
+    df = create_dataframe(new_paths_dict, paths_to_exclude)
 
     filtered_df = df[~df["Path"].isin(paths_to_exclude)]
     if filtered_df.empty:
@@ -1312,7 +1340,7 @@ def preprocess_data(data_ambiguity_model,schemas, filename, ground_truth_file):
     valid = 0
 
     for schema in tqdm.tqdm(schemas, position=2, leave=False, total=len(schemas)):
-        #if schema != "graphql-mesh.json":
+        #if schema != "pyproject.json":
         #    continue
         if schema in ["grunt-clean-task.json", "swagger-api-2-0.json"]:#, "web-types.json"]:#, "openrpc-json.json"]:
             continue
@@ -1323,6 +1351,7 @@ def preprocess_data(data_ambiguity_model,schemas, filename, ground_truth_file):
             total += total_docs
             valid += valid_docs
             #filtered_df[["Path"]].to_csv(schema)
+            
             ground_truths[schema] = frequent_ref_defn_paths
             print(f"Sampling data for {schema}...")
             df = get_samples(filtered_df, frequent_ref_defn_paths)
