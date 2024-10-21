@@ -30,6 +30,19 @@ def load_schema(schema_path):
         return None
 
 
+def if_definition_exists(schema):
+    """
+    Check if 'definitions' exists in the schema.
+
+    Args:
+        schema (dict): The JSON schema.
+
+    Returns:
+        bool: True if either 'definitions' or '$defs' is found, False otherwise.
+    """
+    return "definitions" in schema or "$defs" in schema
+
+
 def has_pattern_properties_string_search(schema):
     """
     Checks if 'patternProperties' exists in the schema by converting it to a string.
@@ -88,6 +101,16 @@ def prevent_additional_properties(schema):
                 for subschema in schema[keyword]:
                     if isinstance(subschema, dict):
                         prevent_additional_properties(subschema)
+
+    # Handle definitions
+    if "definitions" in schema:
+        for definition in schema["definitions"].values():
+            prevent_additional_properties(definition)
+
+    # Handle $defs
+    if "$defs" in schema:
+        for definition in schema["$defs"].values():
+            prevent_additional_properties(definition)
 
     return schema
 
@@ -219,6 +242,7 @@ def process_single_dataset(dataset):
         "exist": 0,
         "empty": 0,
         "loaded": 0,
+        "definition": 0,
         #"pattern_properties": 0,
         #"dereferenced": 0,
         "modified": 0,
@@ -245,6 +269,12 @@ def process_single_dataset(dataset):
     if schema is None:
         print(f"Failed to load schema for {dataset}.")
         failure_flags["loaded"] = 1 
+        return failure_flags
+    
+    # Check if the schema contains definitions
+    if not if_definition_exists(schema):
+        print(f"Skipping {dataset} due to missing definitions in the schema.")
+        failure_flags["definition"] = 1 
         return failure_flags
     
     '''
@@ -306,6 +336,7 @@ def process_datasets():
     exist_count = 0
     empty_count = 0
     load_count = 0 
+    definition = 0
     #pattern_properties_count = 0
     modify_count = 0
     validation_count = 0
@@ -322,6 +353,7 @@ def process_datasets():
                 exist_count += flags["exist"] 
                 empty_count += flags["empty"]
                 load_count += flags["loaded"]
+                definition += flags["definition"]
                 #pattern_properties_count += flags["pattern_properties"]
                 validation_count += flags["validation"]
 
@@ -337,7 +369,8 @@ def process_datasets():
     print(f"Remaining after skipping non-existent datasets: {original_count - exist_count}")
     print(f"Remaining after removing empty datasets: {original_count - exist_count - empty_count}")
     print(f"Remaining after removing schemas failing to load: {original_count - exist_count - empty_count - load_count}")
-    print(f"Remaining after removing schemas failing to be valid: {original_count - exist_count - empty_count - load_count - validation_count}")
+    print(f"Remaining after removing schemas missing definitions: {original_count - exist_count - empty_count - load_count - definition}")
+    print(f"Remaining after removing schemas failing to be valid: {original_count - exist_count - empty_count - load_count - definition - validation_count}")
     print(f"Schemas failing to be modified: {modify_count}")
 
 
