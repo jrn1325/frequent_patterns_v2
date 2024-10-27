@@ -1,12 +1,13 @@
-import ast
-import itertools
+import concurrent.futures
 import json
+import jsonref
 import math
 import networkx as nx
 import numpy as np
 import os
 import sys
 import torch
+import torch.nn as nn
 import tqdm
 import wandb
 
@@ -18,10 +19,13 @@ import process_data
 
 
 MAX_TOK_LEN = 512
-ADAPTER_PATH = "./adapter"
-ADAPTER_NAME = "mrpc"
-SCHEMA_FOLDER = "schemas"
-JSON_FOLDER = "jsons"
+MODEL_NAME = "microsoft/codebert-base" 
+PATH = "./adapter-model"
+ADAPTER_NAME = "frequent_patterns"
+SCHEMA_FOLDER = "processed_schemas"
+JSON_FOLDER = "processed_jsons"
+BATCH_SIZE = 8
+JSON_SUBSCHEMA_KEYWORDS = {"allOf", "oneOf", "anyOf", "not"}
 
 # https://stackoverflow.com/a/73704579
 class EarlyStopper:
@@ -42,23 +46,19 @@ class EarlyStopper:
         return False
 
 
-def initialize_model(model_name, adapter_name=ADAPTER_NAME):
+def initialize_model():
     """
     Initializes a pre-trained model with an adapter for classification tasks.
-    
-    Args:
-        model_name (str): The name of the pre-trained model to load.
-        adapter_name (str): The name of the adapter to add to the model. Defaults to ADAPTER_NAME.
-    
+   
     Returns:
         tuple: A tuple containing the initialized model and tokenizer.
     """
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoAdapterModel.from_pretrained(model_name)
-    model.add_adapter(adapter_name, config="seq_bn")
-    model.set_active_adapters(adapter_name)
-    model.add_classification_head(adapter_name, num_labels=2)
-    model.train_adapter(adapter_name)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoAdapterModel.from_pretrained(MODEL_NAME)
+    model.add_classification_head(ADAPTER_NAME, num_labels=2)
+    model.add_adapter(ADAPTER_NAME, config="seq_bn")
+    model.set_active_adapters(ADAPTER_NAME)
+    model.train_adapter(ADAPTER_NAME)
     wandb.watch(model)
     return model, tokenizer
 
@@ -144,10 +144,10 @@ def merge_schema_tokens(df, tokenizer):
     tokenized_schemas = []
 
     # Loop over the schemas of the pairs of tokenized schemas
-    for idx, (schema1, schema2) in tqdm.tqdm(df[["Schema1", "Schema2"]].iterrows(), position=4, leave=False, total=len(df), desc="merge tokens"):
+    for idx, (schema1, schema2) in tqdm.tqdm(df[["schema1", "schema2"]].iterrows(), position=4, leave=False, total=len(df), desc="merge tokens"):
         #pair = df.iloc[idx]["Pairs"]
-        schema1 = schema1.replace("'", '"')
-        schema2 = schema2.replace("'", '"')
+        #schema1 = schema1.replace("'", '"')
+        #schema2 = schema2.replace("'", '"')
         schema1 = json.loads(schema1)
         schema2 = json.loads(schema2)
 
@@ -174,8 +174,8 @@ def merge_schema_tokens(df, tokenizer):
         tokenized_schemas.append(merged_tokenized_schema)
 
     # Add a new column for tokenized schemas and drop old ones
-    df["Tokenized_schema"] = tokenized_schemas
-    df = df.drop(["Schema1", "Schema2", "Filename"], axis=1)
+    df["tokenized_schema"] = tokenized_schemas
+    df = df.drop(["schema1", "schema2", "filename"], axis=1)
 
     # Shuffle all the rows in the DataFrame
     df = df.sample(frac=1).reset_index(drop=True)
@@ -196,13 +196,13 @@ def transform_data(df, tokenizer, device):
         list: A list of dictionaries, each containing "input_ids", "attention_mask", and "labels" tensors.
     """
 
-    max_length = max(len(schema) for schema in df["Tokenized_schema"])
+    max_length = max(len(schema) for schema in df["tokenized_schema"])
     pad_token_id = tokenizer.pad_token_id
 
     dataset = []
     for idx in range(len(df)):
-        schema = df["Tokenized_schema"].iloc[idx]
-        label = int(df["Label"].iloc[idx])
+        schema = df["tokenized_schema"].iloc[idx]
+        label = int(df["label"].iloc[idx])
 
         schema_tensor = torch.tensor(schema)
         padded_schema = torch.nn.functional.pad(schema_tensor, (0, max_length - len(schema)), value=pad_token_id)
@@ -232,11 +232,9 @@ def train_model(train_df, test_df):
         None
     """
 
-    model_name = "microsoft/codebert-base" 
     accumulation_steps = 4
-    batch_size = 8
-    learning_rate = 2e-5
-    num_epochs = 25
+    learning_rate = 1e-6
+    num_epochs = 100
 
     # Start a new wandb run to track this script
     wandb.require("core")
@@ -244,44 +242,45 @@ def train_model(train_df, test_df):
         project="custom-codebert_frequent_patterns",
         config={
             "accumulation_steps": accumulation_steps,
-            "batch_size": batch_size,
+            "BATCH_SIZE": BATCH_SIZE,
             "dataset": "json-schemas",
             "epochs": num_epochs,
             "learning_rate": learning_rate,
-            "model_name": model_name,
+            "model_name": MODEL_NAME,
         }
     )
 
     # Initialize tokenizer, model with adapter and classification head
-    model, tokenizer = initialize_model(model_name)
+    model, tokenizer = initialize_model()
 
-    # Merge tokenized schemas
-    train_df_with_tokens = merge_schema_tokens(train_df, tokenizer) 
-    test_df_with_tokens = merge_schema_tokens(test_df, tokenizer)
+    # Set up optimizer
+    optimizer = AdamW(model.parameters(), lr=learning_rate)
+
+    # Use all available GPUs
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(model)
 
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
+    # Merge tokenized schemas
+    train_df_with_tokens = merge_schema_tokens(train_df, tokenizer) 
+    test_df_with_tokens = merge_schema_tokens(test_df, tokenizer)
+
     # Transform data into dict
     train_data = transform_data(train_df_with_tokens, tokenizer, device)
     test_data = transform_data(test_df_with_tokens, tokenizer, device)
 
-    # Set up optimizer
-    optimizer = AdamW(model.parameters(), lr=learning_rate)
-
-     # Calculate total steps
-    total_steps = len(train_data) // batch_size * num_epochs
-
-    # Define warm-up steps
-    warmup_steps = int(0.1 * total_steps)
-
-    # Initialize scheduler with warm-up steps
+    # Set up scheduler to adjust the learning rate during training
+    num_training_steps = num_epochs * len(train_data) // BATCH_SIZE 
+    num_warmup_steps = int(0.1 * num_training_steps)
     lr_scheduler = get_scheduler(
         "linear",
         optimizer=optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps
     )
 
     # Setup the training arguments
@@ -289,8 +288,8 @@ def train_model(train_df, test_df):
         report_to="wandb",
         learning_rate=learning_rate,
         num_train_epochs=num_epochs,
-        per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size,
+        per_device_train_batch_size=BATCH_SIZE,
+        per_device_eval_batch_size=BATCH_SIZE, 
         logging_steps=10,
         evaluation_strategy="epoch",
         logging_strategy="epoch",
@@ -299,11 +298,11 @@ def train_model(train_df, test_df):
         remove_unused_columns=False,
         dataloader_pin_memory=False,
         gradient_accumulation_steps=accumulation_steps,
-    )
+)
 
     # Create AdapterTrainer instance
     trainer = AdapterTrainer(
-        model=model,
+        model=model.module if isinstance(model, nn.DataParallel) else model,
         args=training_args,
         train_dataset=train_data,
         eval_dataset=test_data,
@@ -316,7 +315,7 @@ def train_model(train_df, test_df):
     trainer.evaluate()
         
     # Save the adapter
-    save_adapter(model)
+    save_model_and_adapter(model)
     
 
 def compute_accuracy(p: EvalPrediction):
@@ -333,23 +332,21 @@ def compute_accuracy(p: EvalPrediction):
   return {"acc": (preds == p.label_ids).mean()}
     
 
-def save_adapter(model):
+def save_model_and_adapter(model):
     """
-    Save the adapter and log it as a W&B artifact.
+    Save the model's adapter and log it as a WandB artifact.
 
     Args:
-        model (PreTrainedModel): The model with the adapter to be saved.
-        adapter_name (str): The name of the adapter to save.
-        save_path (str): The directory path where the adapter will be saved.
+        model: The model with the adapter to save.
     """
-    # Save the adapter
-    model.save_adapter(ADAPTER_PATH, ADAPTER_NAME, with_head=True)
+    path = os.path.join(os.getcwd(), "adapter-model")
+    
+    model = model.module if isinstance(model, nn.DataParallel) else model
+    # Save the entire model
+    model.save_pretrained(path)
 
-    # Log the adapter artifact
-    artifact = wandb.Artifact("customized_codebert_frequent_patterns", type="model")
-    artifact.add_dir(ADAPTER_PATH)
-    wandb.log_artifact(artifact)
-    wandb.save("./adapter/*")
+    # Save the adapter
+    model.save_adapter(path, ADAPTER_NAME)
 
 
 def load_model_and_adapter():
@@ -359,64 +356,58 @@ def load_model_and_adapter():
     Returns:
         PreTrainedModel: The model with the loaded adapter.
     """
-    # Load the adapter configuration from file
-    config_file_path = f"{ADAPTER_PATH}/adapter_config.json"
-    with open(config_file_path, "r") as config_file:
-        adapter_config = json.load(config_file)
+    
+    # Load the tokenizer and model
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoAdapterModel.from_pretrained(PATH)
 
-    # Initialize the model with the same configuration as during saving
-    model_name = adapter_config["model_name"]
-    adapter_name = adapter_config["name"]
-    m = AutoAdapterModel.from_pretrained(model_name)
-
-    # Load the adapter
-    m.load_adapter(ADAPTER_PATH, config=adapter_config["config"])
-
-    # Activate the adapter
-    m.set_active_adapters(adapter_name)
-
-    return m
+    # Load the adapter from the saved path and activate it
+    adapter_name = model.load_adapter(PATH)
+    model.set_active_adapters(adapter_name)
+    print(f"Loaded and activated adapter: {adapter_name}")
+    
+    return model, tokenizer
 
 
-def get_predicted_label(model, tokenized_pair, device):
+def find_pairs_with_common_properties(df):
     """
-    Get the predicted label for a tokenized pair using the given model.
+    Generate pairs of paths from a DataFrame where the schemas have at least two properties in common.
 
     Args:
-        model (PreTrainedModel): The model used for prediction.
-        tokenized_pair (list[int]): The tokenized input pair.
-        device (torch.device): The device (CPU or GPU) to run the model on.
+        df (pd.DataFrame): A DataFrame containing path information.
 
-    Returns:
-        int: The predicted label.
+    Yields:
+        tuple: A tuple containing the indices of the two paths (i, j) and a set of common properties between their schemas.
     """
-    input_ids = torch.tensor([tokenized_pair]).to(device)
-    attention_mask = torch.tensor([[1] * len(tokenized_pair)]).to(device)
+    properties_list = []
 
-    with torch.no_grad():
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        logits = outputs.logits
-        predictions = torch.argmax(logits, dim=1)
+    # Extract properties for each row
+    for i in range(len(df)):
+        try:
+            schema = json.loads(df.at[i, "schema"])
+            properties = schema.get("properties", {})
+            properties_list.append(set(properties.keys()))
+        except (json.JSONDecodeError) as e:
+            print(f"Skipping row {i} due to error: {e}")
+            properties_list.append(set()) 
+        except Exception as e:
+            print(f"Skipping row {i} due to error: {e}")
+            properties_list.append(set())
+        
 
-    return int(predictions[0])
+    # Compare each pair of schemas
+    for i in range(len(df)):
+        properties_i = properties_list[i]
 
-
-def find_pairs_in_common(df):
-    all_keys = {}
-    for (i, schema) in enumerate(df["Schema"]):
-        for key in schema.get("properties", {}).keys():
-            if key in all_keys:
-                all_keys[key].append(i)
-            else:
-                all_keys[key] = [i]
-
-    explored_pairs = set()
-    for schema_indexes in all_keys.values():
-        for (i1, i2) in itertools.combinations(schema_indexes, 2):
-            (i1, i2) = sorted((i1, i2))
-            if (i1, i2) not in explored_pairs:
-                yield i1, i2
-                explored_pairs.add((i1, i2))
+        for j in range(i + 1, len(df)):
+            properties_j = properties_list[j]
+            
+            # Find the common properties between the two schemas
+            common_properties = properties_i & properties_j
+            
+            # Yield the pair if there are more than two common properties
+            if len(common_properties) > 1:
+                yield i, j, common_properties
 
 
 def merge_eval_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer):#, truncations):
@@ -451,9 +442,187 @@ def merge_eval_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer):#,
     return merged_tokenized_schema#, truncations
 
 
+def load_and_dereference_schema(schema_path):
+    """
+    Load the JSON schema from the specified path and recursively resolve $refs within it.
+
+    Args:
+        schema_path (str): The path to the JSON schema file.
+
+    Returns:
+        dict: The dereferenced JSON schema or None.
+    """
+    try:
+        with open(schema_path, 'r') as schema_file:
+            schema = json.load(schema_file)
+
+            if "$ref" in schema:
+                resolved_root = jsonref.JsonRef.replace_refs(schema)
+                # Merge the resolved ref into the schema without discarding other properties
+                partially_resolved_schema = {**resolved_root, **schema}
+                # Remove $ref since it's now replaced with its resolution
+                partially_resolved_schema.pop("$ref", None)
+                resolved_schema = partially_resolved_schema
+            else:
+                resolved_schema = schema
+
+            # Resolve any additional $refs that might exist after the first replacement
+            resolved_schema = jsonref.JsonRef.replace_refs(resolved_schema)
+            return resolved_schema
+
+    except jsonref.JsonRefError as e:
+        print(f"Error dereferencing schema {schema_path}: {e}")
+        return None
+    except ValueError as e:
+        print(f"Error parsing schema {schema_path}: {e}")
+        return None
+    except Exception as e:
+        print(f"Unknown error dereferencing schema {schema_path}: {e}")
+        return None
+    
+
+def extract_additional_properties_paths(schema, path=('$',)):
+    """
+    Recursively extract paths from a JSON schema where additionalProperties is an object or true.
+
+    Args:
+        schema (dict): The JSON schema.
+        path (tuple): Current path being traversed (used for recursion).
+
+    Yields:
+        tuple: Each path found in the schema where additionalProperties is an object or true.
+    """
+    if not isinstance(schema, dict):
+        return
+
+    # Check for additionalProperties condition
+    if "additionalProperties" in schema:
+        if schema["additionalProperties"] is True or isinstance(schema["additionalProperties"], dict):
+            yield path
+
+    # Handle properties
+    if "properties" in schema:
+        for prop, subschema in schema["properties"].items():
+            current_path = path + (prop,)
+            yield from extract_additional_properties_paths(subschema, current_path)
+
+    # Handle items for arrays
+    if "items" in schema:
+        items_schema = schema["items"]
+        array_path = path + ('*',)
+        yield from extract_additional_properties_paths(items_schema, array_path)
+        
+    # Handle subschemas
+    for subschema_key in JSON_SUBSCHEMA_KEYWORDS:
+        if subschema_key in schema:
+            for subschema in schema[subschema_key]:
+                yield from extract_additional_properties_paths(subschema, path)
+
+    # Handle conditional schemas
+    for condition_key in ["if", "then", "else"]:
+        if condition_key in schema:
+            yield from extract_additional_properties_paths(schema[condition_key], path)
+
+
+def has_additional_properties_prefix_or_exact(path, additional_properties_paths):
+    """
+    Check if the given path matches exactly or starts with any prefix from additionalProperties_paths.
+
+    Args:
+        path (tuple): The path to check.
+        additional_properties_paths (set): A set of paths representing additionalProperties.
+
+    Returns:
+        bool: True if the path matches exactly or starts with any additionalProperties prefix, False otherwise.
+    """
+    for additional_path in additional_properties_paths:
+        # Check for exact match
+        if path == additional_path:
+            return True
+        # Check for prefix match
+        if path[:len(additional_path)] == additional_path:
+            return True
+    return False
+
+
+def remove_additional_properties(filtered_df, schema):
+    """
+    Remove paths from the DataFrame that are not explicitly defined in the schema or have additionalProperties paths as prefixes or exact matches.
+
+    Args:
+        filtered_df (pd.DataFrame): DataFrame containing paths and associated data.
+        schema (dict): The JSON schema to extract valid paths from.
+
+    Returns:
+        pd.DataFrame: Filtered DataFrame with paths that are explicitly defined in the schema.
+    """
+    # Load the schema
+    schema_path = os.path.join(SCHEMA_FOLDER, schema)
+    schema = load_and_dereference_schema(schema_path)
+    #schema = process_data.load_schema(schema_path)
+
+    # Extract paths where additionalProperties is an object or true
+    additional_properties_paths = set(extract_additional_properties_paths(schema))
+    print(f"Additional properties paths: {additional_properties_paths}")
+    if not additional_properties_paths:
+        return filtered_df
+
+    # Filter out rows where the 'path' matches exactly or has an additionalProperties prefix
+    filtered_df = filtered_df[
+        ~filtered_df["path"].apply(lambda path: has_additional_properties_prefix_or_exact(path, additional_properties_paths))
+    ]
+
+    return filtered_df
+
+
+
+def process_pairs(pairs, df, model, device, tokenizer):
+    """
+    Process schema pairs and return edges for connected pairs.
+
+    Args:
+        pairs (list[tuple]): A list of tuples, where each tuple contains the indices of the two schemas (i1, i2) and a set of common properties.
+        df (pd.DataFrame): DataFrame containing the paths and schemas.
+        model (PreTrainedModel): The model used for predicting connections.
+        device (torch.device): The device to run the model on.
+        tokenizer (PreTrainedTokenizer): The tokenizer used for processing schemas.
+
+    Returns:
+        list[tuple]: A list of tuples where each tuple contains the paths of two schemas that are predicted to be connected.
+    """
+    edges = []
+    
+    for i1, i2, prop in pairs:
+        schema1 = json.loads(df["schema"].iloc[i1])
+        schema2 = json.loads(df["schema"].iloc[i2])
+        ordered_schema1, ordered_schema2 = order_properties_by_commonality(schema1, schema2)
+        
+        # Tokenize schemas (returns lists of token IDs)
+        tokenized_schema1 = tokenize_schema(ordered_schema1, tokenizer)
+        tokenized_schema2 = tokenize_schema(ordered_schema2, tokenizer)
+        
+        # Merge the tokenized schemas
+        tokenized_schema = merge_eval_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer)
+        
+        # Convert the list of token IDs to a tensor and create attention mask
+        input_ids = torch.tensor(tokenized_schema, dtype=torch.long).unsqueeze(0).to(device)
+        attention_mask = torch.ones(input_ids.shape, dtype=torch.long).to(device)
+
+        # Predict labels
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            pred = torch.argmax(outputs.logits, dim=-1).item()
+
+        # Add edge if prediction is positive
+        if pred == 1:
+            edges.append((df["path"].iloc[i1], df["path"].iloc[i2]))
+
+    return edges
+
+
 def build_definition_graph(df, model, device, tokenizer):
     """
-    Build a definition graph from tokenized schema pairs using the given model.
+    Build a definition graph from tokenized schema pairs using the given model, without batching.
 
     Args:
         df (pd.DataFrame): A DataFrame containing paths and their tokenized schemas.
@@ -464,26 +633,18 @@ def build_definition_graph(df, model, device, tokenizer):
     Returns:
         nx.Graph: A graph with edges representing predicted connections between pairs.
     """
-    # Create a graph
     graph = nx.Graph()
+    pairs = list(find_pairs_with_common_properties(df))
+    
+    with tqdm.tqdm(total=len(pairs), desc="Processing pairs", position=0, leave=True) as pbar:
+        edges = process_pairs(pairs, df, model, device, tokenizer)
 
-    # Find pairs
-    for i1, i2 in find_pairs_in_common(df):   
-        schema1 = df["Schema"].iloc[i1]
-        schema2 = df["Schema"].iloc[i2] 
-        ordered_schema1, ordered_schema2 = order_properties_by_commonality(schema1, schema2)
-        tokenized_schema1 = tokenize_schema(ordered_schema1, tokenizer)
-        tokenized_schema2 = tokenize_schema(ordered_schema2, tokenizer) 
-        tokenized_schema = merge_eval_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer)
-        
-        # If the predicted label is 1, add an edge between the paths' nodes
-        predicted_label = get_predicted_label(model, tokenized_schema, device)
+        # Add edges to the graph
+        for edge in edges:
+            graph.add_edge(*edge)
 
-        if predicted_label:  
-            #print(df["Path"].iloc[i1], df["Path"].iloc[i2])#, df["Schema"].iloc[i1], df["Schema"].iloc[i2])
-            graph.add_edge(df["Path"].iloc[i1], df["Path"].iloc[i2])
+        pbar.update(len(pairs))
 
-    print()
     return graph
 
 
@@ -497,7 +658,6 @@ def find_definitions_from_graph(graph):
     Returns:
         List[List]: A list of lists, each containing nodes representing a definition.
     """
-
     # Get all the cliques from the graph and sort them based on their lengths in ascending order
     cliques = list(nx.algorithms.find_cliques(graph))
     cliques.sort(key=lambda a: len(a))
@@ -521,64 +681,6 @@ def find_definitions_from_graph(graph):
     return processed_cliques
 
 
-def evaluate_data(test_ground_truth, model, tokenizer):
-    """
-    Evaluate the model on the entire test data.
-
-    Args:
-        test_ground_truth (dict): Dictionary containing ground truth information for test data.
-        model (PreTrainedModel): The trained model to be evaluated.
-        tokenizer: The tokenizer used for processing schemas.
-    """
-
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-
-    # Get the test schemas
-    test_schemas = test_ground_truth.keys()
-    f1_scores = []
-
-    for schema in tqdm.tqdm(test_schemas, position=1, leave=False, total=len(test_schemas)):
-        if schema == "openrpc-json.json":
-            continue
-        # Create a dataframe for schema that meets all the conditions
-        filtered_df, frequent_ref_defn_paths = process_data.process_schema(schema, JSON_FOLDER, SCHEMA_FOLDER)
-        if filtered_df is not None and frequent_ref_defn_paths is not None:
-            #filtered_df.to_csv(schema, columns=["Path", "Schema"], index=False)
-            #print(schema)
-            # Build a definition graph
-            graph = build_definition_graph(filtered_df, model, device, tokenizer)
-            #continue
-            # Predict clusters
-            predicted_clusters = find_definitions_from_graph(graph)
-
-            # Get the ground truth clusters
-            ground_truth_dict = test_ground_truth.get(schema, {})
-            actual_clusters = [[tuple(inner_list) for inner_list in outer_list] for outer_list in ground_truth_dict.values()]
-
-            # Calculate the precision, recall, and F1-score
-            precision, recall, f1_score = calc_scores(actual_clusters, predicted_clusters)
-            f1_scores.append(f1_score)
-
-            # Print the evaluation metrics
-            print(f"Schema: {schema}, Precision: {precision}, Recall: {recall}, F1-score: {f1_score}")
-
-            # Print the actual and predicted clusters
-            print("Actual clusters")
-            for actual_cluster in actual_clusters:
-                print(actual_cluster)
-
-            print()
-            print("Predicted clusters:")
-            for predicted_cluster in predicted_clusters:
-                print(predicted_cluster)
-            print("-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------")
-            print()
-            
-    print("Average F1-score:", sum(f1_scores)/len(f1_scores))
-        
-  
 def calc_jaccard_index(actual_cluster, predicted_cluster):
     """Measure the similarity between actual and predicted clusters
 
@@ -651,3 +753,100 @@ def calc_scores(actual_clusters, predicted_clusters, threshold=1.0):
         precision, recall, f1_score = 0, 0, 0
     
     return precision, recall, f1_score
+
+
+def evaluate_single_schema(schema, device, test_ground_truth):
+    """
+    Helper function to evaluate a single schema.
+
+    Args:
+        schema (str): The schema filename to be evaluated.
+        device (torch.device): The device on which to run the model.
+        tokenizer (PreTrainedTokenizer): The tokenizer for schema tokenization.
+        test_ground_truth (dict): Ground truth clusters for test schemas.
+
+    Returns:
+        tuple: Contains schema name, precision, recall, F1 score, actual clusters, and predicted clusters.
+        None: If the schema could not be processed.
+    """
+    
+    # Load the model and tokenizer
+    m, tokenizer = load_model_and_adapter()
+    m.eval()
+    m.to(device)
+
+    filtered_df, frequent_ref_defn_paths, schema_name, failure_flags = process_data.process_schema(schema)
+        
+    if filtered_df is not None and frequent_ref_defn_paths is not None:
+        filtered_df[["path", "schema"]].to_csv(f"./{schema_name}_filtered_df.csv", index=False)
+        # Filter paths with schema
+        #df = remove_additional_properties(filtered_df, schema)
+        #df["path"].to_csv(f"./{schema_name}_filtered_df.csv", index=False)
+        #print(f"Schema: {schema}, Number of paths: {len(df)}")
+        
+        # Build a definition graph
+        graph = build_definition_graph(filtered_df, m, device, tokenizer)
+        #print(f"Number of edges: {len(graph.edges)}")
+        
+        # Predict clusters
+        predicted_clusters = find_definitions_from_graph(graph)
+        #print(f"Number of predicted clusters: {len(predicted_clusters)}")
+
+        # Get the ground truth clusters
+        ground_truth_dict = test_ground_truth.get(schema_name, {})
+        actual_clusters = [[tuple(inner_list) for inner_list in outer_list] for outer_list in ground_truth_dict.values()]
+
+        # Calculate the precision, recall, and F1-score
+        precision, recall, f1_score = calc_scores(actual_clusters, predicted_clusters)
+
+        # Return evaluation metrics and clusters for the schema
+        return schema, precision, recall, f1_score, actual_clusters, predicted_clusters
+        
+    return None
+
+
+def evaluate_data(test_ground_truth):
+    """
+    Evaluate the model on the entire test data using multiple CPUs.
+
+    Args:
+        test_ground_truth (dict): Dictionary containing ground truth information for test data.
+    """
+
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Get the test schemas
+    test_schemas = list(test_ground_truth.keys())
+    f1_scores = []
+
+    # Process schemas in parallel using ProcessPoolExecutor
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        futures = {executor.submit(evaluate_single_schema, schema, device, test_ground_truth): schema for schema in test_schemas}
+
+        for future in tqdm.tqdm(concurrent.futures.as_completed(futures), total=len(futures), position=1):
+            result = future.result()
+            if result is not None:
+                
+                schema, precision, recall, f1_score, actual_clusters, predicted_clusters = result
+                f1_scores.append(f1_score)
+
+                # Print the evaluation metrics
+                print(f"Schema: {schema}, Precision: {precision}, Recall: {recall}, F1-score: {f1_score}")
+
+                # Print the actual and predicted clusters
+                print("Actual clusters")
+                for actual_cluster in actual_clusters:
+                    print(actual_cluster)
+
+                print("\nPredicted clusters:")
+                for predicted_cluster in predicted_clusters:
+                    print(predicted_cluster)
+                
+                print("-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n")
+                
+    # Print the average F1-score
+    if f1_scores:
+        print("Average F1-score:", sum(f1_scores) / len(f1_scores))
+        
+  
