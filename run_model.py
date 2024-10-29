@@ -1,10 +1,9 @@
 import json
 import model
+import multiprocessing
 import pandas as pd
 import sys
 import time
-
-from transformers import AutoTokenizer
 
 
 
@@ -12,25 +11,22 @@ def load_data():
     """
     Load sampled training and testing datasets from Parquet files and train the model.
     """
-    train_df = pd.read_parquet("sample_train_data.parquet") 
-    test_df = pd.read_parquet("sample_test_data.parquet") 
+    train_df = pd.read_csv("sample_train_data.csv") 
+    test_df = pd.read_csv("sample_test_data.csv") 
     model.train_model(train_df, test_df)
 
 
 def evaluate_model():
     """
-    Load the model and tokenizer, retrieve the testing data and ground truth, and evaluate the model.
+    Evaluate the model on the test set.
     """
-
-    m = model.load_model_and_adapter()
-    tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
 
     test_ground_truth = {}
     with open("test_ground_truth.json", 'r') as json_file:
         for line in json_file:
             test_ground_truth.update(json.loads(line))
 
-    model.evaluate_data(test_ground_truth, m, tokenizer)
+    model.evaluate_data(test_ground_truth)
 
 
 def evaluate_simple_model():
@@ -58,8 +54,6 @@ def deref_schemas():
         schema_size = model.dereference_and_calculate_schema_size(schema, definitions_to_keep)
         print(f"The size of the dereferenced schema {schema} is {schema_size} bytes")
     
-
-
                         
 def main():
     """
@@ -89,4 +83,5 @@ def main():
   
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method("spawn")
     main()

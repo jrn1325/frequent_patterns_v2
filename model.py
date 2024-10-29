@@ -12,6 +12,7 @@ import tqdm
 import wandb
 
 from adapters import AdapterTrainer, AutoAdapterModel
+from copy import copy, deepcopy
 from torch.optim import AdamW
 from transformers import AutoTokenizer, get_scheduler, TrainingArguments, EvalPrediction
 
@@ -61,72 +62,6 @@ def initialize_model():
     model.train_adapter(ADAPTER_NAME)
     wandb.watch(model)
     return model, tokenizer
-
-
-def extract_properties(schema):
-    """Extract properties from a JSON schema."""
-    if "properties" in schema:
-        return schema["properties"]
-    return {}
-
-
-def order_properties_by_commonality(schema1, schema2):
-    """
-    Orders the properties of two schemas based on their common properties.
-
-    Args:
-        schema1 (dict): The first JSON schema.
-        schema2 (dict): The second JSON schema.
-
-    Returns:
-        tuple: Two dictionaries representing the schemas with properties ordered by commonality.
-    """
-
-    # Extract properties from both schemas
-    properties1 = extract_properties(schema1)
-    properties2 = extract_properties(schema2)
-
-    # Find common properties
-    common_properties = set(properties1.keys()).intersection(set(properties2.keys()))
-
-    # Order properties by commonality
-    ordered_properties1 = {prop: properties1[prop] for prop in common_properties}
-    ordered_properties1.update({prop: properties1[prop] for prop in properties1 if prop not in common_properties})
-
-    ordered_properties2 = {prop: properties2[prop] for prop in common_properties}
-    ordered_properties2.update({prop: properties2[prop] for prop in properties2 if prop not in common_properties})
-
-    # Create new ordered schemas
-    ordered_schema1 = {**schema1, "properties": ordered_properties1}
-    ordered_schema2 = {**schema2, "properties": ordered_properties2}
-
-    return ordered_schema1, ordered_schema2
-
-
-def tokenize_schema(schema, tokenizer):
-    """Tokenize schema.
-
-    Args:
-        schema (dict): DataFrame containing pairs, labels, filenames, and schemas of each path in pair
-        tokenizer (PreTrainedTokenizer): The tokenizer used for processing schemas.
-
-    Returns:
-        torch.tensor: inputs_ids tensor
-    """
-
-    # Tokenize the schema
-    tokenized_schema = tokenizer(json.dumps(schema), return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True)
-    input_ids_tensor = tokenized_schema["input_ids"]
-    input_ids_tensor = input_ids_tensor[input_ids_tensor != tokenizer.pad_token_id]
-
-    # Remove the first and last tokens
-    input_ids_tensor_sliced = input_ids_tensor[1:-1]
-
-    # Convert tensor to a numpy array and then list
-    input_ids_numpy = input_ids_tensor_sliced.cpu().numpy()
-    input_ids_list = input_ids_numpy.tolist()
-   
-    return input_ids_list
 
 
 def merge_schema_tokens(df, tokenizer):
@@ -218,6 +153,37 @@ def transform_data(df, tokenizer, device):
         dataset.append(dictionary)
 
     return dataset
+
+
+def compute_accuracy(p: EvalPrediction):
+  """
+    Compute accuracy for the given predictions.
+
+    Args:
+        p (EvalPrediction): An EvalPrediction object containing predictions and label IDs.
+
+    Returns:
+        dict: A dictionary containing the accuracy.
+    """
+  preds = np.argmax(p.predictions, axis=1)
+  return {"acc": (preds == p.label_ids).mean()}
+    
+
+def save_model_and_adapter(model):
+    """
+    Save the model's adapter and log it as a WandB artifact.
+
+    Args:
+        model: The model with the adapter to save.
+    """
+    path = os.path.join(os.getcwd(), "adapter-model")
+    
+    model = model.module if isinstance(model, nn.DataParallel) else model
+    # Save the entire model
+    model.save_pretrained(path)
+
+    # Save the adapter
+    model.save_adapter(path, ADAPTER_NAME)
 
 
 def train_model(train_df, test_df):
@@ -318,37 +284,6 @@ def train_model(train_df, test_df):
     save_model_and_adapter(model)
     
 
-def compute_accuracy(p: EvalPrediction):
-  """
-    Compute accuracy for the given predictions.
-
-    Args:
-        p (EvalPrediction): An EvalPrediction object containing predictions and label IDs.
-
-    Returns:
-        dict: A dictionary containing the accuracy.
-    """
-  preds = np.argmax(p.predictions, axis=1)
-  return {"acc": (preds == p.label_ids).mean()}
-    
-
-def save_model_and_adapter(model):
-    """
-    Save the model's adapter and log it as a WandB artifact.
-
-    Args:
-        model: The model with the adapter to save.
-    """
-    path = os.path.join(os.getcwd(), "adapter-model")
-    
-    model = model.module if isinstance(model, nn.DataParallel) else model
-    # Save the entire model
-    model.save_pretrained(path)
-
-    # Save the adapter
-    model.save_adapter(path, ADAPTER_NAME)
-
-
 def load_model_and_adapter():
     """
     Load the model and adapter from the specified path.
@@ -367,6 +302,94 @@ def load_model_and_adapter():
     print(f"Loaded and activated adapter: {adapter_name}")
     
     return model, tokenizer
+
+
+def get_schema_paths(schema, current_path=('$',)):
+    """
+    Recursively traverse the JSON schema and return the full paths of all nested properties,
+    excluding schema keywords from the path.
+
+    Args:
+        schema (dict): The JSON schema object.
+        current_path (tuple): The current path tuple, starting from the root ('$').
+
+    Yields:
+        tuple: A tuple representing the path of each nested property as it would appear in a JSON document.
+    """
+    if not isinstance(schema, dict):
+        return
+
+    # Yield the current path if it's a dictionary (nested property)
+    yield current_path
+
+    for key, value in schema.items():
+        # Skip 'definitions', '$defs', and 'additionalProperties'
+        if key in {"definitions", "$defs", "additionalProperties"}:
+            continue
+
+        # Update the path for nested structures
+        if key == "properties":
+            for prop_key, prop_value in value.items():
+                # Recursively yield paths for each sub-property
+                yield from get_schema_paths(prop_value, current_path + (prop_key,))
+
+        elif key in {"allOf", "anyOf", "oneOf"}:
+            for item in value:
+                yield from get_schema_paths(item, current_path)
+
+        elif key == "items":
+            # Represent 'items' in the path with '*'
+            yield from get_schema_paths(value, current_path + ('*',))
+
+        # Recursively handle other nested dictionaries
+        elif isinstance(value, dict):
+            yield from get_schema_paths(value, current_path + (key,))
+
+
+def in_schema(path, schema_paths):
+    """
+    Check if the given path matches exactly any path in schema_paths.
+
+    Args:
+        path (tuple): The path to check.
+        schema_paths (set): A set of paths representing allowed schema paths.
+
+    Returns:
+        bool: True if the path matches exactly any schema path, False otherwise.
+    """
+    return path in schema_paths
+
+
+def remove_additional_properties(filtered_df, schema):
+    """
+    Remove paths from the DataFrame that are not explicitly defined in the schema.
+
+    Args:
+        filtered_df (pd.DataFrame): DataFrame containing paths and associated data.
+        schema (str): The JSON schema name.
+
+    Returns:
+        pd.DataFrame: Filtered DataFrame with paths that are explicitly defined in the schema.
+    """
+    # Load the schema
+    schema_path = os.path.join(SCHEMA_FOLDER, schema)
+    try:
+        with open(schema_path, 'r') as schema_file:
+            schema = jsonref.load(schema_file)
+    except Exception as e:
+        print(f"Error loading and dereferencing schema {schema_path}: {e}")
+        return filtered_df
+    
+    # Get all paths in the schema
+    schema_paths = set(get_schema_paths(schema))
+    print(f"Schema paths: {schema_paths}")
+
+    # Only keep rows where the 'path' exists in schema_paths
+    filtered_df = filtered_df[
+        filtered_df["path"].apply(lambda path: in_schema(path, schema_paths))
+    ]
+
+    return filtered_df
 
 
 def find_pairs_with_common_properties(df):
@@ -410,6 +433,72 @@ def find_pairs_with_common_properties(df):
                 yield i, j, common_properties
 
 
+def extract_properties(schema):
+    """Extract properties from a JSON schema."""
+    if "properties" in schema:
+        return schema["properties"]
+    return {}
+
+
+def order_properties_by_commonality(schema1, schema2):
+    """
+    Orders the properties of two schemas based on their common properties.
+
+    Args:
+        schema1 (dict): The first JSON schema.
+        schema2 (dict): The second JSON schema.
+
+    Returns:
+        tuple: Two dictionaries representing the schemas with properties ordered by commonality.
+    """
+
+    # Extract properties from both schemas
+    properties1 = extract_properties(schema1)
+    properties2 = extract_properties(schema2)
+
+    # Find common properties
+    common_properties = set(properties1.keys()).intersection(set(properties2.keys()))
+
+    # Order properties by commonality
+    ordered_properties1 = {prop: properties1[prop] for prop in common_properties}
+    ordered_properties1.update({prop: properties1[prop] for prop in properties1 if prop not in common_properties})
+
+    ordered_properties2 = {prop: properties2[prop] for prop in common_properties}
+    ordered_properties2.update({prop: properties2[prop] for prop in properties2 if prop not in common_properties})
+
+    # Create new ordered schemas
+    ordered_schema1 = {**schema1, "properties": ordered_properties1}
+    ordered_schema2 = {**schema2, "properties": ordered_properties2}
+
+    return ordered_schema1, ordered_schema2
+
+
+def tokenize_schema(schema, tokenizer):
+    """Tokenize schema.
+
+    Args:
+        schema (dict): DataFrame containing pairs, labels, filenames, and schemas of each path in pair
+        tokenizer (PreTrainedTokenizer): The tokenizer used for processing schemas.
+
+    Returns:
+        torch.tensor: inputs_ids tensor
+    """
+
+    # Tokenize the schema
+    tokenized_schema = tokenizer(json.dumps(schema), return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True)
+    input_ids_tensor = tokenized_schema["input_ids"]
+    input_ids_tensor = input_ids_tensor[input_ids_tensor != tokenizer.pad_token_id]
+
+    # Remove the first and last tokens
+    input_ids_tensor_sliced = input_ids_tensor[1:-1]
+
+    # Convert tensor to a numpy array and then list
+    input_ids_numpy = input_ids_tensor_sliced.cpu().numpy()
+    input_ids_list = input_ids_numpy.tolist()
+   
+    return input_ids_list
+
+
 def merge_eval_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer):#, truncations):
     """Merge the tokens of the schemas of the paths with in pair.
 
@@ -441,141 +530,7 @@ def merge_eval_schema_tokens(tokenized_schema1, tokenized_schema2, tokenizer):#,
 
     return merged_tokenized_schema#, truncations
 
-
-def load_and_dereference_schema(schema_path):
-    """
-    Load the JSON schema from the specified path and recursively resolve $refs within it.
-
-    Args:
-        schema_path (str): The path to the JSON schema file.
-
-    Returns:
-        dict: The dereferenced JSON schema or None.
-    """
-    try:
-        with open(schema_path, 'r') as schema_file:
-            schema = json.load(schema_file)
-
-            if "$ref" in schema:
-                resolved_root = jsonref.JsonRef.replace_refs(schema)
-                # Merge the resolved ref into the schema without discarding other properties
-                partially_resolved_schema = {**resolved_root, **schema}
-                # Remove $ref since it's now replaced with its resolution
-                partially_resolved_schema.pop("$ref", None)
-                resolved_schema = partially_resolved_schema
-            else:
-                resolved_schema = schema
-
-            # Resolve any additional $refs that might exist after the first replacement
-            resolved_schema = jsonref.JsonRef.replace_refs(resolved_schema)
-            return resolved_schema
-
-    except jsonref.JsonRefError as e:
-        print(f"Error dereferencing schema {schema_path}: {e}")
-        return None
-    except ValueError as e:
-        print(f"Error parsing schema {schema_path}: {e}")
-        return None
-    except Exception as e:
-        print(f"Unknown error dereferencing schema {schema_path}: {e}")
-        return None
     
-
-def extract_additional_properties_paths(schema, path=('$',)):
-    """
-    Recursively extract paths from a JSON schema where additionalProperties is an object or true.
-
-    Args:
-        schema (dict): The JSON schema.
-        path (tuple): Current path being traversed (used for recursion).
-
-    Yields:
-        tuple: Each path found in the schema where additionalProperties is an object or true.
-    """
-    if not isinstance(schema, dict):
-        return
-
-    # Check for additionalProperties condition
-    if "additionalProperties" in schema:
-        if schema["additionalProperties"] is True or isinstance(schema["additionalProperties"], dict):
-            yield path
-
-    # Handle properties
-    if "properties" in schema:
-        for prop, subschema in schema["properties"].items():
-            current_path = path + (prop,)
-            yield from extract_additional_properties_paths(subschema, current_path)
-
-    # Handle items for arrays
-    if "items" in schema:
-        items_schema = schema["items"]
-        array_path = path + ('*',)
-        yield from extract_additional_properties_paths(items_schema, array_path)
-        
-    # Handle subschemas
-    for subschema_key in JSON_SUBSCHEMA_KEYWORDS:
-        if subschema_key in schema:
-            for subschema in schema[subschema_key]:
-                yield from extract_additional_properties_paths(subschema, path)
-
-    # Handle conditional schemas
-    for condition_key in ["if", "then", "else"]:
-        if condition_key in schema:
-            yield from extract_additional_properties_paths(schema[condition_key], path)
-
-
-def has_additional_properties_prefix_or_exact(path, additional_properties_paths):
-    """
-    Check if the given path matches exactly or starts with any prefix from additionalProperties_paths.
-
-    Args:
-        path (tuple): The path to check.
-        additional_properties_paths (set): A set of paths representing additionalProperties.
-
-    Returns:
-        bool: True if the path matches exactly or starts with any additionalProperties prefix, False otherwise.
-    """
-    for additional_path in additional_properties_paths:
-        # Check for exact match
-        if path == additional_path:
-            return True
-        # Check for prefix match
-        if path[:len(additional_path)] == additional_path:
-            return True
-    return False
-
-
-def remove_additional_properties(filtered_df, schema):
-    """
-    Remove paths from the DataFrame that are not explicitly defined in the schema or have additionalProperties paths as prefixes or exact matches.
-
-    Args:
-        filtered_df (pd.DataFrame): DataFrame containing paths and associated data.
-        schema (dict): The JSON schema to extract valid paths from.
-
-    Returns:
-        pd.DataFrame: Filtered DataFrame with paths that are explicitly defined in the schema.
-    """
-    # Load the schema
-    schema_path = os.path.join(SCHEMA_FOLDER, schema)
-    schema = load_and_dereference_schema(schema_path)
-    #schema = process_data.load_schema(schema_path)
-
-    # Extract paths where additionalProperties is an object or true
-    additional_properties_paths = set(extract_additional_properties_paths(schema))
-    print(f"Additional properties paths: {additional_properties_paths}")
-    if not additional_properties_paths:
-        return filtered_df
-
-    # Filter out rows where the 'path' matches exactly or has an additionalProperties prefix
-    filtered_df = filtered_df[
-        ~filtered_df["path"].apply(lambda path: has_additional_properties_prefix_or_exact(path, additional_properties_paths))
-    ]
-
-    return filtered_df
-
-
-
 def process_pairs(pairs, df, model, device, tokenizer):
     """
     Process schema pairs and return edges for connected pairs.
@@ -778,19 +733,21 @@ def evaluate_single_schema(schema, device, test_ground_truth):
     filtered_df, frequent_ref_defn_paths, schema_name, failure_flags = process_data.process_schema(schema)
         
     if filtered_df is not None and frequent_ref_defn_paths is not None:
-        filtered_df[["path", "schema"]].to_csv(f"./{schema_name}_filtered_df.csv", index=False)
         # Filter paths with schema
-        #df = remove_additional_properties(filtered_df, schema)
-        #df["path"].to_csv(f"./{schema_name}_filtered_df.csv", index=False)
-        #print(f"Schema: {schema}, Number of paths: {len(df)}")
+        filtered_df = remove_additional_properties(filtered_df, schema)
+        filtered_df[["path", "schema"]].to_csv(f"filtered_df_{schema_name}.csv", index=False)
+        if filtered_df.empty:
+            return None
+        
+        print(f"Schema: {schema}, Number of paths: {len(filtered_df)}")
         
         # Build a definition graph
         graph = build_definition_graph(filtered_df, m, device, tokenizer)
-        #print(f"Number of edges: {len(graph.edges)}")
+        print(f"Number of edges: {len(graph.edges)}")
         
         # Predict clusters
         predicted_clusters = find_definitions_from_graph(graph)
-        #print(f"Number of predicted clusters: {len(predicted_clusters)}")
+        print(f"Number of predicted clusters: {len(predicted_clusters)}")
 
         # Get the ground truth clusters
         ground_truth_dict = test_ground_truth.get(schema_name, {})
@@ -842,11 +799,8 @@ def evaluate_data(test_ground_truth):
                 print("\nPredicted clusters:")
                 for predicted_cluster in predicted_clusters:
                     print(predicted_cluster)
-                
                 print("-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n")
                 
     # Print the average F1-score
     if f1_scores:
         print("Average F1-score:", sum(f1_scores) / len(f1_scores))
-        
-  

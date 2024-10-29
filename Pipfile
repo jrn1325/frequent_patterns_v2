@@ -11,6 +11,10 @@ wandb = "*"
 adapters = "*"
 scikit-learn = "*"
 accelerate = "*"
+adapter-transformers = "*"
+jsonschema = "*"
+jq = "*"
+joblib = "*"
 
 [dev-packages]
 

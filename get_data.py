@@ -43,20 +43,6 @@ def if_definition_exists(schema):
     return "definitions" in schema or "$defs" in schema
 
 
-def has_pattern_properties_string_search(schema):
-    """
-    Checks if 'patternProperties' exists in the schema by converting it to a string.
-
-    Args:
-        schema (dict): The JSON schema.
-
-    Returns:
-        bool: True if 'patternProperties' is found, False otherwise.
-    """
-    schema_str = json.dumps(schema)
-    return "patternProperties" in schema_str
-
-
 def prevent_additional_properties(schema):
     """
     Recursively traverse the schema and set 'additionalProperties' to False
@@ -243,8 +229,6 @@ def process_single_dataset(dataset):
         "empty": 0,
         "loaded": 0,
         "definition": 0,
-        #"pattern_properties": 0,
-        #"dereferenced": 0,
         "modified": 0,
         "validation": 0
     }
@@ -276,14 +260,6 @@ def process_single_dataset(dataset):
         print(f"Skipping {dataset} due to missing definitions in the schema.")
         failure_flags["definition"] = 1 
         return failure_flags
-    
-    '''
-    # Check if the schema contains patternProperties
-    if has_pattern_properties_string_search(schema):
-        print(f"Skipping {dataset} due to patternProperties in the schema.")
-        failure_flags["pattern_properties"] = 1 
-        return failure_flags
-    '''
 
     # Try modifying the schema to prevent additional properties
     try:
@@ -337,7 +313,6 @@ def process_datasets():
     empty_count = 0
     load_count = 0 
     definition = 0
-    #pattern_properties_count = 0
     modify_count = 0
     validation_count = 0
 
@@ -354,7 +329,6 @@ def process_datasets():
                 empty_count += flags["empty"]
                 load_count += flags["loaded"]
                 definition += flags["definition"]
-                #pattern_properties_count += flags["pattern_properties"]
                 validation_count += flags["validation"]
 
                 # Only count modification if the schema had valid documents
