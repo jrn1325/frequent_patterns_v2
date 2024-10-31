@@ -255,24 +255,6 @@ def remove_definition_keywords(good_ref_defn_paths):
     return updated_paths
 
 
-def looks_like_object(schema):
-    """
-    Check if the schema looks like an object.
-
-    Args:
-        schema (dict): JSON schema object.
-
-    Returns:
-        bool: True if the schema looks like an object, False otherwise.
-    """
-    if not isinstance(schema, dict):
-        return False
-    elif "type" in schema:
-        return schema["type"] == "object"
-    else:
-        return "properties" in schema
-
-
 def resolve_ref(defn_root, ref_path):
     """
     Resolve $ref within the schema.
@@ -289,75 +271,52 @@ def resolve_ref(defn_root, ref_path):
 
 
 def is_object_like(defn_obj, defn_root):
-    """Check if schema or dereferenced subschemas are of object type.
+    """Check if a schema or any dereferenced subschemas are of object type.
     
     Args:
-        defn_obj (dict): JSON schema object.
-        defn_root (dict): JSON schema object.
+        defn_obj (dict): The JSON schema definition object to evaluate.
+        defn_root (dict): The root of the JSON schema, used for resolving $ref references.
         
     Returns:
-        bool: True if the schema or dereferenced subschemas are of object type, False otherwise.
+        bool: True if the schema or any subschemas are of type 'object' or have 'properties', False otherwise.
     """
-    if not defn_obj:
-        return False
-    if looks_like_object(defn_obj):
+    if isinstance(defn_obj, dict) and (defn_obj.get("type") == "object" or "properties" in defn_obj):
         return True
     for keyword in ["oneOf", "anyOf", "allOf"]:
         for item in defn_obj.get(keyword, []):
             if "$ref" in item:
                 item = resolve_ref(defn_root, item["$ref"])
-            if looks_like_object(item):
+            if isinstance(item, dict) and (item.get("type") == "object" or "properties" in item):
                 return True
     return False
 
 
 def get_ref_defn_of_type_obj(json_schema, ref_defn_paths, paths_to_exclude):
-    """Remove referenced definitions that are not of type object, including those in subschemas
+    """Filter out references to definitions that do not represent objects or object-like schemas.
 
     Args:
-        json_schema (dict): JSON schema object
-        ref_defn_paths (dict): Dictionary of referenced definitions
-        paths_to_exclude (set): Paths to exclude from the JSON datasets
+        json_schema (dict): The JSON schema containing the referenced definitions.
+        ref_defn_paths (dict): Dictionary with references to definitions and their corresponding paths.
+        paths_to_exclude (set): Set of paths to be excluded from JSON datasets.
 
     Returns:
-        set: Updated paths to exclude
+        set: Updated set of paths to exclude, including those of definitions that are not objects.
     """
-    
-    defn_root = json_schema.get("$defs") or json_schema.get("definitions")
+    defn_root = json_schema.get("$defs") or json_schema.get("definitions", {})
     ref_to_delete = []
 
-    for ref in ref_defn_paths.keys():
+    for ref, paths in ref_defn_paths.items():
         defn_name = ref.split("/")[-1]
-        
-        try:
-            defn_obj = defn_root[defn_name]
-        except (KeyError, AttributeError, TypeError):
-            ref_to_delete.append(ref)
-            continue
+        defn_obj = defn_root.get(defn_name)
 
-        # Skip if definition is not a dictionary
-        if not isinstance(defn_obj, dict):
+        # Skip invalid or non-object-like definitions
+        if not isinstance(defn_obj, dict) or (len(defn_obj.get("properties", {})) <= 1 and not is_object_like(defn_obj, defn_root)):
             ref_to_delete.append(ref)
-            print(f"Excluded {ref}: Definition is not a dictionary.")
-            continue
-
-        # Exclude definitions with fewer than two properties, unless they resemble objects
-        if len(defn_obj.get("properties", {})) <= 1:
-            if not is_object_like(defn_obj, defn_root):
-                ref_to_delete.append(ref)
-                print(f"Excluded {ref}: Has fewer than two properties and does not resemble an object.")
-                continue
-
-        # Skip if the definition type is not object or object-like
-        if not is_object_like(defn_obj, defn_root):
-            ref_to_delete.append(ref)
-            print(f"Excluded {ref}: Definition is not an object.")
-            continue
+            print(f"Excluded {ref}: Not an object or object-like definition.")
 
     # Remove excluded references and update paths to exclude
     for ref in ref_to_delete:
-        paths_to_exclude.update(ref_defn_paths[ref])
-        del ref_defn_paths[ref]
+        paths_to_exclude.update(ref_defn_paths.pop(ref))
 
     return paths_to_exclude
 
@@ -386,30 +345,39 @@ def match_properties(schema, document):
     return False
 
 
-def parse_document(doc, path = ('$',)):
-    """Get the path of each key and its value from the json documents
+def parse_document(doc, path=('$',)):
+    """
+    Recursively get the path of each key and its value from a JSON document.
 
     Args:
-        doc (dict, list): json document
-        paths (tuple): tuples to store paths found. Defaults to ().
+        doc (dict or list): The JSON document to parse.
+        path (tuple): The current path as a tuple. Defaults to ('$').
 
     Raises:
-        ValueError: raise an error if the json object is not a dict or list
+        ValueError: If the JSON object is not a dict or list.
 
     Yields:
-        dict: dictionary of paths of each key and their values
+        tuple: A tuple containing:
+            - path (tuple): The path of each key as a tuple.
+            - value: The value at the end of the path.
     """
-
+    
     if isinstance(doc, dict):
         for key, value in doc.items():
-            yield path + (key,), value
+            current_path = path + (key,)
+            yield current_path, value 
             if isinstance(value, (dict, list)):
-                yield from parse_document(value, path + (key,))
+                yield from parse_document(value, current_path)
+
     elif isinstance(doc, list):
-        for item in doc:
-            yield path + ('*',), item
+        for index, item in enumerate(doc):
+            current_path = path + ('*',) 
+            yield current_path, item
             if isinstance(item, (dict, list)):
-                yield from parse_document(item, path + ('*',))
+                yield from parse_document(item, current_path)
+
+    else:
+        raise ValueError("The document must be a dict or list.")
 
 
 def process_document(doc, paths_dict):
@@ -483,78 +451,78 @@ def process_dataset(dataset):
 
 
 def path_matches_with_wildkey(schema_path, json_path):
-    """Check if schema_path with 'wildkey' matches json_path.
+    """
+    Check if a schema path with 'wildkey' matches a JSON path.
     
     Args:
-        schema_path (list): List of keys in the schema path.
-        json_path (list): List of keys in the JSON path.
+        schema_path (list): List of keys in the schema path, where 'wildkey' can match any key.
+        json_path (list): List of keys in the JSON path to compare against the schema path.
         
     Returns:
-        bool: True if the schema path matches the JSON path, False otherwise.
+        bool: True if the schema path matches the JSON path, considering 'wildkey' matches any key, otherwise False.
     """
+    # Paths must be the same length to match
     if len(schema_path) != len(json_path):
         return False
 
-    # Allow 'wildkey' in schema_path to match any value at that position in json_path
-    for schema_part, json_part in zip(schema_path, json_path):
-        if schema_part != "wildkey" and schema_part != json_part:
-            return False
-    return True
+    # Iterate through each part of the schema and JSON paths
+    return all(schema_part == "wildkey" or schema_part == json_part 
+               for schema_part, json_part in zip(schema_path, json_path))
 
 
 def check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, paths_dict):
-    """Check if the paths from JSON Schemas exist in JSON datasets.
+    """
+    Check if the paths from JSON Schemas exist in JSON datasets.
 
     Args:
         cleaned_ref_defn_paths (dict): Dictionary of JSON definitions and their paths.
         paths_dict (dict): Dictionary of paths and their values.
 
     Returns:
-        dict: Dictionary without paths that don't exist in the collection of JSON documents.
+        dict: Dictionary of definitions with paths that exist in the JSON documents.
     """
     filtered_ref_defn_paths = {}
 
     for ref_defn, schema_paths in cleaned_ref_defn_paths.items():
-        intersecting_paths = set()
+        intersecting_paths = []
         for schema_path in schema_paths:
             for json_path in paths_dict.keys():
                 if path_matches_with_wildkey(schema_path, json_path):
-                    intersecting_paths.add(json_path)
+                    intersecting_paths.append(json_path)
         
-        filtered_ref_defn_paths[ref_defn] = intersecting_paths
+        # Add only if there are intersecting paths
+        if intersecting_paths:
+            filtered_ref_defn_paths[ref_defn] = intersecting_paths
     
     return filtered_ref_defn_paths
 
 
-
 def find_frequent_definitions(filtered_ref_defn_paths, paths_to_exclude):
     """
-    Find referenced definitions that are referenced more than once.
+    Identify frequently referenced definitions and update paths to exclude.
 
     Args:
         filtered_ref_defn_paths (dict): Dictionary of reference definitions and their paths.
-        paths_to_exclude (set): Paths to remove from JSON files
+        paths_to_exclude (set): Paths to exclude from JSON files.
 
     Returns:
-        dict: Dictionary of frequently referenced definitions.
+        dict: Dictionary of definitions that are referenced more than once.
     """
     frequent_ref_defn_paths = {}
 
-    # Find frequently referenced definitions and update paths_to_exclude
+    # Identify frequently referenced definitions and update paths_to_exclude
     for ref, paths in filtered_ref_defn_paths.items():
         if len(paths) > 1:
             frequent_ref_defn_paths[ref] = paths
         else:
             paths_to_exclude.update(paths)
 
-    # To prevent removing paths that multiple definitions use Ex: buildkite.json
-    paths_to_exclude_copy = paths_to_exclude.copy()
-    for bad_path in paths_to_exclude_copy:
-        for paths in frequent_ref_defn_paths.values():
-            if bad_path in paths:
-                paths_to_exclude.remove(bad_path)
-                break
+    # Ensure paths used by multiple definitions are retained in JSON files
+    for bad_path in paths_to_exclude.copy():
+        if any(bad_path in paths for paths in frequent_ref_defn_paths.values()):
+            paths_to_exclude.remove(bad_path)
 
+    # Return sorted dictionary of frequent references
     return dict(sorted(frequent_ref_defn_paths.items()))
 
 
@@ -1009,17 +977,21 @@ def process_schema(schema_name):
         failure_flags["ref_defn"] = 1
         print(f"No referenced definitions in {schema_name}.")
         return None, None, schema_name, failure_flags
+    '''
     for ref, paths in ref_defn_paths.items():
         print(f"Reference: {ref} Paths: {paths}")
     print("_________________________________________________________________________________________________________________________")
+    '''
 
     print("Handle nested definitions")
     # Handle nested definitions
     new_ref_defn_paths = handle_nested_definitions(ref_defn_paths)
     cleaned_ref_defn_paths = remove_definition_keywords(new_ref_defn_paths)
+    '''
     for ref, paths in cleaned_ref_defn_paths.items():
         print(f"Reference: {ref} Paths: {paths}")
     print("_________________________________________________________________________________________________________________________")
+    '''
 
     paths_to_exclude = set()
     print("get ref defn of type obj")
@@ -1028,9 +1000,11 @@ def process_schema(schema_name):
         failure_flags["object_defn"] = 1
         print(f"No referenced definitions of type object in {schema_name}.")
         return None, None, schema_name, failure_flags
+    '''
     for ref, paths in cleaned_ref_defn_paths.items():
         print(f"Reference: {ref} Paths: {paths}")
     print("_________________________________________________________________________________________________________________________")
+    '''
 
     # Process dataset
     paths_dict = process_dataset(schema_name)
@@ -1046,10 +1020,12 @@ def process_schema(schema_name):
         failure_flags["schema_intersection"] = 1
         print(f"No paths of properties in referenced definitions found in {schema_name} dataset.")
         return None, None, schema_name, failure_flags
+    '''
     for ref, paths in filtered_ref_defn_paths.items():
         print(f"Reference: {ref} Paths: {paths}")
     print("_________________________________________________________________________________________________________________________")
-   
+    '''
+
     print("Find frequent definitions")
     # Find frequent definitions
     frequent_ref_defn_paths = find_frequent_definitions(filtered_ref_defn_paths, paths_to_exclude)
@@ -1057,12 +1033,16 @@ def process_schema(schema_name):
         failure_flags["freq_defn"] = 1
         print(f"No frequent referenced definitions found in {schema_name}.")
         return None, None, schema_name, failure_flags
+    '''
     for ref, paths in frequent_ref_defn_paths.items():
         print(f"Reference: {ref} Paths: {paths}")
     print("_________________________________________________________________________________________________________________________")
-
+    '''
+    
     # Create DataFrame
     df = create_dataframe(paths_dict, paths_to_exclude)
+
+    # Update reference definitions
     updated_ref_defn_paths = update_ref_defn_paths(frequent_ref_defn_paths, df)
     if not updated_ref_defn_paths:
         failure_flags["properties"] = 1
