@@ -271,28 +271,38 @@ def resolve_ref(defn_root, ref_path):
 
 
 def is_object_like(defn_obj, defn_root):
-    """Check if a schema or any dereferenced subschemas are of object type.
+    """Check if a schema or any dereferenced subschemas are object-like with more than one property.
     
     Args:
         defn_obj (dict): The JSON schema definition object to evaluate.
         defn_root (dict): The root of the JSON schema, used for resolving $ref references.
         
     Returns:
-        bool: True if the schema or any subschemas are of type 'object' or have 'properties', False otherwise.
+        bool: True if the schema or any subschemas have more than one property, indicating object-like structure, False otherwise.
     """
-    if isinstance(defn_obj, dict) and (defn_obj.get("type") == "object" or "properties" in defn_obj):
+    if not isinstance(defn_obj, dict):
+        return False
+
+    # Check if the current object has 'properties' with more than one property (implying an object-like structure)
+    if "properties" in defn_obj and len(defn_obj["properties"]) > 1:
         return True
+
+    # Process subschemas (oneOf, anyOf, allOf) and resolve references if present
     for keyword in ["oneOf", "anyOf", "allOf"]:
         for item in defn_obj.get(keyword, []):
+            # Resolve $ref if it exists
             if "$ref" in item:
                 item = resolve_ref(defn_root, item["$ref"])
-            if isinstance(item, dict) and (item.get("type") == "object" or "properties" in item):
+
+            # Check if resolved item is object-like
+            if isinstance(item, dict) and "properties" in item and len(item["properties"]) > 1:
                 return True
+
     return False
 
 
 def get_ref_defn_of_type_obj(json_schema, ref_defn_paths, paths_to_exclude):
-    """Filter out references to definitions that do not represent objects or object-like schemas.
+    """Filter out references to definitions that do not represent valid object-like schemas.
 
     Args:
         json_schema (dict): The JSON schema containing the referenced definitions.
@@ -300,7 +310,7 @@ def get_ref_defn_of_type_obj(json_schema, ref_defn_paths, paths_to_exclude):
         paths_to_exclude (set): Set of paths to be excluded from JSON datasets.
 
     Returns:
-        set: Updated set of paths to exclude, including those of definitions that are not objects.
+        set: Updated set of paths to exclude, including those of definitions that are not valid objects.
     """
     defn_root = json_schema.get("$defs") or json_schema.get("definitions", {})
     ref_to_delete = []
@@ -309,10 +319,10 @@ def get_ref_defn_of_type_obj(json_schema, ref_defn_paths, paths_to_exclude):
         defn_name = ref.split("/")[-1]
         defn_obj = defn_root.get(defn_name)
 
-        # Skip invalid or non-object-like definitions
-        if not isinstance(defn_obj, dict) or (len(defn_obj.get("properties", {})) <= 1 and not is_object_like(defn_obj, defn_root)):
+        # Validate if the reference is object-like with more than one property
+        if not is_object_like(defn_obj, defn_root):
             ref_to_delete.append(ref)
-            print(f"Excluded {ref}: Not an object or object-like definition.")
+            print(f"Excluded {ref}: Not object-like or does not have more than one property.")
 
     # Remove excluded references and update paths to exclude
     for ref in ref_to_delete:
@@ -738,6 +748,52 @@ def create_dataframe(paths_dict, paths_to_exclude):
     return df.sort_values(by="path")
 
 
+from collections import defaultdict
+import pandas as pd
+
+def create_dataframe_baseline_model(paths_dict, paths_to_exclude):
+    """
+    Create a DataFrame of paths and distinct nested keys.
+
+    Args:
+        paths_dict (dict): Dictionary of paths and their values.
+        paths_to_exclude (set): Paths to exclude from JSON files.
+
+    Returns:
+        pd.DataFrame: DataFrame containing paths and distinct nested keys.
+    """
+    df_data = []
+    distinct_subkeys = defaultdict(set)
+
+    for path in paths_dict.keys():
+        # Skip paths that are in the exclusion set or end with '*'
+        if path in paths_to_exclude or path[-1] == '*':
+            continue
+
+        # Separate the prefix and subkey
+        prefix = path[:-1]
+        subkey = path[-1]
+        
+        # Collect distinct subkeys for the given prefix
+        distinct_subkeys[prefix].add(subkey)
+
+        # Skip if distinct subkeys exceed the specified upper bound for a prefix
+        if len(distinct_subkeys[prefix]) > DISTINCT_SUBKEYS_UPPER_BOUND:
+            continue
+
+    # Prepare row data for the DataFrame
+    for prefix, subkeys in distinct_subkeys.items():
+        if len(subkeys) <= 1:
+            continue
+        sorted_subkeys = sorted(subkeys)
+        row_data = [prefix, sorted_subkeys]
+        df_data.append(row_data)
+
+    # Create and sort the DataFrame by the "path" column
+    df = pd.DataFrame(df_data, columns=["path", "distinct_nested_keys"]).sort_values(by="path").reset_index(drop=True)
+    return df
+
+
 def update_ref_defn_paths(frequent_ref_defn_paths, df):
     """
     Create updated reference definitions based on intersections with the DataFrame paths.
@@ -937,12 +993,13 @@ def get_samples(df, frequent_ref_defn_paths):
     return labeled_df
 
 
-def process_schema(schema_name):
+def process_schema(schema_name, filename):
     """
     Process a single schema and return the relevant dataframes and ground truths.
 
     Args:
         schema_name (str): The name of the schema file.
+        filename (str): The name of the file to save the test data.
 
     Returns:
         tuple: A tuple containing the filtered DataFrame, frequent referenced definition paths, and schema name,
@@ -960,7 +1017,7 @@ def process_schema(schema_name):
         "properties": 0
     }
 
-    print(f"Processing schema {schema_name}...")
+    #print(f"Processing schema {schema_name}...")
     schema_path = os.path.join(SCHEMA_FOLDER, schema_name)
 
     # Load schema
@@ -970,7 +1027,7 @@ def process_schema(schema_name):
         print(f"Failed to load schema {schema_name}.")
         return None, None, schema_name, failure_flags
 
-    print("Get and clean referenced definitions")
+    #print("Get and clean referenced definitions")
     # Get and clean referenced definitions
     ref_defn_paths = clean_ref_defn_paths(schema)
     if not ref_defn_paths:
@@ -983,7 +1040,7 @@ def process_schema(schema_name):
     print("_________________________________________________________________________________________________________________________")
     '''
 
-    print("Handle nested definitions")
+    #print("Handle nested definitions")
     # Handle nested definitions
     new_ref_defn_paths = handle_nested_definitions(ref_defn_paths)
     cleaned_ref_defn_paths = remove_definition_keywords(new_ref_defn_paths)
@@ -994,7 +1051,7 @@ def process_schema(schema_name):
     '''
 
     paths_to_exclude = set()
-    print("get ref defn of type obj")
+    #print("get ref defn of type obj")
     get_ref_defn_of_type_obj(schema, cleaned_ref_defn_paths, paths_to_exclude)
     if not cleaned_ref_defn_paths:
         failure_flags["object_defn"] = 1
@@ -1013,7 +1070,7 @@ def process_schema(schema_name):
         print(f"No paths extracted from {schema_name}.")
         return None, None, schema_name, failure_flags
 
-    print("Check reference definition paths in the dataset")
+    #print("Check reference definition paths in the dataset")
     # Check reference definition paths in the dataset
     filtered_ref_defn_paths = check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, paths_dict)
     if not filtered_ref_defn_paths:
@@ -1026,7 +1083,7 @@ def process_schema(schema_name):
     print("_________________________________________________________________________________________________________________________")
     '''
 
-    print("Find frequent definitions")
+    #print("Find frequent definitions")
     # Find frequent definitions
     frequent_ref_defn_paths = find_frequent_definitions(filtered_ref_defn_paths, paths_to_exclude)
     if not frequent_ref_defn_paths:
@@ -1040,7 +1097,11 @@ def process_schema(schema_name):
     '''
     
     # Create DataFrame
-    df = create_dataframe(paths_dict, paths_to_exclude)
+    if filename == "baseline_test_data.csv":
+        df = create_dataframe_baseline_model(paths_dict, paths_to_exclude)
+    else:
+        df = create_dataframe(paths_dict, paths_to_exclude)
+        
 
     # Update reference definitions
     updated_ref_defn_paths = update_ref_defn_paths(frequent_ref_defn_paths, df)
@@ -1116,7 +1177,7 @@ def preprocess_data(schemas, filename, ground_truth_file):
 
     # Limit the number of concurrent workers to prevent memory overload
     with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(process_schema, schema): schema for schema in schemas}
+        futures = {executor.submit(process_schema, schema, filename): schema for schema in schemas}
         
         for future in tqdm.tqdm(concurrent.futures.as_completed(futures), total=len(futures), position=1):  
             df = None
@@ -1133,8 +1194,10 @@ def preprocess_data(schemas, filename, ground_truth_file):
 
                 if df is not None and frequent_ref_defn_paths:
                     ground_truths[schema_name] = frequent_ref_defn_paths
-                    print(f"Sampling data for {schema_name}...")
-                    df = get_samples(df, frequent_ref_defn_paths)
+                    
+                    if filename != "baseline_test_data.csv":
+                        print(f"Sampling data for {schema_name}...")
+                        df = get_samples(df, frequent_ref_defn_paths)
                     
                     # Append batch to CSV to avoid holding everything in memory
                     df.to_csv(filename, mode='a', header=not pd.io.common.file_exists(filename), index=False)
@@ -1160,19 +1223,23 @@ def preprocess_data(schemas, filename, ground_truth_file):
 def main():
     try:
         # Parse command-line arguments
-        train_size, random_value = sys.argv[-2:]
+        train_size, random_value, model = sys.argv[-3:]
         train_ratio = float(train_size)
         random_value = int(random_value)
         
         # Split the data into training and testing sets
         train_set, test_set = split_data(train_ratio=train_ratio, random_value=random_value)
 
-        # Preprocess the training and testing data
-        preprocess_data(train_set, filename="sample_train_data.csv", ground_truth_file="train_ground_truth.json")
-        preprocess_data(test_set, filename="sample_test_data.csv", ground_truth_file="test_ground_truth.json")
+        if model == "baseline":
+            # Preprocess the testing data for the baseline model
+            preprocess_data(test_set, filename="baseline_test_data.csv", ground_truth_file="baseline_test_ground_truth.json")
+        else:
+            # Preprocess the training and testing data
+            preprocess_data(train_set, filename="sample_train_data.csv", ground_truth_file="train_ground_truth.json")
+            preprocess_data(test_set, filename="sample_test_data.csv", ground_truth_file="test_ground_truth.json")
 
     except (ValueError, IndexError) as e:
-        print(f"Error: {e}\nUsage: script.py <files_folder> <train_size> <random_value>")
+        print(f"Error: {e}\nUsage: script.py <files_folder> <train_size> <random_value> <model>")
         sys.exit(1)
     
 
