@@ -748,9 +748,6 @@ def create_dataframe(paths_dict, paths_to_exclude):
     return df.sort_values(by="path")
 
 
-from collections import defaultdict
-import pandas as pd
-
 def create_dataframe_baseline_model(paths_dict, paths_to_exclude):
     """
     Create a DataFrame of paths and distinct nested keys.
@@ -766,8 +763,8 @@ def create_dataframe_baseline_model(paths_dict, paths_to_exclude):
     distinct_subkeys = defaultdict(set)
 
     for path in paths_dict.keys():
-        # Skip paths that are in the exclusion set or end with '*'
-        if path in paths_to_exclude or path[-1] == '*':
+        # Skip paths that are in the exclusion set
+        if path in paths_to_exclude:
             continue
 
         # Separate the prefix and subkey
@@ -783,8 +780,8 @@ def create_dataframe_baseline_model(paths_dict, paths_to_exclude):
 
     # Prepare row data for the DataFrame
     for prefix, subkeys in distinct_subkeys.items():
-        if len(subkeys) <= 1:
-            continue
+        #if len(subkeys) <= 1:
+        #    continue
         sorted_subkeys = sorted(subkeys)
         row_data = [prefix, sorted_subkeys]
         df_data.append(row_data)
@@ -1096,6 +1093,7 @@ def process_schema(schema_name, filename):
     print("_________________________________________________________________________________________________________________________")
     '''
     
+    print(f"Processing schema {schema_name}...")
     # Create DataFrame
     if filename == "baseline_test_data.csv":
         df = create_dataframe_baseline_model(paths_dict, paths_to_exclude)
@@ -1125,13 +1123,13 @@ def save_ground_truths(ground_truths, ground_truth_file):
         ground_truth_file (str): The file to save the ground truths to.
     """
     ground_truths_serializable = {
-        key: {subkey: list(values) if isinstance(values, set) else values for subkey, values in subdict.items()}
-        for key, subdict in ground_truths.items()
+        schema_name: {ref_defn: list(path_list) if isinstance(path_list, set) else path_list for ref_defn, path_list in subdict.items()}
+        for schema_name, subdict in ground_truths.items()
     }
 
     with open(ground_truth_file, "w") as json_file:
-        for key, value in ground_truths_serializable.items():
-            json_file.write(json.dumps({key: value}) + '\n')
+        for ref_defn, subdict in ground_truths_serializable.items():
+            json_file.write(json.dumps({ref_defn: subdict}) + '\n')
 
 
 def concatenate_dataframes(dfs):
@@ -1200,7 +1198,7 @@ def preprocess_data(schemas, filename, ground_truth_file):
                         df = get_samples(df, frequent_ref_defn_paths)
                     
                     # Append batch to CSV to avoid holding everything in memory
-                    df.to_csv(filename, mode='a', header=not pd.io.common.file_exists(filename), index=False)
+                    df.to_csv(filename, mode='a', header=not os.path.exists(filename), index=False)
 
             except Exception as e:
                 print(f"Error processing schema {futures[future]}: {e}")
