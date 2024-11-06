@@ -554,7 +554,6 @@ def merge_schemas(schema1, schema2):
 
         # If both schemas are objects, merge their properties
         if new_schema["type"] == "object":
-            new_schema.setdefault("properties", {})
             if "properties" in schema2:
                 for prop, value in schema2["properties"].items():
                     if prop in new_schema["properties"]:
@@ -566,51 +565,35 @@ def merge_schemas(schema1, schema2):
         # If both schemas are arrays, merge their items
         elif new_schema["type"] == "array":
             if "items" in schema2:
-                new_schema["items"] = merge_schemas(schema1.get("items", {}), schema2["items"])
-
-        # Merge required fields, handling boolean and list types
-        required1 = schema1.get("required", [])
-        required2 = schema2.get("required", [])
-        
-        # Convert booleans to lists if necessary and ensure "properties" exist before accessing
-        if isinstance(required1, bool):
-            required1 = list(schema1.get("properties", {}).keys()) if required1 else []
-        if isinstance(required2, bool):
-            required2 = list(schema2.get("properties", {}).keys()) if required2 else []
-        
-        # Merge the lists of required fields
-        new_schema["required"] = list(set(required1) | set(required2))
+                new_schema["items"] = merge_schemas(schema1["items"], schema2["items"])
 
         return new_schema
+    
+    else:
+        # If types differ, return a oneOf schema to capture possible structures
+        return {"oneOf": [schema1, schema2]} 
 
-    # If types differ, return a oneOf schema to capture possible structures
-    return {"oneOf": [schema1, schema2]} 
 
-
-def discover_schema(value, parent_key=("$",), parent_key_frequency=1):
+def discover_schema(path, value):
     """
     Discover the implicit structure of a JSON document, including field frequencies,
     value constraints, and nesting depth, and infer if a field may be required.
 
     Args:
+        path (tuple): The path to the key for determining nesting depth.
         value: The JSON value to inspect.
-        parent_key (tuple): The path to the parent key. Defaults to ("$",).
-        parent_key_frequency (float): The frequency of the parent key. Defaults to 1.
 
     Returns:
         dict: A schema object capturing the value's type, constraints, frequency, depth,
               and whether the path is likely required.
     """
-    nesting_depth = len(parent_key)
-    required_threshold = 1  
+    nesting_depth = len(path)
 
     # Detect string type and add constraints
     if isinstance(value, str):
         return {
             "type": "string",
             "nesting_depth": nesting_depth,
-            "relative_frequency": parent_key_frequency,
-            "required": parent_key_frequency >= required_threshold
         }
 
     # Detect number (integer or float) and track range
@@ -618,8 +601,6 @@ def discover_schema(value, parent_key=("$",), parent_key_frequency=1):
         return {
             "type": "number" if isinstance(value, float) else "integer",
             "nesting_depth": nesting_depth,
-            "relative_frequency": parent_key_frequency,
-            "required": parent_key_frequency >= required_threshold
         }
 
     # Detect boolean
@@ -627,8 +608,6 @@ def discover_schema(value, parent_key=("$",), parent_key_frequency=1):
         return {
             "type": "boolean",
             "nesting_depth": nesting_depth,
-            "relative_frequency": parent_key_frequency,
-            "required": parent_key_frequency >= required_threshold
         }
 
     # Detect arrays and discover schema for items
@@ -636,10 +615,8 @@ def discover_schema(value, parent_key=("$",), parent_key_frequency=1):
         if not value:
             return {
                 "type": "array",
-                "items": discover_schema_from_values(value),
+                "items": discover_schema_from_values(path, value),
                 "nesting_depth": nesting_depth,
-                "relative_frequency": parent_key_frequency,
-                "required": parent_key_frequency >= required_threshold
             }
 
     # Detect objects and recursively discover schema for properties
@@ -648,15 +625,12 @@ def discover_schema(value, parent_key=("$",), parent_key_frequency=1):
             "type": "object",
             "properties": {},
             "nesting_depth": nesting_depth,
-            "relative_frequency": parent_key_frequency,
-            "required": parent_key_frequency >= required_threshold
         }
         total_keys = len(value)
 
         for k, v in value.items():
-            key_frequency = parent_key_frequency / total_keys
-            full_key_path = parent_key + (k,)
-            schema["properties"][k] = discover_schema(v, full_key_path, key_frequency)
+            full_key_path = path + (k,)
+            schema["properties"][k] = discover_schema(full_key_path, v)
 
         return schema
 
@@ -664,20 +638,16 @@ def discover_schema(value, parent_key=("$",), parent_key_frequency=1):
     return {
         "type": "null",
         "nesting_depth": nesting_depth,
-        "relative_frequency": parent_key_frequency,
-        "required": parent_key_frequency >= required_threshold
     }
 
 
-def discover_schema_from_values(values, parent_key=("$",), parent_key_frequency=1):
+def discover_schema_from_values(path, values):
     """
     Determine the schema for a list of values, including handling mixed types and null values.
 
     Args:
+        path (tuple): The path to the key for determining nesting depth.
         values (list): The list of values to determine the schema for.
-        parent_key (tuple): The parent key path for determining nesting depth and relative frequency.
-        parent_key_frequency (float): Frequency of the parent key, used to calculate the relative 
-                                      frequency of nested keys. Defaults to 1.
 
     Returns:
         dict: The schema representing the structure of the list of values.
@@ -687,7 +657,7 @@ def discover_schema_from_values(values, parent_key=("$",), parent_key_frequency=
         return {"type": "null"}
     
     # Initialize the discovery process by mapping each value to its schema
-    value_schemas = (discover_schema(v, parent_key, parent_key_frequency) for v in values)
+    value_schemas = (discover_schema(path, v) for v in values)
     
     # Use reduce to merge the schemas for each value in the list
     merged_schema = reduce(merge_schemas, value_schemas)
@@ -731,7 +701,7 @@ def create_dataframe(paths_dict, paths_to_exclude):
 
         # Parse and discover the schema from values
         values = [json.loads(v) for v in values]
-        schema = discover_schema_from_values(values)
+        schema = discover_schema_from_values(path, values)
         
         # Check if the schema has more than one property
         if len(schema.get("properties", {})) > 1:
