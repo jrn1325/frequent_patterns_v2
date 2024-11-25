@@ -25,8 +25,6 @@ from torch.nn.functional import normalize
 from transformers import AutoTokenizer
 
 
-
-
 warnings.filterwarnings("ignore")
 sys.setrecursionlimit(30000) # I had to increase the recursion limit because of the discover_schema function
 
@@ -45,11 +43,11 @@ MAX_TOK_LEN = 512
 
 MODEL_NAME = "microsoft/codebert-base" 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoAdapterModel.from_pretrained(MODEL_NAME)
+m = AutoAdapterModel.from_pretrained(MODEL_NAME)
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
+m.to(device)
 
 
 
@@ -863,7 +861,7 @@ def calculate_embeddings(df):
         
         # Calculate embeddings without computing gradients
         with torch.no_grad():
-            outputs = model(**inputs)
+            outputs = m(**inputs)
 
         # Calculate the mean of the last hidden state to get the embeddings
         embeddings = outputs.last_hidden_state.mean(dim=1)
@@ -881,6 +879,7 @@ def calculate_cosine_distance(schema_embeddings, all_good_pairs):
     Args:
         schema_embeddings (dict): Dictionary containing paths and their corresponding embeddings.
         all_good_pairs (set): Set of good pairs of paths.
+        df (pd.DataFrame): DataFrame containing paths and schemas.
 
     Returns:
         list: List of tuples containing path pairs and their cosine distance, sorted in ascending order of distance.
@@ -1265,7 +1264,7 @@ def delete_file_if_exists(filename):
 def main():
     try:
         # Parse command-line arguments
-        train_size, random_value, model = sys.argv[-3:]
+        train_size, random_value, m = sys.argv[-3:]
         train_ratio = float(train_size)
         random_value = int(random_value)
 
@@ -1273,7 +1272,7 @@ def main():
         # Split the data into training and testing sets
         train_set, test_set = split_data(train_ratio=train_ratio, random_value=random_value)
 
-        if model == "baseline":
+        if m == "baseline":
             # Files to be checked for deletion
             files_to_delete = [
                 "baseline_test_data.csv",
