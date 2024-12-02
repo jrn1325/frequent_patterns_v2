@@ -353,37 +353,31 @@ def match_properties(schema, document):
     return False
 
 
-def parse_document(doc, path=('$',)):
-    """
-    Recursively get the path of each key and its value from a JSON document.
+def parse_document(doc, path = ("$",), values = []):
+    """Get the path of each key and its value from the json documents.
+
     Args:
-        doc (dict or list): The JSON document to parse.
-        path (tuple): The current path as a tuple. Defaults to ('$').
+        doc (dict): JSON document.
+        path (tuple, optional): list of keys full path. Defaults to ('$',).
+        values (list, optional): list of keys' values. Defaults to [].
+
     Raises:
-        ValueError: If the JSON object is not a dict or list.
+        ValueError: Returns an error if the json object is not a dict or list
+
     Yields:
-        tuple: A tuple containing:
-            - path (tuple): The path of each key as a tuple.
-            - value: The value at the end of the path.
+        dict: list of JSON object key value pairs
     """
-
     if isinstance(doc, dict):
-        for key, value in doc.items():
-            current_path = path + (key,)
-            yield current_path, value 
-            if isinstance(value, (dict, list)):
-                yield from parse_document(value, current_path)
-
+        iterator = doc.items()
     elif isinstance(doc, list):
-        for index, item in enumerate(doc):
-            current_path = path + ('*',) 
-            yield current_path, item
-            if isinstance(item, (dict, list)):
-                yield from parse_document(item, current_path)
-
+        iterator = [('*', item) for item in doc] if doc else []
     else:
-        raise ValueError("The document must be a dict or list.")
-
+        raise ValueError("Expected dict or list, got {}".format(type(doc).__name__))
+  
+    for key, value in iterator:
+        yield path + (key,), value
+        if isinstance(value, (dict, list)):
+            yield from parse_document(value, path + (key,), values)
 
 def get_json_type(value):
     """
@@ -411,78 +405,45 @@ def get_json_type(value):
         return "object"  # For any other type, we return "object"
     
 
-def process_document(doc, prefix_paths_dict, parent_key_counts):
-    """
-    Process a document to extract relative frequencies and nesting depths for nested keys
-    relative to their immediate parent key.
-    
-    Args:
-        doc (dict): The JSON document to process.
-        prefix_paths_dict (dict): Dictionary of paths and their corresponding nested keys.
-        parent_key_counts (Counter): Counter to track occurrences of each parent key.
-        
-    Returns:
-        dict: A dictionary of prefixes with nested keys and their respective relative frequencies and nesting depths.
-    """
- 
-    # Iterate over paths and values extracted from the document
-    for path, value in parse_document(doc):
-        if len(path) > 1:
-            nested_key = path[-1]
-            if nested_key == "*":  # Skip wildcard paths
-                continue
-
-            prefix = tuple(path[:-1])
-
-            # The defaultdict will automatically handle the creation of missing prefixes and nested keys
-            if prefix not in prefix_paths_dict:
-                prefix_paths_dict[prefix] = {"nested_keys": {}}
-
-            nested_keys = prefix_paths_dict[prefix]["nested_keys"]
-
-            # Track the occurrence of the parent key
-            parent_key_counts[prefix] += 1
-
-            # Initialize the nested key and update its count and types
-            if nested_key not in nested_keys:
-                nested_keys[nested_key] = {"count": 0, "types": []} 
-
-            # Update the count and types for the nested key
-            nested_keys[nested_key]["count"] += 1
-            nested_keys[nested_key]["types"].append(get_json_type(value))  
-
-    # Convert sets to lists for JSON serialization
-    for prefix, data in prefix_paths_dict.items():
-        for nested_key, key_data in data["nested_keys"].items():
-            key_data["types"] = list(set(key_data["types"]))  # Convert set to list for serialization
-
-  
-def process_document_baseline(doc, prefix_paths_dict):
+def process_document(doc, paths_dict):
     """
     Extracts paths whose values are object-type from the given JSON document and stores them in dictionaries,
-    grouping types by paths.
+    grouping values by paths.
 
     Args:
         doc (dict): The JSON document from which paths are extracted.
-        prefix_paths_dict (dict): Dictionary of paths and their corresponding value types.
+        paths_dict (dict): Dictionary of paths and their values.
+    """
+    for path, value in parse_document(doc):
+        if isinstance(value, dict):
+            value_str = json.dumps(value)
+            paths_dict[path].add(value_str)
+        elif isinstance(value, list):
+            if all(isinstance(item, dict) for item in value):
+                value_str = json.dumps(value)
+                paths_dict[path].add(value_str)
+
+  
+def process_document_baseline(doc, paths_dict):
+    """
+    Extracts paths and their nested keys from the given JSON document and stores them in the paths dictionary.
+
+    Args:
+        doc (dict): The JSON document from which paths and nested keys are extracted.
+        paths_dict (dict): Dictionary to store paths and their corresponding nested keys.
     """
     for path, value in parse_document(doc):
         if len(path) > 1:
             nested_key = path[-1]
-            if nested_key == "*":
+            if nested_key == "*": 
                 continue
             prefix = tuple(path[:-1]) 
 
-            # Initialize the prefix entry if it doesn't exist
-            if prefix not in prefix_paths_dict:
-                prefix_paths_dict[prefix] = {}
+            if prefix not in paths_dict:
+                paths_dict[prefix] = set()
 
-            # Initialize a set for nested key types if it doesn't exist
-            if nested_key not in prefix_paths_dict[prefix]:
-                prefix_paths_dict[prefix][nested_key] = set()
-
-            # Add the type of the value to the set of types for the nested key
-            prefix_paths_dict[prefix][nested_key].add(type(value).__name__)
+            # Add the nested key to the corresponding prefix
+            paths_dict[prefix].add(nested_key)
 
 
 def process_dataset(dataset, filename):
@@ -497,8 +458,7 @@ def process_dataset(dataset, filename):
         dict: Dictionary of paths and their values, with relative frequencies.
     """
     
-    prefix_paths_dict = defaultdict(lambda: {"nested_keys": {}})
-    parent_key_counts = defaultdict(int)
+    paths_dict = defaultdict(set)  
     num_docs = 0  
     matched_document_count = 0 
 
@@ -521,40 +481,24 @@ def process_dataset(dataset, filename):
                 if isinstance(doc, dict) and match_properties(schema, doc):
                     matched_document_count += 1 
                     if filename == "baseline_test_data.csv":
-                        process_document_baseline(doc, prefix_paths_dict)
+                        process_document_baseline(doc, paths_dict)
                     else:
-                        process_document(doc, prefix_paths_dict, parent_key_counts)
+                        process_document(doc, paths_dict)
                     num_docs += 1
                 elif isinstance(doc, list):
                     for item in doc:
                         if isinstance(item, dict) and match_properties(schema, item):
                             matched_document_count += 1 
                             if filename == "baseline_test_data.csv":
-                                process_document_baseline(item, prefix_paths_dict)
+                                process_document_baseline(item, paths_dict)
                             else:
-                                process_document(item, prefix_paths_dict, parent_key_counts)
+                                process_document(item, paths_dict)
                             num_docs += 1
             except Exception as e:
                 print(f"Error processing line in {dataset}: {e}")
                 continue
 
-    # Calculate relative frequency for each path if there are documents processed
-    if num_docs > 0:
-        for prefix, data in prefix_paths_dict.items():
-            for nested_key, key_data in data["nested_keys"].items():
-                parent_count = parent_key_counts[prefix]
-                key_data["relative_frequency"] = key_data["count"] / parent_count if parent_count > 0 else 0
-
-    # Clean up data structure by removing raw counts
-    for data in prefix_paths_dict.values():
-        for key_data in data["nested_keys"].values():
-            key_data.pop("count")
-
-    # Return the processed dictionary
-    if filename == "baseline_test_data.csv":
-        return prefix_paths_dict if prefix_paths_dict else None
-    else:
-        return prefix_paths_dict if prefix_paths_dict else None
+    return paths_dict if paths_dict else None
     
 
 def path_matches_with_wildkey(schema_path, json_path):
@@ -668,6 +612,7 @@ def merge_schemas(schema1, schema2):
     if schema1.get("type") == schema2.get("type"):
         # If both schemas are objects, merge their properties
         if schema1.get("type") == "object":
+            new_schema["required"] = list(set(schema1.get("required", [])) | set(schema2.get("required", [])))
             if "properties" in schema2:  # Ensure schema2 has properties to merge 
                 for prop, value in schema2["properties"].items():
                     if prop in new_schema["properties"]:
@@ -682,10 +627,6 @@ def merge_schemas(schema1, schema2):
             if "items" in schema2:
                 new_schema["items"] = merge_schemas(schema1["items"], schema2["items"])
 
-        # Sum frequencies if they exist
-        if "frequency" in schema1 and "frequency" in schema2:
-            new_schema["frequency"] = schema1["frequency"] + schema2["frequency"]
-
         # Take the maximum nesting depth if it exists
         if "nesting_depth" in schema1 and "nesting_depth" in schema2:
             new_schema["nesting_depth"] = max(schema1["nesting_depth"], schema2["nesting_depth"])
@@ -697,30 +638,35 @@ def merge_schemas(schema1, schema2):
         return {"oneOf": [schema1, schema2]}
 
     
-def discover_schema(value):
+def discover_schema(value, path_length):
     """
     Determine the structure (type) of the JSON key's value.
     Args:
         value: The value of the JSON key. It can be of any type.
+        path_length (int): The length of the path to the key.
     Returns:
         dict: An object representing the structure of the JSON key's value.
     """
     if isinstance(value, str):
-        return {"type": "string", "relative_frequency": 1}
+        return {"type": "string", "nesting_depth": path_length}
     elif isinstance(value, float):
-        return {"type": "number"}
+        return {"type": "number", "nesting_depth": path_length}
     elif isinstance(value, int):
-        return {"type": "integer"}
+        return {"type": "integer", "nesting_depth": path_length}
     elif isinstance(value, bool):
-        return {"type": "boolean"}
+        return {"type": "boolean", "nesting_depth": path_length}
     elif isinstance(value, list):
-        item_schemas = [discover_schema(item) for item in value if isinstance(item, (dict, list))]
-        # Assuming uniform items in the list; adjust if mixed types
-        return {"type": "array", "items": item_schemas[0] if item_schemas else {}}
+        # Handle lists, assuming mixed types if any items exist
+        item_schemas = [discover_schema(item, path_length + 1) for item in value]
+        if item_schemas:
+            merged_items = reduce(merge_schemas, item_schemas)
+        else:
+            merged_items = {}
+        return {"type": "array", "items": merged_items, "nesting_depth": path_length}
     elif isinstance(value, dict):
-        schema = {"type": "object", "properties": {}}
+        schema = {"type": "object", "required": list(set(value.keys())), "properties": {}, "nesting_depth": path_length}
         for k, v in value.items():
-            schema["properties"][k] = discover_schema(v)
+            schema["properties"][k] = discover_schema(v, path_length + 1)
         return schema
     elif value is None:
         return {"type": "null"}
@@ -728,70 +674,64 @@ def discover_schema(value):
         raise TypeError(f"Unsupported value type: {type(value)}")
 
 
-def discover_schema_from_values(values):
+def discover_schema_from_values(values, path_length):
     """
     Determine the schema for a list of values.
     Args:
         values (list): The list of values to determine the schema for.
+        path_length (int): The length of the path to the key.
     Returns:
         dict: The schema representing the structure of the list of values.
     """
     if not values:
         return {"type": "null"}
     else:
-        return reduce(merge_schemas, (discover_schema(v) for v in values))
+        return reduce(merge_schemas, (discover_schema(v, path_length) for v in values))
 
 
 def create_dataframe(paths_dict, paths_to_exclude):
-    """
-    Creates an implicit schema DataFrame from paths_dict, capturing nested key types,
-    relative frequencies, and nesting depths.
+    """Create a DataFrame of paths and their values schema.
 
     Args:
-        paths_dict (dict): Dictionary of paths and their nested keys info.
-        paths_to_exclude (set): Paths to exclude from the schema.
+        paths_dict (dict): Dictionary of paths and their values.
+        paths_to_exclude (set): Paths to remove from JSON files.
 
     Returns:
-        pd.DataFrame: DataFrame with the implicit schema details.
+        pd.DataFrame: DataFrame with tokenized schema added.
     """
+    
     df_data = []
-
-    for path, nested_keys_info in paths_dict.items():
+    
+    for path, values in paths_dict.items():
         # Skip paths that are in the exclusion set
         if path in paths_to_exclude:
             continue
 
-        #print(nested_keys_info)
-        # Skip schemas with fewer than 2 nested keys
-        if len(nested_keys_info["nested_keys"]) < 2:
-            continue
-
-        # Build the schema for this path
-        schema = {
-            "type": "object",
-            "properties": nested_keys_info["nested_keys"],
-            "nesting_depth": len(path)
-        }
-
-        # Tokenize the schema if needed
-        tokenized_schema = tokenize_schema(json.dumps(schema))
-
-        # Append path, tokenized schema, and schema details to DataFrame data
-        df_data.append([path, tokenized_schema, json.dumps(schema)])
+        # Parse and discover the schema from values
+        parsed_values = [json.loads(v) for v in values]
+        schema = discover_schema_from_values(parsed_values, len(path))
+        
+        # Check if the schema has more than one property
+        if len(schema.get("properties", {})) > 1:
+            tokenized_schema = tokenize_schema(json.dumps(schema))
+            df_data.append([path, tokenized_schema, json.dumps(schema)])
+        else:
+            # Update paths_to_exclude if schema has less than or equal to one property
+            paths_to_exclude.add(path)
 
     # Create DataFrame from collected data
     columns = ["path", "tokenized_schema", "schema"]
     df = pd.DataFrame(df_data, columns=columns)
-
+    
     return df.sort_values(by="path")
 
 
-def create_dataframe_baseline_model(prefix_paths_dict, paths_to_exclude):
+def create_dataframe_baseline_model(paths_dict, paths_to_exclude):
     """
     Create a DataFrame of paths and distinct nested keys.
 
     Args:
-        prefic_paths_dict (dict): Dictionary of paths and their nested keys.
+        paths_dict (dict): Dictionary of paths and their nested keys.
         paths_to_exclude (set): Paths to exclude from JSON files.
 
     Returns:
@@ -799,15 +739,13 @@ def create_dataframe_baseline_model(prefix_paths_dict, paths_to_exclude):
     """
     df_data = []
 
-    for path, nested_keys_dict in prefix_paths_dict.items():
+    for path, nested_keys in paths_dict.items():
         # Skip paths that are in the exclusion set
         if path in paths_to_exclude:
             continue
         
-        distinct_nested_keys = set(nested_keys_dict.keys())
-
-        if len(distinct_nested_keys) > 1:
-            df_data.append([path, distinct_nested_keys])
+        if len(nested_keys) > 1:
+            df_data.append([path, nested_keys])
         else:
             # Update paths_to_exclude if schema has less than or equal to one property
             paths_to_exclude.add(path)
@@ -1089,15 +1027,15 @@ def process_schema(schema_name, filename):
     print("_________________________________________________________________________________________________________________________")
     '''
 
-    prefix_paths_dict = process_dataset(schema_name, filename)
-    if prefix_paths_dict is None:
+    paths_dict = process_dataset(schema_name, filename)
+    if paths_dict is None:
         failure_flags["path"] = 1
         print(f"No paths extracted from {schema_name}.")
         return None, None, schema_name, failure_flags
 
     #print("Check reference definition paths in the dataset")
     # Check reference definition paths in the dataset
-    filtered_ref_defn_paths = check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, prefix_paths_dict)
+    filtered_ref_defn_paths = check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, paths_dict)
     if not filtered_ref_defn_paths:
         failure_flags["schema_intersection"] = 1
         print(f"No paths of properties in referenced definitions found in {schema_name} dataset.")
@@ -1124,9 +1062,9 @@ def process_schema(schema_name, filename):
     print(f"Processing schema {schema_name}...")
     # Create DataFrame
     if filename == "baseline_test_data.csv":
-        df = create_dataframe_baseline_model(prefix_paths_dict, paths_to_exclude)
+        df = create_dataframe_baseline_model(paths_dict, paths_to_exclude)
     else:
-        df = create_dataframe(prefix_paths_dict, paths_to_exclude)
+        df = create_dataframe(paths_dict, paths_to_exclude)
         print(f"Number of paths in {schema_name}: {len(df)}")
         
 
