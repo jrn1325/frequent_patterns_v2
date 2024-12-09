@@ -22,7 +22,10 @@ from jsonschema import ValidationError
 from jsonschema.validators import validator_for
 from sklearn.model_selection import GroupShuffleSplit
 from torch.nn.functional import normalize
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
+
 
 
 warnings.filterwarnings("ignore")
@@ -40,6 +43,7 @@ JSON_SUBSCHEMA_KEYWORDS = {"allOf", "oneOf", "anyOf"}
 SCHEMA_FOLDER = "processed_schemas"
 JSON_FOLDER = "processed_jsons"
 MAX_TOK_LEN = 512
+BATCH_SIZE = 32
 
 MODEL_NAME = "microsoft/codebert-base" 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -379,6 +383,7 @@ def parse_document(doc, path = ("$",), values = []):
         if isinstance(value, (dict, list)):
             yield from parse_document(value, path + (key,), values)
 
+
 def get_json_type(value):
     """
     Map Python types to their corresponding JSON types.
@@ -664,7 +669,7 @@ def discover_schema(value, path_length):
             merged_items = {}
         return {"type": "array", "items": merged_items, "nesting_depth": path_length}
     elif isinstance(value, dict):
-        schema = {"type": "object", "required": list(set(value.keys())), "properties": {}, "nesting_depth": path_length}
+        schema = {"type": "object", "required": list(set(value.keys())), "properties": {}}
         for k, v in value.items():
             schema["properties"][k] = discover_schema(v, path_length + 1)
         return schema
@@ -775,38 +780,48 @@ def update_ref_defn_paths(frequent_ref_defn_paths, df):
     }
 
 
-def calculate_embeddings(df):
+def calculate_embeddings(df, model, device):
     """
-    Calculate the embeddings for each path.
+    Calculate the embeddings for each path in batches.
 
     Args:
-        df (pd.DataFrame): DataFrame containing the paths and their corresponding schemas.
+        df (pd.DataFrame): DataFrame containing paths and their tokenized schemas.
+        model (torch.nn.Module): Pre-trained model to compute embeddings.
+        device (torch.device): Device (CPU/GPU) for model inference.
 
     Returns:
-        dict: Dictionary containing paths and their corresponding embeddings.
+        dict: Dictionary mapping paths to their corresponding embeddings.
     """
-    
     schema_embeddings = {}
+    paths = df["path"].tolist()
+    tokenized_schemas = df["tokenized_schema"].tolist()
 
-    # Process paths and calculate embeddings
-    for index, row in df.iterrows():
-        inputs = row["tokenized_schema"]
-        bad_path = row["path"]
+    # Create batches
+    for batch_start in range(0, len(tokenized_schemas), BATCH_SIZE):
+        batch_paths = paths[batch_start: batch_start + BATCH_SIZE]
+        batch_schemas = tokenized_schemas[batch_start: batch_start + BATCH_SIZE]
 
-        # Move inputs to the device
-        for key in inputs:
-            inputs[key] = inputs[key].to(device)
-        
-        # Calculate embeddings without computing gradients
+        # Prepare batch tensors
+        batch_input_ids = [torch.tensor(schema["input_ids"]) for schema in batch_schemas]
+        batch_attention_mask = [torch.tensor(schema["attention_mask"]) for schema in batch_schemas]
+
+        # Pad sequences to get a uniform length
+        batch_input_ids = pad_sequence(batch_input_ids, batch_first=True)
+        batch_attention_mask = pad_sequence(batch_attention_mask, batch_first=True)
+
+        # Move tensors to the device
+        batch_input_ids = batch_input_ids.to(device)
+        batch_attention_mask = batch_attention_mask.to(device)
+
+        # Use model to compute embeddings
         with torch.no_grad():
-            outputs = m(**inputs)
+            outputs = model(input_ids=batch_input_ids, attention_mask=batch_attention_mask)
+            batch_embeddings = outputs.last_hidden_state.mean(dim=1)
 
-        # Calculate the mean of the last hidden state to get the embeddings
-        embeddings = outputs.last_hidden_state.mean(dim=1)
-        
-        # Store the embeddings in the dictionary
-        schema_embeddings[bad_path] = embeddings.squeeze().cpu() 
-    
+        # Store embeddings
+        for path, embedding in zip(batch_paths, batch_embeddings):
+            schema_embeddings[path] = embedding.cpu()
+
     return schema_embeddings
 
 
@@ -929,6 +944,7 @@ def get_samples(df, frequent_ref_defn_paths):
     # Generate good pairs from frequent referenced definition paths
     for ref_defn, good_paths in frequent_ref_defn_paths.items():
         good_paths_pairs = list(itertools.combinations(good_paths, 2))
+        print(f"Number of good pairs for {ref_defn}: {len(good_paths_pairs)}")
         all_good_pairs.update(good_paths_pairs)
         good_pairs.update(itertools.islice(good_paths_pairs, 1000))
 
