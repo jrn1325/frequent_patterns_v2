@@ -1,13 +1,11 @@
 import dask.dataframe as dd
 import itertools
 import json
-import jsonref
-import jsonschema
 import os
 import pandas as pd
-import re
 import sys
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import tqdm
 import warnings
@@ -46,13 +44,9 @@ MAX_TOK_LEN = 512
 BATCH_SIZE = 32
 
 MODEL_NAME = "microsoft/codebert-base" 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-m = AutoAdapterModel.from_pretrained(MODEL_NAME)
-
-# Set device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-m.to(device)
-
+MODEL = AutoAdapterModel.from_pretrained(MODEL_NAME)
+TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 
@@ -324,7 +318,7 @@ def get_ref_defn_of_type_obj(json_schema, ref_defn_paths, paths_to_exclude):
         # Validate if the reference is object-like with more than one property
         if not is_object_like(defn_obj, defn_root):
             ref_to_delete.append(ref)
-            print(f"Excluded {ref}: Not object-like or does not have more than one property.")
+            #print(f"Excluded {ref}: Not object-like or does not have more than one property.")
 
     # Remove excluded references and update paths to exclude
     for ref in ref_to_delete:
@@ -594,7 +588,7 @@ def tokenize_schema(schema):
     """
 
     # Tokenize the schema
-    tokenized_schema = tokenizer(schema, return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True)
+    tokenized_schema = TOKENIZER(schema, return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True)
     return tokenized_schema
 
 
@@ -780,18 +774,25 @@ def update_ref_defn_paths(frequent_ref_defn_paths, df):
     }
 
 
-def calculate_embeddings(df, model, device):
+def calculate_embeddings(df):
     """
     Calculate the embeddings for each path in batches.
 
     Args:
         df (pd.DataFrame): DataFrame containing paths and their tokenized schemas.
-        model (torch.nn.Module): Pre-trained model to compute embeddings.
-        device (torch.device): Device (CPU/GPU) for model inference.
 
     Returns:
         dict: Dictionary mapping paths to their corresponding embeddings.
     """
+
+    # Set device
+    MODEL.to(DEVICE)
+
+    # Use all available GPUs
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(MODEL)
+
     schema_embeddings = {}
     paths = df["path"].tolist()
     tokenized_schemas = df["tokenized_schema"].tolist()
@@ -810,8 +811,8 @@ def calculate_embeddings(df, model, device):
         batch_attention_mask = pad_sequence(batch_attention_mask, batch_first=True)
 
         # Move tensors to the device
-        batch_input_ids = batch_input_ids.to(device)
-        batch_attention_mask = batch_attention_mask.to(device)
+        batch_input_ids = batch_input_ids.to(DEVICE)
+        batch_attention_mask = batch_attention_mask.to(DEVICE)
 
         # Use model to compute embeddings
         with torch.no_grad():
@@ -944,7 +945,7 @@ def get_samples(df, frequent_ref_defn_paths):
     # Generate good pairs from frequent referenced definition paths
     for ref_defn, good_paths in frequent_ref_defn_paths.items():
         good_paths_pairs = list(itertools.combinations(good_paths, 2))
-        print(f"Number of good pairs for {ref_defn}: {len(good_paths_pairs)}")
+        #print(f"Number of good pairs for {ref_defn}: {len(good_paths_pairs)}")
         all_good_pairs.update(good_paths_pairs)
         good_pairs.update(itertools.islice(good_paths_pairs, 1000))
 
@@ -1157,7 +1158,7 @@ def preprocess_data(schemas, filename, ground_truth_file):
     properties = 0
 
     # Limit the number of concurrent workers to prevent memory overload
-    with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ProcessPoolExecutor() as executor:
         futures = {executor.submit(process_schema, schema, filename): schema for schema in schemas}
         
         for future in tqdm.tqdm(concurrent.futures.as_completed(futures), total=len(futures), position=1):  
