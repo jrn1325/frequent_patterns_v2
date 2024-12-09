@@ -832,7 +832,6 @@ def calculate_cosine_distance(schema_embeddings, all_good_pairs):
     Args:
         schema_embeddings (dict): Dictionary containing paths and their corresponding embeddings.
         all_good_pairs (set): Set of good pairs of paths.
-        df (pd.DataFrame): DataFrame containing paths and schemas.
 
     Returns:
         list: List of tuples containing path pairs and their cosine distance, sorted in ascending order of distance.
@@ -845,24 +844,25 @@ def calculate_cosine_distance(schema_embeddings, all_good_pairs):
     # Normalize embeddings
     normalized_embeddings = normalize(embeddings_tensor, p=2, dim=1)
 
-    # Calculate cosine distances for all possible pairs
-    all_pairs = list(itertools.combinations(range(len(paths_list)), 2))
-    cosine_distances = []
+    # Compute cosine similarity matrix
+    cosine_similarity_matrix = torch.mm(normalized_embeddings, normalized_embeddings.T)
 
-    for path1_idx, path2_idx in all_pairs:
-        path1 = paths_list[path1_idx]
-        path2 = paths_list[path2_idx]
+    # Calculate cosine distances (1 - cosine similarity)
+    cosine_distance_matrix = 1 - cosine_similarity_matrix
 
-        # Skip pairs that are in the set of good pairs
+    # Extract all unique pairs (upper triangular matrix, excluding diagonal)
+    indices = torch.triu_indices(len(paths_list), len(paths_list), offset=1)
+
+    all_pairs = []
+    for i, j in zip(indices[0], indices[1]):
+        path1, path2 = paths_list[i], paths_list[j]
         if (path1, path2) not in all_good_pairs and (path2, path1) not in all_good_pairs:
-            # Calculate cosine similarity
-            cosine_sim = torch.dot(normalized_embeddings[path1_idx], normalized_embeddings[path2_idx]).item()
-            distance = 1 - cosine_sim
-            cosine_distances.append(((path1, path2), distance))
+            all_pairs.append(((path1, path2), cosine_distance_matrix[i, j].item()))
 
-    # Sort pairs by their cosine distance in ascending order
-    cosine_distances.sort(key=lambda x: x[1])
-    return cosine_distances
+    # Sort pairs by cosine distance
+    all_pairs.sort(key=lambda x: x[1])
+
+    return all_pairs
 
 
 def label_samples(df, good_pairs, bad_pairs):
@@ -911,7 +911,7 @@ def label_samples(df, good_pairs, bad_pairs):
         
 
     # Create a new DataFrame containing the labeled pairs, schemas, and filenames
-    labeled_df = pd.DataFrame({"pairs": pairs,
+    labeled_df = pd.DataFrame({"pair": pairs,
                                "label": labels,
                                "filename": filenames,
                                "schema1": tokenized_schemas1,
@@ -1004,7 +1004,7 @@ def process_schema(schema_name, filename):
     schema = load_schema(schema_path)
     if schema is None:
         failure_flags["load"] = 1
-        print(f"Failed to load schema {schema_name}.")
+        #print(f"Failed to load schema {schema_name}.")
         return None, None, schema_name, failure_flags
 
     #print("Get and clean referenced definitions")
@@ -1012,7 +1012,7 @@ def process_schema(schema_name, filename):
     ref_defn_paths = clean_ref_defn_paths(schema)
     if not ref_defn_paths:
         failure_flags["ref_defn"] = 1
-        print(f"No referenced definitions in {schema_name}.")
+        #print(f"No referenced definitions in {schema_name}.")
         return None, None, schema_name, failure_flags
     '''
     for ref, paths in ref_defn_paths.items():
@@ -1035,7 +1035,7 @@ def process_schema(schema_name, filename):
     get_ref_defn_of_type_obj(schema, cleaned_ref_defn_paths, paths_to_exclude)
     if not cleaned_ref_defn_paths:
         failure_flags["object_defn"] = 1
-        print(f"No referenced definitions of type object in {schema_name}.")
+        #print(f"No referenced definitions of type object in {schema_name}.")
         return None, None, schema_name, failure_flags
     '''
     for ref, paths in cleaned_ref_defn_paths.items():
@@ -1046,7 +1046,7 @@ def process_schema(schema_name, filename):
     paths_dict = process_dataset(schema_name, filename)
     if paths_dict is None:
         failure_flags["path"] = 1
-        print(f"No paths extracted from {schema_name}.")
+        #print(f"No paths extracted from {schema_name}.")
         return None, None, schema_name, failure_flags
 
     #print("Check reference definition paths in the dataset")
@@ -1054,7 +1054,7 @@ def process_schema(schema_name, filename):
     filtered_ref_defn_paths = check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, paths_dict)
     if not filtered_ref_defn_paths:
         failure_flags["schema_intersection"] = 1
-        print(f"No paths of properties in referenced definitions found in {schema_name} dataset.")
+        #print(f"No paths of properties in referenced definitions found in {schema_name} dataset.")
         return None, None, schema_name, failure_flags
     '''
     for ref, paths in filtered_ref_defn_paths.items():
@@ -1067,7 +1067,7 @@ def process_schema(schema_name, filename):
     frequent_ref_defn_paths = find_frequent_definitions(filtered_ref_defn_paths, paths_to_exclude)
     if not frequent_ref_defn_paths:
         failure_flags["freq_defn"] = 1
-        print(f"No frequent referenced definitions found in {schema_name}.")
+        #print(f"No frequent referenced definitions found in {schema_name}.")
         return None, None, schema_name, failure_flags
     '''
     for ref, paths in frequent_ref_defn_paths.items():
@@ -1088,7 +1088,7 @@ def process_schema(schema_name, filename):
     updated_ref_defn_paths = update_ref_defn_paths(frequent_ref_defn_paths, df)
     if not updated_ref_defn_paths:
         failure_flags["properties"] = 1
-        print(f"Not enough properties found under refererenced definitions in {schema_name}.")
+        #print(f"Not enough properties found under refererenced definitions in {schema_name}.")
         return None, None, schema_name, failure_flags
 
     df["filename"] = schema_name
