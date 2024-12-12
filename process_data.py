@@ -7,7 +7,6 @@ import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import tqdm
 import warnings
 
 
@@ -16,13 +15,17 @@ from collections import defaultdict, Counter
 import concurrent.futures
 from copy import copy, deepcopy
 from functools import reduce
+from heapq import nlargest, nsmallest
 from jsonschema import ValidationError
 from jsonschema.validators import validator_for
+from scipy.spatial.distance import cosine
 from sklearn.model_selection import GroupShuffleSplit
 from torch.nn.functional import normalize
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 from transformers import AutoTokenizer
+
 
 
 
@@ -41,7 +44,7 @@ JSON_SUBSCHEMA_KEYWORDS = {"allOf", "oneOf", "anyOf"}
 SCHEMA_FOLDER = "processed_schemas"
 JSON_FOLDER = "processed_jsons"
 MAX_TOK_LEN = 512
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 
 MODEL_NAME = "microsoft/codebert-base" 
 MODEL = AutoAdapterModel.from_pretrained(MODEL_NAME)
@@ -327,6 +330,10 @@ def get_ref_defn_of_type_obj(json_schema, ref_defn_paths, paths_to_exclude):
     return paths_to_exclude
 
 
+
+
+
+
 def match_properties(schema, document):
     """Check if there is an intersection between the schema properties and the document.
 
@@ -584,7 +591,6 @@ def tokenize_schema(schema):
 
     Returns:
         torch.tensor: tokenized schema
-        torch.tensor: inputs_ids tensor
     """
 
     # Tokenize the schema
@@ -784,21 +790,15 @@ def calculate_embeddings(df):
     Returns:
         dict: Dictionary mapping paths to their corresponding embeddings.
     """
-
     # Set device
     MODEL.to(DEVICE)
-
-    # Use all available GPUs
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs")
-        model = nn.DataParallel(MODEL)
 
     schema_embeddings = {}
     paths = df["path"].tolist()
     tokenized_schemas = df["tokenized_schema"].tolist()
 
-    # Create batches
-    for batch_start in range(0, len(tokenized_schemas), BATCH_SIZE):
+    # Create batches and add tqdm for progress tracking
+    for batch_start in tqdm(range(0, len(tokenized_schemas), BATCH_SIZE), desc="Calculating embeddings", position=0):
         batch_paths = paths[batch_start: batch_start + BATCH_SIZE]
         batch_schemas = tokenized_schemas[batch_start: batch_start + BATCH_SIZE]
 
@@ -816,7 +816,7 @@ def calculate_embeddings(df):
 
         # Use model to compute embeddings
         with torch.no_grad():
-            outputs = model(input_ids=batch_input_ids, attention_mask=batch_attention_mask)
+            outputs = MODEL(input_ids=batch_input_ids, attention_mask=batch_attention_mask)
             batch_embeddings = outputs.last_hidden_state.mean(dim=1)
 
         # Store embeddings
@@ -824,46 +824,6 @@ def calculate_embeddings(df):
             schema_embeddings[path] = embedding.cpu()
 
     return schema_embeddings
-
-
-def calculate_cosine_distance(schema_embeddings, all_good_pairs):
-    """
-    Calculate the cosine distances between the embeddings of all paths.
-
-    Args:
-        schema_embeddings (dict): Dictionary containing paths and their corresponding embeddings.
-        all_good_pairs (set): Set of good pairs of paths.
-
-    Returns:
-        list: List of tuples containing path pairs and their cosine distance, sorted in ascending order of distance.
-    """
-    
-    # Convert embeddings to a tensor
-    paths_list = list(schema_embeddings.keys())
-    embeddings_tensor = torch.stack([schema_embeddings[path] for path in paths_list])
-
-    # Normalize embeddings
-    normalized_embeddings = normalize(embeddings_tensor, p=2, dim=1)
-
-    # Compute cosine similarity matrix
-    cosine_similarity_matrix = torch.mm(normalized_embeddings, normalized_embeddings.T)
-
-    # Calculate cosine distances (1 - cosine similarity)
-    cosine_distance_matrix = 1 - cosine_similarity_matrix
-
-    # Extract all unique pairs (upper triangular matrix, excluding diagonal)
-    indices = torch.triu_indices(len(paths_list), len(paths_list), offset=1)
-
-    all_pairs = []
-    for i, j in zip(indices[0], indices[1]):
-        path1, path2 = paths_list[i], paths_list[j]
-        if (path1, path2) not in all_good_pairs and (path2, path1) not in all_good_pairs:
-            all_pairs.append(((path1, path2), cosine_distance_matrix[i, j].item()))
-
-    # Sort pairs by cosine distance
-    all_pairs.sort(key=lambda x: x[1])
-
-    return all_pairs
 
 
 def label_samples(df, good_pairs, bad_pairs):
@@ -934,43 +894,53 @@ def get_samples(df, frequent_ref_defn_paths):
         pd.DataFrame: Labeled dataFrame containing sample paths and schemas.
     """
 
-    good_pairs = set()
     all_good_pairs = set()
-    bad_pairs = set()
-    ref_path_dict = {}
+    all_bad_pairs = set()
+    all_good_paths = set()
+    sample_good_pairs = set()
+    sample_bad_pairs = set()
 
-    # Get all paths in the schema
-    paths = list(df["path"])
+    # Calculate the embeddings of the tokenized schema
+    schema_embeddings = calculate_embeddings(df)
     
-    # Generate good pairs from frequent referenced definition paths
+    # Get all paths from the DataFrame
+    paths = list(df["path"])
+
+    # Process good paths
     for ref_defn, good_paths in frequent_ref_defn_paths.items():
-        good_paths_pairs = list(itertools.combinations(good_paths, 2))
-        #print(f"Number of good pairs for {ref_defn}: {len(good_paths_pairs)}")
-        all_good_pairs.update(good_paths_pairs)
-        good_pairs.update(itertools.islice(good_paths_pairs, 1000))
+        all_good_paths.update(good_paths)
+        good_pairs = list(itertools.combinations(good_paths, 2))
+        all_good_pairs.update(good_pairs)
 
-        # Map paths to their reference definition
-        for path in good_paths:
-            ref_path_dict[path] = ref_defn
+        # Calculate distances for good pairs
+        good_pairs_distances = [
+            ((path1, path2), cosine(schema_embeddings[path1], schema_embeddings[path2]))
+            for path1, path2 in good_pairs
+        ]
 
-    # Get non definition paths
-    bad_paths = list(set(paths) - set(ref_path_dict.keys()))
+        # Select top 1,000 pairs with greatest distances
+        top_1000_good_pairs = nlargest(1000, good_pairs_distances, key=lambda x: x[1])
+        sample_good_pairs.update(pair for pair, _ in top_1000_good_pairs)
 
-    if bad_paths:
-        # Calculate the embeddings of the tokenized schema
-        schema_embeddings = calculate_embeddings(df)
-        # Calculate cosine distances for all pairs
-        cosine_distances = calculate_cosine_distance(schema_embeddings, all_good_pairs)
+
+    # Process bad paths
+    if len(paths) > len(all_good_paths):
+        all_pairs = list(itertools.combinations(paths, 2))
+        all_bad_pairs = set(all_pairs) - all_good_pairs
+
+        # Calculate distances for bad pairs
+        bad_pairs_distances = [
+            ((path1, path2), cosine(schema_embeddings[path1], schema_embeddings[path2]))
+            for path1, path2 in all_bad_pairs
+        ]
+
+        # Select pairs with smallest distances 
+        num_bad_pairs = min(len(sample_good_pairs), len(all_bad_pairs))
+        top_bad_pairs = nsmallest(num_bad_pairs, bad_pairs_distances, key=lambda x: x[1])
+        sample_bad_pairs.update(pair for pair, _ in top_bad_pairs)
         
-        # Select pairs with the smallest distances as bad pairs
-        for pair, distance in cosine_distances:
-            if len(bad_pairs) < len(good_pairs):
-                bad_pairs.add(pair)
-            else:
-                break
-
     # Label data
-    labeled_df = label_samples(df, good_pairs, bad_pairs)
+    labeled_df = label_samples(df, sample_good_pairs, sample_bad_pairs)
     return labeled_df
 
 
@@ -1158,10 +1128,10 @@ def preprocess_data(schemas, filename, ground_truth_file):
     properties = 0
 
     # Limit the number of concurrent workers to prevent memory overload
-    with concurrent.futures.ProcessPoolExecutor() as executor:
+    with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = {executor.submit(process_schema, schema, filename): schema for schema in schemas}
         
-        for future in tqdm.tqdm(concurrent.futures.as_completed(futures), total=len(futures), position=1):  
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), position=1, desc="Processing schemas"):  
             df = None
             try:
                 df, frequent_ref_defn_paths, schema_name, failure_flags = future.result()
@@ -1244,7 +1214,7 @@ def main():
         else:
             # Files to be checked for deletion
             files_to_delete = [
-                "sample_train_data.csv",
+               "sample_train_data.csv",
                 "train_ground_truth.json",
                 "sample_test_data.csv",
                 "test_ground_truth.json"
