@@ -4,36 +4,37 @@ import json
 import jsonref
 import math
 import networkx as nx
-import numpy as np
 import os
 import subprocess
 import sys
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import wandb
 
 from adapters import AdapterTrainer, AutoAdapterModel
 from collections import defaultdict, OrderedDict
-from concurrent.futures import ThreadPoolExecutor
-from copy import copy, deepcopy
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, precision_score, recall_score, f1_score, accuracy_score
+from torch.nn.utils.rnn import pad_sequence
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
-from transformers import AutoTokenizer, get_scheduler, TrainingArguments, EvalPrediction
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup, EvalPrediction
 
 import process_data
 
 
 MAX_TOK_LEN = 512
 MODEL_NAME = "microsoft/codebert-base" 
-PATH = "./adapter-model"
 ADAPTER_NAME = "frequent_patterns"
 SCHEMA_FOLDER = "processed_schemas"
 JSON_FOLDER = "processed_jsons"
-BATCH_SIZE = 16
+BATCH_SIZE = 120
+HIDDEN_SIZE = 768
 JSON_SUBSCHEMA_KEYWORDS = {"allOf", "oneOf", "anyOf", "not"}
+
+
 
 # https://stackoverflow.com/a/73704579
 class EarlyStopper:
@@ -54,20 +55,77 @@ class EarlyStopper:
         return False
 
 
-def initialize_model():
+def extract_properties(schema):
     """
-    Initializes a pre-trained model with an adapter for classification tasks.
+    Extracts the top-level properties from a JSON schema.
     
+    Args:
+        schema (dict): The JSON schema.
+
     Returns:
-        tuple: A tuple containing the initialized model and tokenizer.
+        dict: A dictionary containing the top-level properties.
     """
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoAdapterModel.from_pretrained(MODEL_NAME)
-    model.add_classification_head(ADAPTER_NAME, num_labels=2)
-    model.add_adapter(ADAPTER_NAME, config="seq_bn")
-    model.set_active_adapters(ADAPTER_NAME)
-    model.train_adapter(ADAPTER_NAME)
-    return model, tokenizer
+    return schema.get("properties", {})
+
+
+def find_common_properties(properties1, properties2):
+    """
+    Finds common properties between two dictionaries.
+
+    Args:
+        properties1 (dict): The properties of the first schema.
+        properties2 (dict): The properties of the second schema.
+
+    Returns:
+        set: A set of common property keys.
+    """
+    return set(properties1.keys()) & set(properties2.keys())
+
+
+def order_properties(properties, common_properties):
+    """
+    Orders a dictionary of properties by prioritizing common properties.
+
+    Args:
+        properties (dict): The properties to order.
+        common_properties (set): A set of properties that are common between schemas.
+
+    Returns:
+        OrderedDict: The ordered properties.
+    """
+    ordered = OrderedDict((property, properties[property]) for property in common_properties if property in properties)
+    ordered.update((property, properties[property]) for property in properties if property not in common_properties)
+    return ordered
+
+
+def order_properties_by_commonality(schema1, schema2):
+    """
+    Orders the properties of two schemas based on their common properties.
+
+    Args:
+        schema1 (dict): The first JSON schema.
+        schema2 (dict): The second JSON schema.
+
+    Returns:
+        tuple: Two dictionaries representing the schemas with properties ordered by commonality.
+    """
+
+    # Extract properties from both schemas
+    properties1 = extract_properties(schema1)
+    properties2 = extract_properties(schema2)
+
+    # Get common properties
+    common_properties = find_common_properties(properties1, properties2)
+
+    # Order properties
+    ordered_properties1 = order_properties(properties1, common_properties)
+    ordered_properties2 = order_properties(properties2, common_properties)
+
+    # Create updated schemas with reordered properties
+    ordered_schema1 = {**schema1, "properties": dict(ordered_properties1)}
+    ordered_schema2 = {**schema2, "properties": dict(ordered_properties2)}
+
+    return ordered_schema1, ordered_schema2
 
 
 def tokenize_schema(schema, tokenizer):
@@ -81,35 +139,38 @@ def tokenize_schema(schema, tokenizer):
     Returns:
         list: A list of token IDs representing the tokenized schema.
     """
-    tokens = tokenizer(schema, add_special_tokens=False, truncation=True, max_length=MAX_TOK_LEN)["input_ids"]
+    tokens = tokenizer(json.dumps(schema), return_tensors="pt")["input_ids"]
+    tokens = tokens.squeeze(0).tolist()
     return tokens
 
 
 def merge_schema_tokens(df, tokenizer):
     """
-    Merges tokenized schemas of pairs into a single sequence with a newline token in between.
-    Truncates proportionally if the tokenized length exceeds the maximum token length.
+    Merges tokenized schemas and includes a similarity indicator based on the second element of their paths
+    in the merged tokenized schema. Truncates proportionally if the tokenized length exceeds the maximum token length.
 
     Args:
-        df (pd.DataFrame): DataFrame containing schema pairs to be tokenized and merged.
+        df (pd.DataFrame): DataFrame containing schema pairs and their paths.
         tokenizer (PreTrainedTokenizer): The tokenizer used for processing schemas.
 
     Returns:
-        pd.DataFrame: Updated DataFrame with a single 'tokenized_schema' column containing merged tokens.
+        pd.DataFrame: Updated DataFrame with a single 'tokenized_schema' column.
     """
     # Special tokens
-    cls_token_id = tokenizer.cls_token_id  # [CLS]
+    bos_token_id = tokenizer.bos_token_id  # [BOS]
     sep_token_id = tokenizer.sep_token_id  # [SEP]
     eos_token_id = tokenizer.eos_token_id  # [EOS]
     tokenized_schemas = []
 
-    for idx, (schema1, schema2) in df[["schema1", "schema2"]].iterrows():
+    # Add tqdm progress bar for the iteration
+    for idx, (schema1, schema2) in tqdm(df[["schema1", "schema2"]].iterrows(), leave=False, total=len(df), desc="Merging schema tokens"):
         schema1 = json.loads(schema1)
         schema2 = json.loads(schema2)
 
-        # Ensure that properties are ordered by commonality if needed (implementation dependent)
+        # Ensure that properties are ordered by commonality
         ordered_schema1, ordered_schema2 = order_properties_by_commonality(schema1, schema2)
 
+        # Tokenize schemas
         tokenized_schema1 = tokenize_schema(ordered_schema1, tokenizer)
         tokenized_schema2 = tokenize_schema(ordered_schema2, tokenizer)
 
@@ -123,8 +184,9 @@ def merge_schema_tokens(df, tokenizer):
             tokenized_schema1 = tokenized_schema1[:-truncate_len1]
             tokenized_schema2 = tokenized_schema2[:-truncate_len2]
 
+        # Merge tokens including the similarity token
         merged_tokenized_schema = (
-            [cls_token_id] +  # Add [CLS] at the beginning
+            [bos_token_id] +  # Add [BOS] at the beginning
             tokenized_schema1 +
             [sep_token_id] +  # Add [SEP] between schemas
             tokenized_schema2 +
@@ -133,11 +195,106 @@ def merge_schema_tokens(df, tokenizer):
 
         tokenized_schemas.append(merged_tokenized_schema)
 
+    # Add tokenized schema to DataFrame
     df["tokenized_schema"] = tokenized_schemas
     df = df.drop(["schema1", "schema2", "filename"], axis=1)
 
     return df
 
+
+class CustomDataset(Dataset):
+    """
+    Custom PyTorch Dataset class for training and testing the model.
+
+    Args:
+        dataframe (pd.DataFrame): DataFrame containing the tokenized schemas and labels.
+
+    Returns:
+        dict: A dictionary containing the input IDs, attention mask, label, and nesting depths of the schemas.
+    """
+
+    def __init__(self, dataframe):
+        self.data = dataframe
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        tokenized_schema = self.data.iloc[idx]["tokenized_schema"]
+        label = self.data.iloc[idx]["label"]
+        path1 = self.data.iloc[idx]["path1"]
+        path2 = self.data.iloc[idx]["path2"]
+        nesting_depth1 = len(path1)
+        nesting_depth2 = len(path2)
+
+        return {
+            "input_ids": tokenized_schema,
+            "attention_mask": [1] * len(tokenized_schema),
+            "label": label,
+            "nesting_depth1": nesting_depth1,
+            "nesting_depth2": nesting_depth2,
+        }
+
+
+def collate_fn(batch, tokenizer):
+    input_ids = [torch.tensor(item["input_ids"]) for item in batch]
+    attention_mask = [torch.tensor(item["attention_mask"]) for item in batch]
+    labels = torch.tensor([item["label"] for item in batch])
+    nesting_depth1 = torch.tensor([item["nesting_depth1"] for item in batch])
+    nesting_depth2 = torch.tensor([item["nesting_depth2"] for item in batch])
+
+    padded_input_ids = pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
+    padded_attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+
+    return {
+        "input_ids": padded_input_ids,
+        "attention_mask": padded_attention_mask,
+        "label": labels,
+        "nesting_depth1": nesting_depth1,
+        "nesting_depth2": nesting_depth2
+    }
+
+
+class CustomBERTModel(nn.Module):
+    def __init__(self):
+        super(CustomBERTModel, self).__init__()
+        
+        # Load pre-trained CodeBERT with adapters
+        self.codebert = AutoAdapterModel.from_pretrained(MODEL_NAME)
+
+        # Add the adapter and classification head
+        self.codebert.add_adapter(ADAPTER_NAME, config="seq_bn")
+        self.codebert.set_active_adapters(ADAPTER_NAME)
+        self.codebert.add_classification_head(ADAPTER_NAME, num_labels=2) 
+        self.codebert.train_adapter(ADAPTER_NAME)
+
+        # Custom layers for processing additional inputs
+        self.nesting_depth1 = nn.Linear(1, HIDDEN_SIZE) 
+        self.nesting_depth2 = nn.Linear(1, HIDDEN_SIZE)
+
+        # Final classifier to process concatenated logits and custom features
+        self.modified_classifier = nn.Linear(HIDDEN_SIZE * 2 + 2, 2)
+
+
+    def forward(self, input_ids, attention_mask, nesting_depth1, nesting_depth2):
+        # Pass input through the pre-trained CodeBERT with the adapter
+        outputs = self.codebert(input_ids=input_ids, attention_mask=attention_mask)
+        
+        # Extract the logits from the classification head
+        logits = outputs.logits
+
+        # Process nesting depths with custom layers
+        depth1_emb = F.relu(self.nesting_depth1(nesting_depth1.unsqueeze(-1).float()))
+        depth2_emb = F.relu(self.nesting_depth2(nesting_depth2.unsqueeze(-1).float()))
+        
+        # Concatenate the [CLS] output with the embeddings of depth1 and depth2
+        combined_output = torch.cat([logits, depth1_emb, depth2_emb], dim=-1)
+        
+        # Pass the combined output through the final classification layer
+        logits = self.modified_classifier(combined_output)
+    
+        return logits
+            
 
 def compute_metrics(pred: EvalPrediction):
     """
@@ -161,79 +318,29 @@ def compute_metrics(pred: EvalPrediction):
     }
 
     
-def save_model_and_adapter(model):
+def save_model_and_adapter(model, save_path="frequent_pattern_model"):
     """
-    Save the model's adapter and log it as a WandB artifact.
+    Save the custom model's state_dict and the adapter.
 
     Args:
-        model: The model with the adapter to save.
+        model (CustomBERTModel): The custom model to save.
     """
-    path = os.path.join(os.getcwd(), "adapter-model")
-    
+
+    # Ensure the save directory exists
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+    path = os.path.join(os.getcwd(), save_path)
+
+    # Handle multi-GPU models
     model = model.module if isinstance(model, nn.DataParallel) else model
-    # Save the entire model
-    model.save_pretrained(path)
 
-    # Save the adapter
-    model.save_adapter(path, ADAPTER_NAME)
+    # Save the state_dict for the custom layers
+    torch.save(model.state_dict(), os.path.join(path, "frequent_patterns_model_state_dict.pth"))
 
+    # Save the CodeBERT adapter and base model
+    model.codebert.save_pretrained(path)
+    model.codebert.save_adapter(path, ADAPTER_NAME)  
 
-class SchemaDataset(Dataset):
-    """
-    Custom dataset class for tokenized schema data.
-
-    Args:
-        df (pd.DataFrame): The DataFrame containing tokenized schemas and labels.
-        tokenizer (PreTrainedTokenizer): The tokenizer for padding and encoding.
-    """
-    def __init__(self, df, tokenizer):
-        self.tokenizer = tokenizer
-        self.df = df
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        """
-        Retrieves the tokenized schema and its label for the given index.
-
-        Args:
-            idx (int): Index of the item to retrieve.
-
-        Returns:
-            dict: Dictionary containing input_ids, attention_mask, and label.
-        """
-        tokenized_schema = self.df.iloc[idx]["tokenized_schema"]
-        label = self.df.iloc[idx]["label"]
-
-        # Pad the tokenized schema to the max length using the tokenizer's pad_token_id
-        encoding = self.tokenizer.pad(
-            {"input_ids": [tokenized_schema], 
-             "attention_mask": [[1] * len(tokenized_schema)]}, 
-            padding="max_length",  
-            max_length=MAX_TOK_LEN, 
-            return_tensors="pt" 
-        )
-        # Return the encoded data along with the label
-        return {
-            "input_ids": encoding["input_ids"].squeeze(0), 
-            "attention_mask": encoding["attention_mask"].squeeze(0),
-            "labels": torch.tensor(label)
-        }
-
-
-def create_dataset(df, tokenizer):
-    """
-    Creates a custom dataset from the provided DataFrame with tokenized schema and labels.
-    
-    Args:
-        df (pd.DataFrame): DataFrame containing the tokenized schema and labels.
-        tokenizer (PreTrainedTokenizer): The tokenizer used to process the schemas.
-    
-    Returns:
-        SchemaDataset: Custom dataset ready for training.
-    """
-    return SchemaDataset(df, tokenizer)
 
 
 def train_model(train_df, test_df):
@@ -247,7 +354,7 @@ def train_model(train_df, test_df):
     # Hyperparameters
     accumulation_steps = 4
     learning_rate = 1e-6
-    num_epochs = 50
+    num_epochs = 75
 
     # Initialize wandb logging
     wandb.init(
@@ -259,8 +366,9 @@ def train_model(train_df, test_df):
         }
     )
 
-    # Initialize model and tokenizer
-    model, tokenizer = initialize_model()
+    # Initialize the custom model and tokenizer
+    model = CustomBERTModel()
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     # Set up optimizer
     optimizer = AdamW(model.parameters(), lr=learning_rate)
@@ -279,74 +387,119 @@ def train_model(train_df, test_df):
     test_df = merge_schema_tokens(test_df, tokenizer)
 
     # Create datasets with dynamic padding and batching
-    train_dataset = create_dataset(train_df, tokenizer)
-    test_dataset = create_dataset(test_df, tokenizer)
-
+    train_dataset = CustomDataset(train_df)
+    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda batch: collate_fn(batch, tokenizer))
+   
     # Set up scheduler to adjust the learning rate during training
-    num_training_steps = num_epochs * len(train_dataset) // BATCH_SIZE 
+    num_training_steps = num_epochs * len(train_dataloader) // accumulation_steps
     num_warmup_steps = int(0.1 * num_training_steps)
-    lr_scheduler = get_scheduler(
-        "linear",
+    lr_scheduler = get_linear_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_training_steps
+        num_training_steps=num_training_steps,
     )
 
-    # Setup the training arguments
-    training_args = TrainingArguments(
-        report_to="wandb",
-        learning_rate=learning_rate,
-        num_train_epochs=num_epochs,
-        per_device_train_batch_size=BATCH_SIZE,
-        per_device_eval_batch_size=BATCH_SIZE, 
-        logging_steps=10,
-        evaluation_strategy="epoch",
-        logging_strategy="epoch",
-        output_dir="./training_output",
-        overwrite_output_dir=True,
-        remove_unused_columns=False,
-        dataloader_pin_memory=False,
-        gradient_accumulation_steps=accumulation_steps,
-    )
+    # Train the model
+    model.train()
+     # Define the loss function
+    loss_fn = torch.nn.CrossEntropyLoss()
 
-    trainer = AdapterTrainer(
-        model=model.module if isinstance(model, nn.DataParallel) else model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=test_dataset,
-        compute_metrics=compute_metrics,
-        optimizers=(optimizer, lr_scheduler),
-    )
+    pbar = tqdm(range(num_epochs), position=0, desc="Epoch")
+    for epoch in pbar:
+        total_loss = 0
+        for i, batch in enumerate(tqdm(train_dataloader, position=1, total=len(train_dataloader), desc="Training")):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            input_ids, attention_mask, labels, nesting_depth1, nesting_depth2 = batch["input_ids"], batch["attention_mask"], batch["label"], batch["nesting_depth1"], batch["nesting_depth2"]
 
-    # Start training
-    trainer.train()
-    trainer.evaluate()
+            # Zero the gradients
+            optimizer.zero_grad()
+
+            # Forward pass
+            logits = model(input_ids=input_ids, attention_mask=attention_mask, nesting_depth1=nesting_depth1, nesting_depth2=nesting_depth2)
+  
+            # Calculate the training loss
+            training_loss = loss_fn(logits, labels)
+       
+            # Need to average the loss if we are using DataParallel
+            if training_loss.dim() > 0:
+                training_loss = training_loss.mean()
+
+            training_loss.backward()
+            
+            if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_dataloader):
+                optimizer.step()
+                lr_scheduler.step()
+                
+                # Calculate global training step
+                step = (epoch * len(train_dataloader) + i + 1) // accumulation_steps
+        
+            total_loss += training_loss.item()
+
+        average_loss = total_loss / len(train_dataloader)
+
+        # Test the model
+        testing_loss = test_model(test_df, tokenizer, model, device, wandb)
+
+        wandb.log({
+            "training_loss": average_loss,
+            "learning_rate": lr_scheduler.get_last_lr()[0], 
+            "step": step,
+            "epoch": epoch + 1
+        })
 
     # Save the model and adapter after training
     save_model_and_adapter(model)
-
     # Finish wandb logging
     wandb.finish()
 
 
-def load_model_and_adapter():
-    """
-    Load the model and adapter from the specified path.
+def test_model(test_df, tokenizer, model, device, wandb):
+    test_dataset = CustomDataset(test_df)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda batch: collate_fn(batch, tokenizer))
 
-    Returns:
-        PreTrainedModel: The model with the loaded adapter.
-    """
-    
-    # Load the tokenizer and model
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoAdapterModel.from_pretrained(PATH)
+    model.eval()
+    total_loss = 0.0
 
-    # Load the adapter from the saved path and activate it
-    adapter_name = model.load_adapter(PATH)
-    model.set_active_adapters(adapter_name)
-    print(f"Loaded and activated adapter: {adapter_name}")
-    
-    return model, tokenizer
+    # Define the loss function
+    loss_fn = torch.nn.CrossEntropyLoss()
+
+    total_actual_labels = []
+    total_predicted_labels = []
+
+    with torch.no_grad():
+        for batch in tqdm(test_loader, total=len(test_loader), desc="Testing"):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            input_ids, attention_mask, labels, nesting_depth1, nesting_depth2 = batch["input_ids"], batch["attention_mask"], batch["label"], batch["nesting_depth1"], batch["nesting_depth2"]
+
+            # Forward pass
+            logits = model(input_ids=input_ids, attention_mask=attention_mask, nesting_depth1=nesting_depth1, nesting_depth2=nesting_depth2)
+            
+            # Calculate the testing loss
+            testing_loss = loss_fn(logits, labels)
+
+            # Need to average the loss if we are using DataParallel
+            if testing_loss.dim() > 0:
+                testing_loss = testing_loss.mean()
+            total_loss += testing_loss.item()
+
+            # Get the actual and predicted labels
+            actual_labels = labels.cpu().numpy()
+            predicted_labels = torch.argmax(logits, dim=1).cpu().numpy()
+            total_actual_labels.extend(actual_labels)
+            total_predicted_labels.extend(predicted_labels)
+
+    average_loss = total_loss / len(test_loader)
+
+    # Calculate the accuracy, precision, recall, f1 score of the positive class
+    accuracy = accuracy_score(total_actual_labels, total_predicted_labels)
+    precision = precision_score(total_actual_labels, total_predicted_labels, average="binary")
+    recall = recall_score(total_actual_labels, total_predicted_labels, average="binary")
+    f1 = f1_score(total_actual_labels, total_predicted_labels, average="binary")
+
+    #print(f'accuracy: {accuracy}, precision: {precision}, recall: {recall}, F1: {f1}')
+    wandb.log({"accuracy": accuracy, "testing_loss": average_loss, "precision": precision, "recall": recall, "F1": f1})
+
+    return average_loss
 
 
 def get_schema_paths(schema, current_path=('$',)):
@@ -437,6 +590,37 @@ def remove_additional_properties(filtered_df, schema):
     return filtered_df
 
 
+
+
+
+
+def load_model_and_adapter(save_path="frequent_pattern_model"):
+    """
+    Load the custom model and its adapter.
+
+    Args:
+        save_path (str): Path where the custom model and adapter are saved.
+
+    Returns:
+        CustomBERTModel: The loaded custom model.
+        AutoTokenizer: The tokenizer used for processing schemas.
+    """
+    # Initialize a new instance of the custom model and tokenizer
+    model = CustomBERTModel()
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+    # Load the base CodeBERT model and adapter
+    model.codebert = AutoAdapterModel.from_pretrained(save_path)
+    model.codebert.load_adapter(save_path, load_as=ADAPTER_NAME)
+    model.codebert.set_active_adapters(ADAPTER_NAME)
+
+    # Load the state_dict for the custom layers
+    #model.load_state_dict(torch.load(os.path.join(save_path, "frequent_patterns_model_state_dict.pth")))
+
+    return model, tokenizer
+
+
+
 def find_pairs_with_common_properties(df):
     """
     Generate pairs of paths from a DataFrame where the schemas have at least two properties in common.
@@ -447,138 +631,28 @@ def find_pairs_with_common_properties(df):
     Yields:
         tuple: A tuple containing the indices of the two paths (i, j) and a set of common properties between their schemas.
     """
-    properties_list = []
 
-    # Extract properties for each row
-    for i in range(len(df)):
-        try:
-            schema = json.loads(df.at[i, "schema"])
-            properties = schema.get("properties", {})
-            properties_list.append(set(properties.keys()))
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"Skipping row {i} due to error: {e}")
-            properties_list.append(set()) 
+    # Extract properties for each schema into a list
+    properties_list = [
+        set(json.loads(row["schema"]).get("properties", {}).keys())
+        if isinstance(row["schema"], str) else set()
+        for _, row in df.iterrows()
+    ]
 
-    # Compare each pair of schemas
-    for i in range(len(df)):
-        properties_i = properties_list[i]
-
-        for j in range(i + 1, len(df)):
-            properties_j = properties_list[j]
-            
-            # Find the common properties between the two schemas
-            common_properties = properties_i & properties_j
-            
-            # Yield the pair if there are more than two common properties
-            if len(common_properties) > 1:
-                yield i, j, common_properties
+    # Compare pairs of schemas
+    for i, properties_i in enumerate(properties_list):
+        for j in range(i + 1, len(properties_list)):
+            common_properties = properties_i & properties_list[j]
+            if len(common_properties) >= 2:
+                yield i, j, sorted(common_properties)
 
 
-def extract_properties(schema):
-    """
-    Extracts the top-level properties from a JSON schema.
-    
-    Args:
-        schema (dict): The JSON schema.
-
-    Returns:
-        dict: A dictionary containing the top-level properties.
-    """
-    return schema.get("properties", {})
-
-
-def find_common_properties(properties1, properties2):
-    """
-    Finds common properties between two dictionaries.
-
-    Args:
-        properties1 (dict): The properties of the first schema.
-        properties2 (dict): The properties of the second schema.
-
-    Returns:
-        set: A set of common property keys.
-    """
-    return set(properties1.keys()) & set(properties2.keys())
-
-
-def order_properties(properties, common_keys):
-    """
-    Orders a dictionary of properties by prioritizing common keys.
-
-    Args:
-        properties (dict): The properties to order.
-        common_keys (set): A set of keys that are common between schemas.
-
-    Returns:
-        OrderedDict: The ordered properties.
-    """
-    ordered = OrderedDict((key, properties[key]) for key in common_keys if key in properties)
-    ordered.update((key, properties[key]) for key in properties if key not in common_keys)
-    return ordered
-
-
-def order_properties_by_commonality(schema1, schema2):
-    """
-    Orders the properties of two schemas based on their common properties.
-
-    Args:
-        schema1 (dict): The first JSON schema.
-        schema2 (dict): The second JSON schema.
-
-    Returns:
-        tuple: Two dictionaries representing the schemas with properties ordered by commonality.
-    """
-
-    # Extract properties from both schemas
-    properties1 = extract_properties(schema1)
-    properties2 = extract_properties(schema2)
-
-    # Find common properties
-    common_properties = find_common_properties(properties1, properties2)
-
-    # Order properties
-    ordered_properties1 = order_properties(properties1, common_properties)
-    ordered_properties2 = order_properties(properties2, common_properties)
-
-    # Create updated schemas with reordered properties
-    ordered_schema1 = {**schema1, "properties": dict(ordered_properties1)}
-    ordered_schema2 = {**schema2, "properties": dict(ordered_properties2)}
-
-    return ordered_schema1, ordered_schema2
-
-
-def tokenize_schema(schema, tokenizer):
-    """Tokenize schema.
-
-    Args:
-        schema (dict): DataFrame containing pairs, labels, filenames, and schemas of each path in pair
-        tokenizer (PreTrainedTokenizer): The tokenizer used for processing schemas.
-
-    Returns:
-        torch.tensor: inputs_ids tensor
-    """
-
-    # Tokenize the schema
-    tokenized_schema = tokenizer(json.dumps(schema), return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True)
-    input_ids_tensor = tokenized_schema["input_ids"]
-    input_ids_tensor = input_ids_tensor[input_ids_tensor != tokenizer.pad_token_id]
-
-    # Remove the first and last tokens
-    input_ids_tensor_sliced = input_ids_tensor[1:-1]
-
-    # Convert tensor to a numpy array and then list
-    input_ids_numpy = input_ids_tensor_sliced.cpu().numpy()
-    input_ids_list = input_ids_numpy.tolist()
-   
-    return input_ids_list
-
-
-def merge_eval_schema_tokens(pairs, df, tokenizer):
+def merge_eval_schema_tokens(batch, df, tokenizer):
     """
     Merge the tokens of two schemas for evaluation, with truncation if necessary to fit the maximum token length.
 
     Args:
-        pairs (list): A list of tuples containing the indices of the two schemas and a set of common properties.
+        batch (list): A list of tuples containing the indices of the two schemas and a set of common properties.
         df (pd.DataFrame): DataFrame containing the paths and schemas.
         tokenizer (PreTrainedTokenizer): Tokenizer used for processing schemas.
 
@@ -587,50 +661,56 @@ def merge_eval_schema_tokens(pairs, df, tokenizer):
     """
     
     # Special tokens
-    cls_token_id = tokenizer.cls_token_id  # [CLS]
+    bos_token_id = tokenizer.bos_token_id  # [BOS]
     sep_token_id = tokenizer.sep_token_id  # [SEP]
     eos_token_id = tokenizer.eos_token_id  # [EOS]
 
-     # Loop through the entire batch passed in as 'pairs'
-    for i1, i2, _ in pairs:
+    tokenized_schemas = []
+
+    # Loop through the entire batch passed in as 'pairs'
+    for i1, i2, common_properties in batch:
         schema1 = json.loads(df["schema"].iloc[i1])
         schema2 = json.loads(df["schema"].iloc[i2])
 
-    # Order properties by commonality
-    ordered_schema1, ordered_schema2 = order_properties_by_commonality(schema1, schema2)
-    
-    tokenized_schema1 = tokenize_schema(ordered_schema1, tokenizer)
-    tokenized_schema2 = tokenize_schema(ordered_schema2, tokenizer)
-    
-    # Calculate the total length of the merged tokenized schemas
-    total_len = len(tokenized_schema1) + len(tokenized_schema2)
-    max_tokenized_len = MAX_TOK_LEN - 1 - 2  # Subtract BOS, EOS, and newline token lengths
+        # Order properties by commonality
+        ordered_schema1, ordered_schema2 = order_properties_by_commonality(schema1, schema2)
+        
+        # Tokenize schemas
+        tokenized_schema1 = tokenize_schema(ordered_schema1, tokenizer)
+        tokenized_schema2 = tokenize_schema(ordered_schema2, tokenizer)
+        
+        # Calculate the total length of the merged tokenized schemas
+        total_len = len(tokenized_schema1) + len(tokenized_schema2)
+        max_tokenized_len = MAX_TOK_LEN - 3  # Account for BOS, EOS, and newline token lengths
 
-    # Truncate the schemas proportionally if they exceed the max token length
-    if total_len > max_tokenized_len:
-        truncate_len = total_len - max_tokenized_len
-        truncate_len1 = math.ceil(len(tokenized_schema1) / total_len * truncate_len)
-        truncate_len2 = math.ceil(len(tokenized_schema2) / total_len * truncate_len)
-        tokenized_schema1 = tokenized_schema1[:-truncate_len1]
-        tokenized_schema2 = tokenized_schema2[:-truncate_len2]
+        # Truncate the schemas proportionally if they exceed the max token length
+        if total_len > max_tokenized_len:
+            truncate_len = total_len - max_tokenized_len
+            truncate_len1 = math.ceil(len(tokenized_schema1) / total_len * truncate_len)
+            truncate_len2 = math.ceil(len(tokenized_schema2) / total_len * truncate_len)
+            tokenized_schema1 = tokenized_schema1[:-truncate_len1]
+            tokenized_schema2 = tokenized_schema2[:-truncate_len2]
 
-    merged_tokenized_schema = (
-        [cls_token_id] +  # Add [CLS] at the beginning
-        tokenized_schema1 +
-        [sep_token_id] +  # Add [SEP] between schemas
-        tokenized_schema2 +
-        [eos_token_id]  # Add [EOS] at the end
-    )
+        # Merge tokens including the similarity token
+        merged_tokenized_schema = (
+            [bos_token_id] +  # Add [BOS] at the beginning
+            tokenized_schema1 +
+            [sep_token_id] +  # Add [SEP] between schemas
+            tokenized_schema2 +
+            [eos_token_id]  # Add [EOS] at the end
+        )
 
-    return merged_tokenized_schema
+        tokenized_schemas.append(merged_tokenized_schema)
+        
+    return tokenized_schemas
 
 
-def process_pairs(pairs, df, model, device, tokenizer):
+def process_pairs(batch, df, model, device, tokenizer):
     """
     Process a batch of schema pairs and return edges for connected pairs.
 
     Args:
-        pairs (list[tuple]): A list of tuples, where each tuple contains the indices of the two schemas (i1, i2) and a set of common properties.
+        batch (list): A list of tuples containing the indices of the two schemas and a set of common properties.
         df (pd.DataFrame): DataFrame containing the paths and schemas.
         model (PreTrainedModel): The model used for predicting connections.
         device (torch.device): The device to run the model on.
@@ -639,35 +719,37 @@ def process_pairs(pairs, df, model, device, tokenizer):
     Returns:
         list[tuple]: A list of tuples where each tuple contains the paths of two schemas that are predicted to be connected.
     """
-    edges = []
+    batch_edges = []
     batch_input_ids = []
     batch_attention_masks = []
 
     # Tokenize and merge schemas
-    tokenized_schema = merge_eval_schema_tokens(pairs, df, tokenizer)
-
-    # Convert tokens to tensors 
-    input_ids = torch.tensor(tokenized_schema, dtype=torch.long).to(device)
-    attention_mask = torch.ones(input_ids.shape, dtype=torch.long).to(device)
-    batch_input_ids.append(input_ids)
-    batch_attention_masks.append(attention_mask)
+    tokenized_schemas = merge_eval_schema_tokens(batch, df, tokenizer)
+    
+    # Loop through each tokenized schema in the batch
+    for tokenized_schema in tokenized_schemas:
+        # Convert tokens to tensors 
+        input_ids = torch.tensor(tokenized_schema, dtype=torch.long).to(device)
+        attention_mask = torch.ones(input_ids.shape, dtype=torch.long).to(device)
+        batch_input_ids.append(input_ids)
+        batch_attention_masks.append(attention_mask)
 
     # Pad batch tensors to have the same length, then stack
     batch_input_ids = torch.nn.utils.rnn.pad_sequence(batch_input_ids, batch_first=True)
     batch_attention_masks = torch.nn.utils.rnn.pad_sequence(batch_attention_masks, batch_first=True)
-
+    
     # Run the batch through the model
     with torch.no_grad():
         outputs = model(input_ids=batch_input_ids, attention_mask=batch_attention_masks)
         preds = torch.argmax(outputs.logits, dim=-1).tolist()
-
+    
     # Append edges based on predictions
     for idx, pred in enumerate(preds):
         if pred == 1:
-            i1, i2, _ = pairs[idx]
-            edges.append((df["path"].iloc[i1], df["path"].iloc[i2]))
-
-    return edges
+            i1, i2, _ = batch[idx]
+            batch_edges.append((df["path"].iloc[i1], df["path"].iloc[i2]))
+    
+    return batch_edges
 
 
 def build_definition_graph(df, model, device, tokenizer, schema_name):
@@ -711,24 +793,29 @@ def find_definitions_from_graph(graph):
     Returns:
         List[List]: A list of lists, each containing nodes representing a definition.
     """
-    # Find all maximal cliques in the graph
+
+    # Get all the cliques from the graph and sort them based on their lengths in ascending order
     cliques = list(nx.algorithms.find_cliques(graph))
-    cliques.sort(key=len, reverse=True)  # Sort cliques by size in descending order
+    cliques.sort(key=lambda a: len(a))
     
-    # Track used nodes to ensure each node is part of only one definition
+    # Make sure a path only appears in one definition
     processed_cliques = []
-    used_nodes = set()
-
-    for clique in cliques:
-        # Exclude nodes already processed
-        unique_clique = [node for node in clique if node not in used_nodes]
-
-        if unique_clique:
-            processed_cliques.append(unique_clique)
-            used_nodes.update(unique_clique)  # Mark nodes as processed
+    while cliques:
+        # Remove the last clique
+        largest_clique = cliques.pop()
+        # Create a set of vertices in the largest clique
+        clique_set = set(largest_clique)
+        # Filter out vertices from other cliques that are in the largest clique
+        filtered_cliques = []
+        for clique in cliques:
+            filtered_clique = [c for c in clique if c not in clique_set]
+            if len(filtered_clique) > 1:
+                filtered_cliques.append(filtered_clique)
+        processed_cliques.append(list(clique_set))
+        cliques = filtered_cliques
 
     return processed_cliques
- 
+
 
 def calc_jaccard_index(actual_cluster, predicted_cluster):
     """Measure the similarity between actual and predicted clusters
@@ -836,7 +923,6 @@ def evaluate_single_schema(schema, device, test_ground_truth):
     m.eval()
 
     filtered_df, frequent_ref_defn_paths, schema_name, failure_flags = process_data.process_schema(schema, "")
-        
     if filtered_df is not None and frequent_ref_defn_paths is not None:
         
         # Build a definition graph
@@ -852,6 +938,7 @@ def evaluate_single_schema(schema, device, test_ground_truth):
         print(f"Schema: {schema_name}")
         print(f"Actual clusters: {actual_clusters}")
         print(f"Predicted clusters: {predicted_clusters}")
+
         # Calculate the precision, recall, and F1-score
         precision, recall, f1_score, _, _ = calc_scores(actual_clusters, predicted_clusters)
         print(f"Precision: {precision}, Recall: {recall}, F1-score: {f1_score}")
@@ -879,7 +966,7 @@ def evaluate_data(test_ground_truth, output_file="evaluation_results.json"):
     f1_scores = []
     results = []
 
-    # Process schemas in parallel using ProcessPoolExecutor
+    # Process schemas in parallel using 
     with ThreadPoolExecutor() as executor:
         futures = {
             executor.submit(evaluate_single_schema, schema, device, test_ground_truth): schema 
@@ -919,7 +1006,7 @@ def evaluate_data(test_ground_truth, output_file="evaluation_results.json"):
 
 
 
-def group_paths(df, test_ground_truth, min_common_keys=2, output_file="evaluation_results_baseline_model.json"):
+def group_paths(df, test_ground_truth, min_common_keys=1, output_file="evaluation_results_baseline_model.json"):
     """
     Group paths that have at least a specified number of distinct nested keys in common per filename and evaluate.
 

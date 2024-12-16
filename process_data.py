@@ -1075,7 +1075,6 @@ def preprocess_data(schemas, filename, ground_truth_file):
     freq_defn = 0
     properties = 0
     
-    #schemas = ["iobroker-package-manifest.json", "openrpc-json.json"]
     # Limit the number of concurrent workers to prevent memory overload
     for i in range(0, len(schemas), BATCH_SIZE):
         batch = schemas[i:i+BATCH_SIZE]
