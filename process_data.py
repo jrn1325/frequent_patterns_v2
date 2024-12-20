@@ -1,3 +1,4 @@
+import ast
 import concurrent.futures
 import itertools
 import json
@@ -17,6 +18,7 @@ from copy import copy, deepcopy
 from functools import reduce
 from heapq import nlargest, nsmallest
 from scipy.spatial.distance import cosine
+from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import GroupShuffleSplit
 from torch.nn.functional import normalize
 from torch.nn.utils.rnn import pad_sequence
@@ -38,12 +40,9 @@ JSON_SUBSCHEMA_KEYWORDS = {"allOf", "oneOf", "anyOf"}
 SCHEMA_FOLDER = "processed_schemas"
 JSON_FOLDER = "processed_jsons"
 MAX_TOK_LEN = 512
-BATCH_SIZE = 8
-
+BATCH_SIZE = 32
 MODEL_NAME = "microsoft/codebert-base" 
-MODEL = AutoAdapterModel.from_pretrained(MODEL_NAME)
-TOKENIZER = AutoTokenizer.from_pretrained(MODEL_NAME)
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 
 
@@ -553,18 +552,19 @@ def find_frequent_definitions(filtered_ref_defn_paths, paths_to_exclude):
 
 
 
-def tokenize_schema(schema):
+def tokenize_schema(schema, tokenizer):
     """Tokenize schema.
 
     Args:
         schema (dict): DataFrame containing pairs, labels, filenames, and schemas of each path in pair
+        tokenizer (preTrainedTokenizer): Tokenizer to use for tokenizing schema.
 
     Returns:
         torch.tensor: tokenized schema
     """
 
     # Tokenize the schema
-    tokenized_schema = TOKENIZER(schema, return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True)
+    tokenized_schema = tokenizer(schema, return_tensors="pt", max_length=MAX_TOK_LEN, padding="max_length", truncation=True)
     return tokenized_schema
 
 
@@ -670,8 +670,9 @@ def create_dataframe(paths_dict, paths_to_exclude):
     """
     
     df_data = []
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     
-    for path, values in tqdm(paths_dict.items(), desc="Processing paths", total=len(paths_dict)):
+    for path, values in tqdm(paths_dict.items(), desc="Processing paths", total=len(paths_dict), leave=False):
         # Skip paths that are in the exclusion set
         if path in paths_to_exclude:
             continue
@@ -682,7 +683,7 @@ def create_dataframe(paths_dict, paths_to_exclude):
         
         # Check if the schema has more than one property
         if len(schema.get("properties", {})) > 1:
-            tokenized_schema = tokenize_schema(json.dumps(schema))
+            tokenized_schema = tokenize_schema(json.dumps(schema), tokenizer)
             df_data.append([path, len(path), tokenized_schema, json.dumps(schema)])
         else:
             # Update paths_to_exclude if schema has less than or equal to one property
@@ -744,25 +745,25 @@ def update_ref_defn_paths(frequent_ref_defn_paths, df):
     }
 
 
-def calculate_embeddings(df):
+def calculate_embeddings(df, model, device):
     """
     Calculate the embeddings for each path in batches.
 
     Args:
         df (pd.DataFrame): DataFrame containing paths and their tokenized schemas.
+        model (AutoAdapterModel): Pretrained model to compute embeddings.
+        device (torch.device): Device to move tensors to.
 
     Returns:
         dict: Dictionary mapping paths to their corresponding embeddings.
     """
-    # Set device
-    MODEL.to(DEVICE)
 
     schema_embeddings = {}
     paths = df["path"].tolist()
     tokenized_schemas = df["tokenized_schema"].tolist()
 
     # Create batches of tokenized schemas
-    for batch_start in tqdm(range(0, len(tokenized_schemas), BATCH_SIZE), desc="Calculating embeddings", position=0, leave=False):
+    for batch_start in tqdm(range(0, len(tokenized_schemas), BATCH_SIZE), desc="Calculating schema embeddings", position=0, leave=False):
         batch_paths = paths[batch_start: batch_start + BATCH_SIZE]
         batch_schemas = tokenized_schemas[batch_start: batch_start + BATCH_SIZE]
 
@@ -775,12 +776,12 @@ def calculate_embeddings(df):
         batch_attention_mask = pad_sequence(batch_attention_mask, batch_first=True)
 
         # Move tensors to the device
-        batch_input_ids = batch_input_ids.to(DEVICE)
-        batch_attention_mask = batch_attention_mask.to(DEVICE)
+        batch_input_ids = batch_input_ids.to(device)
+        batch_attention_mask = batch_attention_mask.to(device)
 
         # Use model to compute embeddings
         with torch.no_grad():
-            outputs = MODEL(input_ids=batch_input_ids, attention_mask=batch_attention_mask)
+            outputs = model(input_ids=batch_input_ids, attention_mask=batch_attention_mask)
             batch_embeddings = outputs.last_hidden_state.mean(dim=1)
 
         # Store embeddings
@@ -850,7 +851,6 @@ def label_samples(df, good_pairs, bad_pairs):
     return labeled_df
 
 
-
 def get_samples(df, frequent_ref_defn_paths, best_good_pairs):
     """
     Generate labeled samples of good and bad pairs from the DataFrame based on ground truth definitions.
@@ -863,6 +863,10 @@ def get_samples(df, frequent_ref_defn_paths, best_good_pairs):
     Returns:
         pd.DataFrame: Labeled dataFrame containing sample paths and schemas.
     """
+    model = AutoAdapterModel.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
 
     all_good_pairs = set()
     all_bad_pairs = set()
@@ -871,7 +875,7 @@ def get_samples(df, frequent_ref_defn_paths, best_good_pairs):
     sample_bad_pairs = set()
 
     # Calculate the embeddings of the tokenized schema
-    schema_embeddings = calculate_embeddings(df)
+    schema_embeddings = calculate_embeddings(df, model, device)
     
     # Get all paths from the DataFrame
     paths = list(df["path"])
@@ -901,7 +905,11 @@ def get_samples(df, frequent_ref_defn_paths, best_good_pairs):
     # Process bad paths
     if len(paths) > len(all_good_paths):
         all_pairs = list(itertools.combinations(paths, 2))
-        all_bad_pairs = set(all_pairs) - all_good_pairs
+        
+        # Loop through all pairs and add to bad pairs if not in good pairs
+        for path1, path2 in all_pairs:
+            if (path1, path2) not in all_good_pairs and (path2, path1) not in all_good_pairs:
+                all_bad_pairs.add((path1, path2))
 
         # Calculate distances for bad pairs
         bad_pairs_distances = [
@@ -916,7 +924,168 @@ def get_samples(df, frequent_ref_defn_paths, best_good_pairs):
         
     # Label data
     labeled_df = label_samples(df, sample_good_pairs, sample_bad_pairs)
+    # Calculate cosine similarity between the two paths
+    labeled_df = calculate_cosine_similarity(labeled_df, model, tokenizer, device)
     return labeled_df
+
+
+def get_unique_paths(df):
+    """
+    Extract unique paths from both path1 and path2 columns in the dataframe.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing 'path1' and 'path2' columns.
+
+    Returns:
+        set: Set of unique paths.
+    """
+    # Collect unique paths from both path1 and path2 columns
+    unique_paths = set(df["path1"].tolist() + df["path2"].tolist())
+    return unique_paths
+
+
+def tuple_to_string(path_tuple):
+    """
+    Converts a tuple representing a JSON path into a string.
+
+    Args:
+        path_tuple (tuple): A tuple representing a JSON path.
+
+    Returns:
+        str: The string representation of the JSON path.
+    """
+    return '.'.join(path_tuple)
+
+
+def tokenize_paths(paths, tokenizer, device):
+    """
+    Tokenize a list of paths and prepare them for the model.
+
+    Args:
+        paths (list of str): List of JSON paths to tokenize.
+        tokenizer: Tokenizer to use for tokenizing paths.
+        device: Device to move tokenized inputs to.
+
+    Returns:
+        dict: Tokenized paths with input_ids and attention_mask tensors on the device.
+    """
+    return tokenizer(paths, return_tensors="pt", padding=True, truncation=True, max_length=MAX_TOK_LEN).to(device)
+
+
+def compute_embeddings(tokenized_inputs, model):
+    """
+    Compute embeddings from tokenized inputs.
+
+    Args:
+        tokenized_inputs (dict): Tokenized inputs containing input_ids and attention_mask.
+        model: Pretrained model to compute embeddings.
+
+    Returns:
+        torch.Tensor: Embeddings of shape (batch_size, embedding_dim).
+    """
+    with torch.no_grad():
+        outputs = model(**tokenized_inputs)
+    return outputs.last_hidden_state.mean(dim=1).squeeze()
+
+
+def precompute_embeddings(unique_paths, model, tokenizer, device):
+    """
+    Precompute embeddings for unique paths in batches.
+
+    Args:
+        unique_paths (set): Set of unique paths.
+        model: Pretrained model to compute embeddings.
+        tokenizer: Tokenizer to tokenize paths.
+        device: Device to move inputs and embeddings.
+
+    Returns:
+        dict: Cache of precomputed embeddings for each path.
+    """
+    embeddings_cache = {}
+    unique_paths_list = list(unique_paths)
+
+    for i in tqdm(range(0, len(unique_paths_list), BATCH_SIZE), desc="Precomputing embeddings", position=0, leave=False, total=len(unique_paths_list) // BATCH_SIZE):
+        # Batch paths to process
+        batch_paths = unique_paths_list[i:i + BATCH_SIZE]
+        
+        # Convert tuples to strings for tokenization
+        batch_paths_strings = [tuple_to_string(path) for path in batch_paths]
+        
+        # Tokenize paths
+        tokenized_inputs = tokenize_paths(batch_paths_strings, tokenizer, device)
+        
+        # Compute embeddings
+        embeddings = compute_embeddings(tokenized_inputs, model)
+
+        # Add embeddings to cache using original tuples as keys
+        for original_path, embedding in zip(batch_paths, embeddings):
+            embeddings_cache[original_path] = embedding
+
+        # Add embeddings to cache
+        for path, embedding in zip(batch_paths, embeddings):
+            embeddings_cache[path] = embedding
+
+    return embeddings_cache
+
+
+def calculate_similarities(df, embeddings_cache):
+    """
+    Calculate cosine similarities between path1 and path2 using precomputed embeddings.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing 'path1' and 'path2' columns.
+        embeddings_cache (dict): Precomputed embeddings for paths.
+
+    Returns:
+        list: List of cosine similarity scores for each row in the DataFrame.
+    """
+    similarities = []
+
+    for i in range(0, len(df), BATCH_SIZE):
+        batch = df.iloc[i:i + BATCH_SIZE]
+        path1_batch = batch["path1"].tolist()
+        path2_batch = batch["path2"].tolist()
+
+        # Retrieve embeddings from cache
+        embedding1_batch = torch.stack([embeddings_cache[path] for path in path1_batch])
+        embedding2_batch = torch.stack([embeddings_cache[path] for path in path2_batch])
+
+        # Calculate cosine similarity
+        embedding1_batch = embedding1_batch.cpu().numpy()
+        embedding2_batch = embedding2_batch.cpu().numpy()
+        similarities_batch = cosine_similarity(embedding1_batch, embedding2_batch)
+        similarities.extend(similarities_batch.diagonal())
+
+    return similarities
+
+
+def calculate_cosine_similarity(df, model, tokenizer, device):
+    """
+    Main function to calculate cosine similarity between path1 and path2.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing 'path1' and 'path2' columns.
+        model (PreTrainedModel): Pretrained model to compute embeddings.
+        tokenizer (PreTrainedTokenizer): Tokenizer to tokenize paths.
+        device (str): Device to use for computation (e.g., 'cpu' or 'cuda').
+        
+        
+    Returns:
+        pd.DataFrame: DataFrame with an additional column 'cosine_similarity'.
+    """
+    # Extract unique paths from path1 and path2 columns
+    unique_paths = set(df["path1"]).union(df["path2"])
+
+    # Precompute embeddings for unique paths
+    embeddings_cache = precompute_embeddings(unique_paths, model, tokenizer, device)
+
+    # Calculate similarities between path1 and path2 for each row
+    similarities = calculate_similarities(df, embeddings_cache)
+
+    # Add the similarity as a new column to the DataFrame
+    df["cosine_similarity"] = similarities
+
+    return df
 
 
 def process_schema(schema_name, filename):
@@ -1064,6 +1233,7 @@ def preprocess_data(schemas, filename, ground_truth_file):
         filename (str): Filename to save the resulting DataFrame.
         ground_truth_file (str): Filename to save the ground truth definitions.
     """
+
     ground_truths = defaultdict(dict)
     
     total_schemas = len(schemas)
@@ -1076,12 +1246,12 @@ def preprocess_data(schemas, filename, ground_truth_file):
     properties = 0
     
     # Limit the number of concurrent workers to prevent memory overload
-    for i in range(0, len(schemas), BATCH_SIZE):
+    for i in tqdm(range(0, len(schemas), BATCH_SIZE), position=0, desc="Processing schemas", leave=True, total=len(schemas)):
         batch = schemas[i:i+BATCH_SIZE]
-        with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
+        with concurrent.futures.ProcessPoolExecutor() as executor:
             futures = {executor.submit(process_schema, schema, filename): schema for schema in batch}
 
-            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), position=1, desc="Processing schemas", leave=False):
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), position=1, desc="Processing batch", leave=False):
                 try:
                     df, frequent_ref_defn_paths, schema_name, failure_flags = future.result()
                     
@@ -1097,7 +1267,6 @@ def preprocess_data(schemas, filename, ground_truth_file):
                         ground_truths[schema_name] = frequent_ref_defn_paths
                         
                         if filename != "baseline_test_data.csv":
-                            print(f"Sampling data for {schema_name}...", flush=True)
                             df = get_samples(df, frequent_ref_defn_paths, best_good_pairs=True)
                         
                         # Append batch to CSV to avoid holding everything in memory
