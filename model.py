@@ -5,6 +5,7 @@ import jsonref
 import math
 import networkx as nx
 import os
+import pandas as pd
 import subprocess
 import sys
 import torch
@@ -12,9 +13,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 
-from adapters import AdapterTrainer, AutoAdapterModel
+from adapters import AutoAdapterModel
 from collections import defaultdict, OrderedDict
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
+from itertools import combinations
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, precision_score, recall_score, f1_score, accuracy_score
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim import AdamW
@@ -33,7 +35,6 @@ JSON_FOLDER = "processed_jsons"
 BATCH_SIZE = 120
 HIDDEN_SIZE = 768
 JSON_SUBSCHEMA_KEYWORDS = {"allOf", "oneOf", "anyOf", "not"}
-
 
 
 # https://stackoverflow.com/a/73704579
@@ -141,6 +142,7 @@ def tokenize_schema(schema, tokenizer):
     """
     tokens = tokenizer(json.dumps(schema), return_tensors="pt")["input_ids"]
     tokens = tokens.squeeze(0).tolist()
+    tokens = tokens[1:-1]
     return tokens
 
 
@@ -173,7 +175,7 @@ def merge_schema_tokens(df, tokenizer):
         # Tokenize schemas
         tokenized_schema1 = tokenize_schema(ordered_schema1, tokenizer)
         tokenized_schema2 = tokenize_schema(ordered_schema2, tokenizer)
-
+     
         total_len = len(tokenized_schema1) + len(tokenized_schema2)
         max_tokenized_len = MAX_TOK_LEN - 3  # Account for BOS, EOS, and newline token lengths
 
@@ -202,6 +204,26 @@ def merge_schema_tokens(df, tokenizer):
     return df
 
 
+def compare_prefixes(path1, path2):
+    """
+    Compares the prefixes (all elements except the last) of two paths.
+
+    Args:
+        path1 (list or tuple): The first path, e.g., a list or tuple of elements.
+        path2 (list or tuple): The second path, e.g., a list or tuple of elements.
+
+    Returns:
+        int: 1 if the prefixes are the same, 0 otherwise.
+    """
+
+    # Extract prefixes
+    prefix1 = path1[:-1]
+    prefix2 = path2[:-1]
+
+    # Compare prefixes
+    return 1 if prefix1 == prefix2 else 0
+
+
 class CustomDataset(Dataset):
     """
     Custom PyTorch Dataset class for training and testing the model.
@@ -213,6 +235,7 @@ class CustomDataset(Dataset):
         dict: A dictionary containing the input IDs, attention mask, label, and nesting depths of the schemas.
     """
 
+    
     def __init__(self, dataframe):
         self.data = dataframe
 
@@ -222,17 +245,15 @@ class CustomDataset(Dataset):
     def __getitem__(self, idx):
         tokenized_schema = self.data.iloc[idx]["tokenized_schema"]
         label = self.data.iloc[idx]["label"]
-        path1 = self.data.iloc[idx]["path1"]
-        path2 = self.data.iloc[idx]["path2"]
-        nesting_depth1 = len(path1)
-        nesting_depth2 = len(path2)
-
+        nesting_depth1 = self.data.iloc[idx]["nesting_depth1"]
+        nesting_depth2 = self.data.iloc[idx]["nesting_depth2"]
+        similarity = self.data.iloc[idx]["cosine_similarity"]
+        
         return {
             "input_ids": tokenized_schema,
             "attention_mask": [1] * len(tokenized_schema),
             "label": label,
-            "nesting_depth1": nesting_depth1,
-            "nesting_depth2": nesting_depth2,
+            "extra_features": [nesting_depth1, nesting_depth2, similarity]
         }
 
 
@@ -240,8 +261,7 @@ def collate_fn(batch, tokenizer):
     input_ids = [torch.tensor(item["input_ids"]) for item in batch]
     attention_mask = [torch.tensor(item["attention_mask"]) for item in batch]
     labels = torch.tensor([item["label"] for item in batch])
-    nesting_depth1 = torch.tensor([item["nesting_depth1"] for item in batch])
-    nesting_depth2 = torch.tensor([item["nesting_depth2"] for item in batch])
+    extra_features = torch.tensor([item["extra_features"] for item in batch])
 
     padded_input_ids = pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
     padded_attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
@@ -250,8 +270,60 @@ def collate_fn(batch, tokenizer):
         "input_ids": padded_input_ids,
         "attention_mask": padded_attention_mask,
         "label": labels,
-        "nesting_depth1": nesting_depth1,
-        "nesting_depth2": nesting_depth2
+        "extra_features": extra_features
+    }
+
+
+class CustomEvalDataset(Dataset):
+    """
+    Custom PyTorch Dataset class for Evaluating the model.
+
+    Args:
+        dataframe (pd.DataFrame): DataFrame containing the tokenized schemas.
+
+    Returns:
+        dict: A dictionary containing the input IDs, attention mask and nesting depths of the schemas.
+    """
+
+    def __init__(self, dataframe):
+        self.data = dataframe
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        tokenized_schema = self.data.iloc[idx]["tokenized_schema"]
+        path1 = self.data.iloc[idx]["path1"]
+        path2 = self.data.iloc[idx]["path2"]
+        nesting_depth1 = self.data.iloc[idx]["nesting_depth1"]
+        nesting_depth2 = self.data.iloc[idx]["nesting_depth2"]
+        similarity = self.data.iloc[idx]["cosine_similarity"]
+
+        return {
+            "input_ids": tokenized_schema,
+            "attention_mask": [1] * len(tokenized_schema),
+            "extra_features": [nesting_depth1, nesting_depth2, similarity],
+            "path1": path1,
+            "path2": path2
+        }
+    
+
+def collate_eval_fn(batch, tokenizer):
+    input_ids = [torch.tensor(item["input_ids"]) for item in batch]
+    attention_mask = [torch.tensor(item["attention_mask"]) for item in batch]
+    extra_features = torch.tensor([item["extra_features"] for item in batch])
+    path1 = [item["path1"] for item in batch]
+    path2 = [item["path2"] for item in batch]
+
+    padded_input_ids = pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
+    padded_attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+
+    return {
+        "input_ids": padded_input_ids,
+        "attention_mask": padded_attention_mask,
+        "extra_features": extra_features,
+        "path1": path1,
+        "path2": path2
     }
 
 
@@ -269,32 +341,49 @@ class CustomBERTModel(nn.Module):
         self.codebert.train_adapter(ADAPTER_NAME)
 
         # Custom layers for processing additional inputs
-        self.nesting_depth1 = nn.Linear(1, HIDDEN_SIZE) 
-        self.nesting_depth2 = nn.Linear(1, HIDDEN_SIZE)
+        self.extra_features = nn.Linear(3, HIDDEN_SIZE) 
 
         # Final classifier to process concatenated logits and custom features
-        self.modified_classifier = nn.Linear(HIDDEN_SIZE * 2 + 2, 2)
+        self.modified_classifier = nn.Linear(HIDDEN_SIZE + 2, 2)
 
 
-    def forward(self, input_ids, attention_mask, nesting_depth1, nesting_depth2):
+    def forward(self, input_ids, attention_mask, extra_features):
         # Pass input through the pre-trained CodeBERT with the adapter
         outputs = self.codebert(input_ids=input_ids, attention_mask=attention_mask)
         
         # Extract the logits from the classification head
         logits = outputs.logits
 
-        # Process nesting depths with custom layers
-        depth1_emb = F.relu(self.nesting_depth1(nesting_depth1.unsqueeze(-1).float()))
-        depth2_emb = F.relu(self.nesting_depth2(nesting_depth2.unsqueeze(-1).float()))
-        
-        # Concatenate the [CLS] output with the embeddings of depth1 and depth2
-        combined_output = torch.cat([logits, depth1_emb, depth2_emb], dim=-1)
+        # Process the additional input features with the custom layer
+        extra_features_emb = F.relu(self.extra_features(extra_features.float()))
+
+        # Concatenate the CodeBERT logits and the processed feature embeddings
+        combined_output = torch.cat([logits, extra_features_emb], dim=-1)
         
         # Pass the combined output through the final classification layer
         logits = self.modified_classifier(combined_output)
     
         return logits
             
+
+def normalize_nesting_depths(df, max_depth=6):
+    """
+    Calculates and normalizes the nesting depths by dividing by max_depth for a DataFrame, with optional capping at max_depth.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing path1 and path2 columns.
+        max_depth (int): Maximum allowable depth for normalization.
+
+    Returns:
+        pd.DataFrame: DataFrame with normalized nesting depths.
+    """
+
+    # Calculate nesting depths and cap at max_depth
+    df["nesting_depth1"] = df["path1"].apply(lambda path: min(len(ast.literal_eval(path)), max_depth) / max_depth)
+    df["nesting_depth2"] = df["path2"].apply(lambda path: min(len(ast.literal_eval(path)), max_depth) / max_depth)
+    
+    return df
+
 
 def compute_metrics(pred: EvalPrediction):
     """
@@ -342,7 +431,6 @@ def save_model_and_adapter(model, save_path="frequent_pattern_model"):
     model.codebert.save_adapter(path, ADAPTER_NAME)  
 
 
-
 def train_model(train_df, test_df):
     """
     Trains the model using an AdapterTrainer, logging metrics with wandb and evaluating at each epoch.
@@ -354,7 +442,7 @@ def train_model(train_df, test_df):
     # Hyperparameters
     accumulation_steps = 4
     learning_rate = 1e-6
-    num_epochs = 75
+    num_epochs = 50
 
     # Initialize wandb logging
     wandb.init(
@@ -382,9 +470,14 @@ def train_model(train_df, test_df):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
+    # Process and normalize nesting depths for training and testing
+    train_df = normalize_nesting_depths(train_df, max_depth=6)
+    test_df = normalize_nesting_depths(test_df, max_depth=6)
+
     # Merge tokens for each schema in the training and testing DataFrames
     train_df = merge_schema_tokens(train_df, tokenizer)
     test_df = merge_schema_tokens(test_df, tokenizer)
+
 
     # Create datasets with dynamic padding and batching
     train_dataset = CustomDataset(train_df)
@@ -407,15 +500,15 @@ def train_model(train_df, test_df):
     pbar = tqdm(range(num_epochs), position=0, desc="Epoch")
     for epoch in pbar:
         total_loss = 0
-        for i, batch in enumerate(tqdm(train_dataloader, position=1, total=len(train_dataloader), desc="Training")):
+        for i, batch in enumerate(tqdm(train_dataloader, position=1, total=len(train_dataloader), leave=False, desc="Training")):
             batch = {k: v.to(device) for k, v in batch.items()}
-            input_ids, attention_mask, labels, nesting_depth1, nesting_depth2 = batch["input_ids"], batch["attention_mask"], batch["label"], batch["nesting_depth1"], batch["nesting_depth2"]
+            input_ids, attention_mask, labels, extra_features = batch["input_ids"], batch["attention_mask"], batch["label"], batch["extra_features"]
 
             # Zero the gradients
             optimizer.zero_grad()
 
             # Forward pass
-            logits = model(input_ids=input_ids, attention_mask=attention_mask, nesting_depth1=nesting_depth1, nesting_depth2=nesting_depth2)
+            logits = model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)
   
             # Calculate the training loss
             training_loss = loss_fn(logits, labels)
@@ -438,7 +531,7 @@ def train_model(train_df, test_df):
         average_loss = total_loss / len(train_dataloader)
 
         # Test the model
-        testing_loss = test_model(test_df, tokenizer, model, device, wandb)
+        test_model(test_df, tokenizer, model, device, wandb)
 
         wandb.log({
             "training_loss": average_loss,
@@ -451,9 +544,24 @@ def train_model(train_df, test_df):
     save_model_and_adapter(model)
     # Finish wandb logging
     wandb.finish()
-
+    
 
 def test_model(test_df, tokenizer, model, device, wandb):
+    """
+    Tests the model on a given dataset and logs the evaluation metrics.
+
+    Args:
+        test_df (pd.DataFrame): DataFrame with testing data.
+        tokenizer (PreTrainedTokenizer): The tokenizer used for processing schemas.
+        model (CustomBERTModel): The model to evaluate.
+        device (torch.device): The device to run the model on.
+        wandb: The wandb object for logging.
+
+    Returns:
+        float: The average testing loss.
+    """
+
+    # Create datasets with dynamic padding and batching
     test_dataset = CustomDataset(test_df)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda batch: collate_fn(batch, tokenizer))
 
@@ -467,12 +575,12 @@ def test_model(test_df, tokenizer, model, device, wandb):
     total_predicted_labels = []
 
     with torch.no_grad():
-        for batch in tqdm(test_loader, total=len(test_loader), desc="Testing"):
+        for batch in tqdm(test_loader, total=len(test_loader), leave=False, desc="Testing"):
             batch = {k: v.to(device) for k, v in batch.items()}
-            input_ids, attention_mask, labels, nesting_depth1, nesting_depth2 = batch["input_ids"], batch["attention_mask"], batch["label"], batch["nesting_depth1"], batch["nesting_depth2"]
+            input_ids, attention_mask, labels, extra_features = batch["input_ids"], batch["attention_mask"], batch["label"], batch["extra_features"]
 
             # Forward pass
-            logits = model(input_ids=input_ids, attention_mask=attention_mask, nesting_depth1=nesting_depth1, nesting_depth2=nesting_depth2)
+            logits = model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)   
             
             # Calculate the testing loss
             testing_loss = loss_fn(logits, labels)
@@ -500,6 +608,9 @@ def test_model(test_df, tokenizer, model, device, wandb):
     wandb.log({"accuracy": accuracy, "testing_loss": average_loss, "precision": precision, "recall": recall, "F1": f1})
 
     return average_loss
+
+
+
 
 
 def get_schema_paths(schema, current_path=('$',)):
@@ -606,27 +717,24 @@ def load_model_and_adapter(save_path="frequent_pattern_model"):
         AutoTokenizer: The tokenizer used for processing schemas.
     """
     # Initialize a new instance of the custom model and tokenizer
-    model = CustomBERTModel()
+    custom_model = CustomBERTModel()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     # Load the base CodeBERT model and adapter
-    model.codebert = AutoAdapterModel.from_pretrained(save_path)
-    model.codebert.load_adapter(save_path, load_as=ADAPTER_NAME)
-    model.codebert.set_active_adapters(ADAPTER_NAME)
-
-    # Load the state_dict for the custom layers
-    #model.load_state_dict(torch.load(os.path.join(save_path, "frequent_patterns_model_state_dict.pth")))
-
-    return model, tokenizer
+    custom_model.codebert = AutoAdapterModel.from_pretrained(save_path)
+    custom_model.codebert.load_adapter(save_path, load_as=ADAPTER_NAME)
+    custom_model.codebert.set_active_adapters(ADAPTER_NAME)
 
 
+    return custom_model, tokenizer
 
-def find_pairs_with_common_properties(df):
+
+def find_pairs_with_common_properties(normalized_df):
     """
     Generate pairs of paths from a DataFrame where the schemas have at least two properties in common.
 
     Args:
-        df (pd.DataFrame): A DataFrame containing path information.
+        normalized_df (pd.DataFrame): A DataFrame containing path information.
 
     Yields:
         tuple: A tuple containing the indices of the two paths (i, j) and a set of common properties between their schemas.
@@ -636,7 +744,7 @@ def find_pairs_with_common_properties(df):
     properties_list = [
         set(json.loads(row["schema"]).get("properties", {}).keys())
         if isinstance(row["schema"], str) else set()
-        for _, row in df.iterrows()
+        for _, row in normalized_df.iterrows()
     ]
 
     # Compare pairs of schemas
@@ -647,135 +755,76 @@ def find_pairs_with_common_properties(df):
                 yield i, j, sorted(common_properties)
 
 
-def merge_eval_schema_tokens(batch, df, tokenizer):
+def create_schema_pairs_with_common_properties(df):
     """
-    Merge the tokens of two schemas for evaluation, with truncation if necessary to fit the maximum token length.
+    Create a DataFrame with pairs of schemas that have at least two common properties.
 
     Args:
-        batch (list): A list of tuples containing the indices of the two schemas and a set of common properties.
-        df (pd.DataFrame): DataFrame containing the paths and schemas.
-        tokenizer (PreTrainedTokenizer): Tokenizer used for processing schemas.
+        df (pd.DataFrame): Input DataFrame containing columns 'path', 'schema', and 'filename'.
 
     Returns:
-        list: A list of merged tokenized schemas, adhering to token length constraints.
+        pd.DataFrame: A new DataFrame with columns 'path1', 'path2', 'schema1', 'schema2', 'filename',
+                      where the pairs of schemas have at least two properties in common.
     """
-    
-    # Special tokens
-    bos_token_id = tokenizer.bos_token_id  # [BOS]
-    sep_token_id = tokenizer.sep_token_id  # [SEP]
-    eos_token_id = tokenizer.eos_token_id  # [EOS]
+    # Precompute properties for all schemas
+    properties_list = []
+    for schema in df["schema"]:
+        if isinstance(schema, str):
+            properties_list.append(set(json.loads(schema).get("properties", {}).keys()))
+        else:
+            properties_list.append(set())
 
-    tokenized_schemas = []
+    # Prepare an empty list to collect valid pairs
+    rows = []
 
-    # Loop through the entire batch passed in as 'pairs'
-    for i1, i2, common_properties in batch:
-        schema1 = json.loads(df["schema"].iloc[i1])
-        schema2 = json.loads(df["schema"].iloc[i2])
+    # Generate all unique pairs using combinations
+    for (idx1, row1), (idx2, row2) in combinations(df.iterrows(), 2):
+        common_properties = properties_list[idx1] & properties_list[idx2]
+        if len(common_properties) >= 2:
+            rows.append({
+                "filename": row1["filename"],
+                "path1": row1["path"],
+                "path2": row2["path"],
+                "schema1": row1["schema"],
+                "schema2": row2["schema"],
+            })
 
-        # Order properties by commonality
-        ordered_schema1, ordered_schema2 = order_properties_by_commonality(schema1, schema2)
-        
-        # Tokenize schemas
-        tokenized_schema1 = tokenize_schema(ordered_schema1, tokenizer)
-        tokenized_schema2 = tokenize_schema(ordered_schema2, tokenizer)
-        
-        # Calculate the total length of the merged tokenized schemas
-        total_len = len(tokenized_schema1) + len(tokenized_schema2)
-        max_tokenized_len = MAX_TOK_LEN - 3  # Account for BOS, EOS, and newline token lengths
-
-        # Truncate the schemas proportionally if they exceed the max token length
-        if total_len > max_tokenized_len:
-            truncate_len = total_len - max_tokenized_len
-            truncate_len1 = math.ceil(len(tokenized_schema1) / total_len * truncate_len)
-            truncate_len2 = math.ceil(len(tokenized_schema2) / total_len * truncate_len)
-            tokenized_schema1 = tokenized_schema1[:-truncate_len1]
-            tokenized_schema2 = tokenized_schema2[:-truncate_len2]
-
-        # Merge tokens including the similarity token
-        merged_tokenized_schema = (
-            [bos_token_id] +  # Add [BOS] at the beginning
-            tokenized_schema1 +
-            [sep_token_id] +  # Add [SEP] between schemas
-            tokenized_schema2 +
-            [eos_token_id]  # Add [EOS] at the end
-        )
-
-        tokenized_schemas.append(merged_tokenized_schema)
-        
-    return tokenized_schemas
+    # Create a new DataFrame from the collected pairs
+    return pd.DataFrame(rows)
 
 
-def process_pairs(batch, df, model, device, tokenizer):
-    """
-    Process a batch of schema pairs and return edges for connected pairs.
-
-    Args:
-        batch (list): A list of tuples containing the indices of the two schemas and a set of common properties.
-        df (pd.DataFrame): DataFrame containing the paths and schemas.
-        model (PreTrainedModel): The model used for predicting connections.
-        device (torch.device): The device to run the model on.
-        tokenizer (PreTrainedTokenizer): The tokenizer used for processing schemas.
-
-    Returns:
-        list[tuple]: A list of tuples where each tuple contains the paths of two schemas that are predicted to be connected.
-    """
-    batch_edges = []
-    batch_input_ids = []
-    batch_attention_masks = []
-
-    # Tokenize and merge schemas
-    tokenized_schemas = merge_eval_schema_tokens(batch, df, tokenizer)
-    
-    # Loop through each tokenized schema in the batch
-    for tokenized_schema in tokenized_schemas:
-        # Convert tokens to tensors 
-        input_ids = torch.tensor(tokenized_schema, dtype=torch.long).to(device)
-        attention_mask = torch.ones(input_ids.shape, dtype=torch.long).to(device)
-        batch_input_ids.append(input_ids)
-        batch_attention_masks.append(attention_mask)
-
-    # Pad batch tensors to have the same length, then stack
-    batch_input_ids = torch.nn.utils.rnn.pad_sequence(batch_input_ids, batch_first=True)
-    batch_attention_masks = torch.nn.utils.rnn.pad_sequence(batch_attention_masks, batch_first=True)
-    
-    # Run the batch through the model
-    with torch.no_grad():
-        outputs = model(input_ids=batch_input_ids, attention_mask=batch_attention_masks)
-        preds = torch.argmax(outputs.logits, dim=-1).tolist()
-    
-    # Append edges based on predictions
-    for idx, pred in enumerate(preds):
-        if pred == 1:
-            i1, i2, _ = batch[idx]
-            batch_edges.append((df["path"].iloc[i1], df["path"].iloc[i2]))
-    
-    return batch_edges
-
-
-def build_definition_graph(df, model, device, tokenizer, schema_name):
+def build_definition_graph(eval_loader, custom_model, device, schema_name):
     """
     Build a definition graph from tokenized schema pairs using the given model, with batching.
 
     Args:
-        df (pd.DataFrame): A DataFrame containing paths and their tokenized schemas.
-        model (PreTrainedModel): The model used for predicting connections.
+        eval_loader (DataLoader): DataLoader containing the tokenized schema pairs.
+        custom_model (PreTrainedModel): The model used for predicting connections.
         device (torch.device): The device (CPU or GPU) to run the model on.
-        tokenizer (PreTrainedTokenizer): The tokenizer used for processing schemas.
         schema_name (str): The name of the schema.
 
     Returns:
         nx.Graph: A graph with edges representing predicted connections between pairs.
     """
     graph = nx.Graph()
-    pairs = list(find_pairs_with_common_properties(df))
-    
     edges = []
-    with tqdm(total=len(pairs), desc="Processing pairs for " + schema_name, position=0, leave=True) as pbar:
-        for batch_start in range(0, len(pairs), BATCH_SIZE):
-            batch = pairs[batch_start: batch_start + BATCH_SIZE]
-            batch_edges = process_pairs(batch, df, model, device, tokenizer)
-            edges.extend(batch_edges)
-            pbar.update(len(batch))
+    for batch in tqdm(eval_loader, total=len(eval_loader), leave=False, desc="Processing pairs for " + schema_name):
+        batch = {k: v.to(device) for k, v in batch.items()}
+        print(batch)
+        input_ids, attention_mask, extra_features = batch["input_ids"], batch["attention_mask"], batch["extra_features"]
+
+        # Model prediction
+        with torch.no_grad():
+            outputs = custom_model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)
+            preds = torch.argmax(outputs.logits, dim=-1).tolist()
+        
+        # Append edges based on predictions
+        for idx, pred in enumerate(preds):
+            if pred == 1:
+                path1 = batch["path1"][idx]
+                path2 = batch["path2"][idx]
+                print(f"Adding edge between {path1} and {path2}")
+                edges.append((path1, path2))
 
     # Add edges to the graph
     graph.add_edges_from(edges)
@@ -912,21 +961,34 @@ def evaluate_single_schema(schema, device, test_ground_truth):
     """
 
     # Load the model and tokenizer
-    m, tokenizer = load_model_and_adapter()
+    custom_model, tokenizer = load_model_and_adapter()
 
     # Enable multiple GPU usage with DataParallel
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs for model parallelism.")
-        m = nn.DataParallel(m)
+        custom_model = nn.DataParallel(custom_model)
 
-    m.to(device)
-    m.eval()
+    custom_model.to(device)
+    custom_model.eval()
 
-    filtered_df, frequent_ref_defn_paths, schema_name, failure_flags = process_data.process_schema(schema, "")
-    if filtered_df is not None and frequent_ref_defn_paths is not None:
+    df, frequent_ref_defn_paths, schema_name, failure_flags = process_data.process_schema(schema, "")
+    if df is not None and frequent_ref_defn_paths is not None:
+        
+        # Create a DataFrame with pairs of schemas that have at least two common properties
+        pairs_df = create_schema_pairs_with_common_properties(df)
+
+        # Process and normalize nesting depths for evaluation
+        normalized_df = normalize_nesting_depths(pairs_df, scaler=scaler, fit_scaler=False, max_depth=6)
+
+        # Tokenize and merge schemas
+        eval_df = merge_schema_tokens(normalized_df, tokenizer)
+
+        # Create datasets with dynamic padding and batching
+        eval_dataset = CustomEvalDataset(eval_df)
+        eval_loader = DataLoader(eval_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda batch: collate_eval_fn(batch, tokenizer))
         
         # Build a definition graph
-        graph = build_definition_graph(filtered_df, m, device, tokenizer, schema_name)
+        graph = build_definition_graph(eval_loader, custom_model, device, schema_name)
         
         # Predict clusters and sort each predicted cluster alphabetically
         predicted_clusters = [sorted(cluster) for cluster in find_definitions_from_graph(graph)]
@@ -967,10 +1029,10 @@ def evaluate_data(test_ground_truth, output_file="evaluation_results.json"):
     results = []
 
     # Process schemas in parallel using 
-    with ThreadPoolExecutor() as executor:
+    with ProcessPoolExecutor() as executor:
         futures = {
             executor.submit(evaluate_single_schema, schema, device, test_ground_truth): schema 
-            for schema in test_schemas
+            for schema in test_schemas[2:3]
         }
 
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), position=1):
