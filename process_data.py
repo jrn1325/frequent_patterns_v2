@@ -693,7 +693,7 @@ def create_dataframe(paths_dict, paths_to_exclude):
     columns = ["path", "nesting_depth", "tokenized_schema", "schema"]
     df = pd.DataFrame(df_data, columns=columns)
     
-    return df.sort_values(by="path")
+    return df
 
 
 def create_dataframe_baseline_model(paths_dict, paths_to_exclude):
