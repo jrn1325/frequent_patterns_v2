@@ -905,10 +905,15 @@ def get_samples(df, frequent_ref_defn_paths, best_good_pairs):
     # Process bad paths
     if len(paths) > len(all_good_paths):
         all_pairs = list(itertools.combinations(paths, 2))
+
+        # Create a set of schemas for all good paths for quick lookup
+        good_schemas = set(df.loc[df["path"].isin(all_good_paths), "schema"])
         
         # Loop through all pairs and add to bad pairs if not in good pairs
         for path1, path2 in all_pairs:
-            if (path1, path2) not in all_good_pairs and (path2, path1) not in all_good_pairs:
+            if ((path1, path2) not in all_good_pairs and (path2, path1) not in all_good_pairs and
+            df.loc[df["path"] == path1, "schema"].values[0] not in good_schemas and
+            df.loc[df["path"] == path2, "schema"].values[0] not in good_schemas):
                 all_bad_pairs.add((path1, path2))
 
         # Calculate distances for bad pairs
