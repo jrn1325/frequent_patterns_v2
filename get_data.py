@@ -3,6 +3,7 @@ import os
 import shutil
 import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from copy import deepcopy
 from jsonschema.validators import validator_for
 
 # Use os.path.expanduser to expand '~' to the full home directory path
@@ -219,8 +220,8 @@ def process_single_dataset(dataset):
             - exist: 1 if the dataset was skipped due to not existing, else 0
             - empty: 1 if the dataset is empty, else 0
             - loaded: 1 if the schema failed to load, else 0
+            - definition: 1 if the schema has missing definitions, else 0
             - modified: 1 if the schema failed to be modified, else 0
-            - pattern_properties: 1 if the schema has patternProperties, else 0
             - validation: 1 if the schema failed to validate, else 0
     """
     # Initialize failure flags
@@ -239,49 +240,52 @@ def process_single_dataset(dataset):
     # Check if the dataset exists
     if not os.path.exists(dataset_path):
         print(f"Dataset {dataset} does not exist in {JSON_FOLDER}. Skipping...")
-        failure_flags["exist"] = 1 
+        failure_flags["exist"] = 1
         return failure_flags
     
     # Check if the dataset is empty
     if os.stat(dataset_path).st_size == 0:
         print(f"Dataset {dataset} is empty. Skipping...")
-        failure_flags["empty"] = 1 
+        failure_flags["empty"] = 1
         return failure_flags
 
     # Load the schema
     schema = load_schema(schema_path)
+    
     if schema is None:
         print(f"Failed to load schema for {dataset}.")
-        failure_flags["loaded"] = 1 
+        failure_flags["loaded"] = 1
         return failure_flags
     
     # Check if the schema contains definitions
     if not if_definition_exists(schema):
         print(f"Skipping {dataset} due to missing definitions in the schema.")
-        failure_flags["definition"] = 1 
+        failure_flags["definition"] = 1
         return failure_flags
 
+    # Make a deep copy of the schema to ensure modifications don't affect the original
+    modified_schema = deepcopy(schema)
+    
     # Try modifying the schema to prevent additional properties
     try:
-        modified_schema = prevent_additional_properties(schema)
+        modified_schema = prevent_additional_properties(modified_schema)
         print(f"Successfully modified schema {dataset}.")
     except Exception as e:
         print(f"Error modifying schema for {dataset}: {e}. Reverting to original schema.")
-        failure_flags["modified"] = 1 
+        failure_flags["modified"] = 1
         modified_schema = schema
 
     # Validate all documents against the modified schema
-    all_docs, invalid_docs_count = validate_all_documents(dataset_path, schema)
+    all_docs, invalid_docs_count = validate_all_documents(dataset_path, modified_schema)
     print(f"Total number of documents in {dataset} is {len(all_docs)}")
     print(f"Number of invalid documents in {dataset} is {invalid_docs_count}")
 
     # Save the schema only if there are valid documents
     if len(all_docs) > 0:
-        # Revert to dereferenced schema if validation fails for at lleast 1 document
-        if invalid_docs_count == 0:
-            print(f"All documents in {dataset} passed validation with modified schema.")
-        else:
-            print(f"Validation failed for at least one document in {dataset}, reverting to original schema.")
+        # Revert to original schema if validation fails for any document
+        if invalid_docs_count > 0:
+            print(f"Validation failed for at least one document in {dataset}. Reverting to original schema.")
+            modified_schema = schema
         
         # Save the schema to the processed_schemas folder
         if save_json_schema(modified_schema, dataset):
@@ -289,7 +293,7 @@ def process_single_dataset(dataset):
             save_json_documents(all_docs, dataset)
     else:
         print(f"No valid documents found for {dataset}. Skipping schema save.")
-        failure_flags["validation"] = 1 
+        failure_flags["validation"] = 1
         return failure_flags
 
     return failure_flags
