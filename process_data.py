@@ -471,7 +471,8 @@ def process_dataset(dataset, filename):
                 print(f"Error processing line in {dataset}: {e}", flush=True)
                 continue
 
-    return paths_dict if paths_dict else None
+    # Return the dictionary of paths and their values and number of documents
+    return paths_dict, num_docs
     
 
 def path_matches_with_wildkey(schema_path, json_path):
@@ -658,12 +659,36 @@ def discover_schema_from_values(values):
         return reduce(merge_schemas, (discover_schema(v) for v in values))
 
 
-def create_dataframe(paths_dict, paths_to_exclude):
+def calculate_path_frequency(values, num_docs):
+    """Calculate the frequency of a path relative to the number of documents."""
+    return len(values) / num_docs
+
+
+def calculate_nested_key_frequencies(parsed_values):
+    """Calculate frequencies of nested keys relative to their parent objects.
+    Args:
+        parsed_values (list): List of parsed JSON values.
+    Returns:
+        dict: Dictionary of nested key frequencies.
+    """
+    nested_frequencies = {}
+    for value in parsed_values:
+        if isinstance(value, dict):
+            for key in value.keys():
+                nested_frequencies[key] = nested_frequencies.get(key, 0) + 1
+    # Normalize frequencies
+    for key in nested_frequencies:
+        nested_frequencies[key] /= len(parsed_values)
+    return nested_frequencies
+
+
+def create_dataframe(paths_dict, paths_to_exclude, num_docs):
     """Create a DataFrame of paths and their values schema.
 
     Args:
         paths_dict (dict): Dictionary of paths and their values.
         paths_to_exclude (set): Paths to remove from JSON files.
+        num_docs (int): Number of documents in the dataset.
 
     Returns:
         pd.DataFrame: DataFrame with tokenized schema added.
@@ -680,17 +705,19 @@ def create_dataframe(paths_dict, paths_to_exclude):
         # Parse and discover the schema from values
         parsed_values = [json.loads(v) for v in values]
         schema = discover_schema_from_values(parsed_values)
-        
+
         # Check if the schema has more than one property
         if len(schema.get("properties", {})) > 1:
+            path_frequency = calculate_path_frequency(values, num_docs)
+            nested_keys_frequency = calculate_nested_key_frequencies(parsed_values)
             tokenized_schema = tokenize_schema(json.dumps(schema), tokenizer)
-            df_data.append([path, len(path), tokenized_schema, json.dumps(schema)])
+            df_data.append([path, len(path), path_frequency, nested_keys_frequency, tokenized_schema, json.dumps(schema)])
         else:
             # Update paths_to_exclude if schema has less than or equal to one property
             paths_to_exclude.add(path)
 
     # Create DataFrame from collected data
-    columns = ["path", "nesting_depth", "tokenized_schema", "schema"]
+    columns = ["path", "nesting_depth", "path_frequency", "nested_key_frequency", "tokenized_schema", "schema"]
     df = pd.DataFrame(df_data, columns=columns)
     
     return df
@@ -808,6 +835,10 @@ def label_samples(df, good_pairs, bad_pairs):
     paths1 = []
     paths2 = []
     labels = []
+    path1_freqs = []
+    path2_freqs = []
+    nested_key_freqs1 = []
+    nested_key_freqs2 = []
     schemas1 = [] 
     schemas2 = []  
     filenames = []  
@@ -821,6 +852,10 @@ def label_samples(df, good_pairs, bad_pairs):
         # Extract schemas and filename for both paths
         path1_row = df[df["path"] == path1].iloc[0]
         path2_row = df[df["path"] == path2].iloc[0]
+        path1_freqs.append(path1_row["path_frequency"])
+        path2_freqs.append(path2_row["path_frequency"])
+        nested_key_freqs1.append(path1_row["nested_key_frequency"])
+        nested_key_freqs2.append(path2_row["nested_key_frequency"])
         filenames.append(path1_row["filename"])
         schemas1.append(path1_row["schema"])
         schemas2.append(path2_row["schema"])
@@ -834,6 +869,10 @@ def label_samples(df, good_pairs, bad_pairs):
         # Extract schemas and filename for both paths
         path1_row = df[df["path"] == path1].iloc[0]
         path2_row = df[df["path"] == path2].iloc[0]
+        path1_freqs.append(path1_row["path_frequency"])
+        path2_freqs.append(path2_row["path_frequency"])
+        nested_key_freqs1.append(path1_row["nested_key_frequency"])
+        nested_key_freqs2.append(path2_row["nested_key_frequency"])
         filenames.append(path1_row["filename"])
         schemas1.append(path1_row["schema"])
         schemas2.append(path2_row["schema"])
@@ -844,6 +883,10 @@ def label_samples(df, good_pairs, bad_pairs):
         "path1": paths1,
         "path2": paths2,
         "label": labels,
+        "path1_freq": path1_freqs,
+        "path2_freq": path2_freqs,
+        "nested_key_freq1": nested_key_freqs1,
+        "nested_key_freq2": nested_key_freqs2,
         "schema1": schemas1,
         "schema2": schemas2
     })
@@ -901,19 +944,13 @@ def get_samples(df, frequent_ref_defn_paths, best_good_pairs):
             top_1000_good_pairs = nlargest(1000, good_pairs_distances, key=lambda x: x[1])
             sample_good_pairs.update(pair for pair, _ in top_1000_good_pairs)
 
-
-    # Process bad paths
     if len(paths) > len(all_good_paths):
+        # Process bad paths
         all_pairs = list(itertools.combinations(paths, 2))
-
-        # Create a set of schemas for all good paths for quick lookup
-        good_schemas = set(df.loc[df["path"].isin(all_good_paths), "schema"])
         
         # Loop through all pairs and add to bad pairs if not in good pairs
         for path1, path2 in all_pairs:
-            if ((path1, path2) not in all_good_pairs and (path2, path1) not in all_good_pairs and
-            df.loc[df["path"] == path1, "schema"].values[0] not in good_schemas and
-            df.loc[df["path"] == path2, "schema"].values[0] not in good_schemas):
+            if (path1, path2) not in all_good_pairs and (path2, path1) not in all_good_pairs:
                 all_bad_pairs.add((path1, path2))
 
         # Calculate distances for bad pairs
@@ -1159,7 +1196,7 @@ def process_schema(schema_name, filename):
     print("_________________________________________________________________________________________________________________________")
     '''
 
-    paths_dict = process_dataset(schema_name, filename)
+    paths_dict, num_docs = process_dataset(schema_name, filename)
     if paths_dict is None:
         failure_flags["path"] = 1
         #print(f"No paths extracted from {schema_name}.", flush=True)
@@ -1195,8 +1232,8 @@ def process_schema(schema_name, filename):
     if filename == "baseline_test_data.csv":
         df = create_dataframe_baseline_model(paths_dict, paths_to_exclude)
     else:
-        df = create_dataframe(paths_dict, paths_to_exclude)
-        #print(f"Number of paths in {schema_name}: {len(df)}", flush=True)
+        df = create_dataframe(paths_dict, paths_to_exclude, num_docs)
+        print(f"Number of paths in {schema_name}: {len(df)}", flush=True)
 
     # Update reference definitions
     updated_ref_defn_paths = update_ref_defn_paths(frequent_ref_defn_paths, df)
@@ -1354,4 +1391,5 @@ def main():
     
 
 if __name__ == "__main__":
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
     main()
