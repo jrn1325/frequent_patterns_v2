@@ -924,7 +924,7 @@ def get_samples(df, frequent_ref_defn_paths, best_good_pairs):
     paths = list(df["path"])
 
     # Process good paths
-    for ref_defn, good_paths in frequent_ref_defn_paths.items():
+    for ref_defn, good_paths in tqdm(frequent_ref_defn_paths.items(), desc="Processing good pairs", position=0, leave=False):
         all_good_paths.update(good_paths)
         good_pairs = list(itertools.combinations(good_paths, 2))
         all_good_pairs.update(good_pairs)
@@ -939,26 +939,38 @@ def get_samples(df, frequent_ref_defn_paths, best_good_pairs):
                 ((path1, path2), cosine(schema_embeddings[path1], schema_embeddings[path2]))
                 for path1, path2 in good_pairs
             ]
-
+            
             # Select top 1,000 pairs with greatest distances
             top_1000_good_pairs = nlargest(1000, good_pairs_distances, key=lambda x: x[1])
             sample_good_pairs.update(pair for pair, _ in top_1000_good_pairs)
-
+        
     if len(paths) > len(all_good_paths):
         # Process bad paths
         all_pairs = list(itertools.combinations(paths, 2))
+
+        # Create a set of schemas for all good paths for quick lookup
+        good_schemas = set(df.loc[df["path"].isin(all_good_paths), "schema"])
+
+        # Create a dictionary for path-to-schema mapping for faster lookups
+        path_to_schema = df.set_index("path")["schema"].to_dict()
         
         # Loop through all pairs and add to bad pairs if not in good pairs
         for path1, path2 in all_pairs:
-            if (path1, path2) not in all_good_pairs and (path2, path1) not in all_good_pairs:
-                all_bad_pairs.add((path1, path2))
-
+            if ((path1, path2) not in all_good_pairs and 
+                (path2, path1) not in all_good_pairs):
+                
+                schema1_good = path_to_schema.get(path1) in good_schemas
+                schema2_good = path_to_schema.get(path2) in good_schemas
+        
+                if not (schema1_good and schema2_good):
+                    all_bad_pairs.add((path1, path2))
+        
         # Calculate distances for bad pairs
         bad_pairs_distances = [
             ((path1, path2), cosine(schema_embeddings[path1], schema_embeddings[path2]))
             for path1, path2 in all_bad_pairs
         ]
-
+        
         # Select pairs with smallest distances 
         num_bad_pairs = min(len(sample_good_pairs), len(all_bad_pairs))
         top_bad_pairs = nsmallest(num_bad_pairs, bad_pairs_distances, key=lambda x: x[1])
