@@ -514,7 +514,8 @@ def check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, prefix_paths
     for ref_defn, schema_paths in cleaned_ref_defn_paths.items():
         for schema_path in schema_paths:
             for json_path in json_paths_set:
-                if path_matches_with_wildkey(schema_path, json_path):
+                #if path_matches_with_wildkey(schema_path, json_path):
+                if schema_path == json_path:
                     filtered_ref_defn_paths[ref_defn].add(json_path)
 
     return filtered_ref_defn_paths
@@ -880,9 +881,9 @@ def label_samples(df, good_pairs, bad_pairs):
     # Create a new DataFrame with separate columns for path1 and path2
     labeled_df = pd.DataFrame({
         "filename": filenames,
+        "label": labels,
         "path1": paths1,
         "path2": paths2,
-        "label": labels,
         "path1_freq": path1_freqs,
         "path2_freq": path2_freqs,
         "nested_key_freq1": nested_key_freqs1,
@@ -947,10 +948,10 @@ def get_samples(df, frequent_ref_defn_paths, best_good_pairs):
     if len(paths) > len(all_good_paths):
         # Process bad paths
         all_pairs = list(itertools.combinations(paths, 2))
-
+      
         # Create a set of schemas for all good paths for quick lookup
         good_schemas = set(df.loc[df["path"].isin(all_good_paths), "schema"])
-
+        
         # Create a dictionary for path-to-schema mapping for faster lookups
         path_to_schema = df.set_index("path")["schema"].to_dict()
         
@@ -975,11 +976,13 @@ def get_samples(df, frequent_ref_defn_paths, best_good_pairs):
         num_bad_pairs = min(len(sample_good_pairs), len(all_bad_pairs))
         top_bad_pairs = nsmallest(num_bad_pairs, bad_pairs_distances, key=lambda x: x[1])
         sample_bad_pairs.update(pair for pair, _ in top_bad_pairs)
-        
+   
     # Label data
     labeled_df = label_samples(df, sample_good_pairs, sample_bad_pairs)
+   
     # Calculate cosine similarity between the two paths
     labeled_df = calculate_cosine_similarity(labeled_df, model, tokenizer, device)
+
     return labeled_df
 
 
@@ -1298,6 +1301,8 @@ def preprocess_data(schemas, filename, ground_truth_file):
     schema_intersection = 0
     freq_defn = 0
     properties = 0
+
+    #schemas = ["label-commenter-config-yml.json"]
     
     # Limit the number of concurrent workers to prevent memory overload
     for i in tqdm(range(0, len(schemas), BATCH_SIZE), position=0, desc="Processing schemas", leave=True, total=len(schemas)):
