@@ -2,6 +2,8 @@ import ast
 import concurrent.futures
 import itertools
 import json
+import jsonref
+import jsonschema
 import os
 import pandas as pd
 import multiprocessing
@@ -28,7 +30,7 @@ from transformers import AutoTokenizer
 
 
 warnings.filterwarnings("ignore")
-sys.setrecursionlimit(30000) # I had to increase the recursion limit because of the discover_schema function
+#sys.setrecursionlimit(2000) # I had to increase the recursion limit because of the discover_schema function
 
 # Create constant variables
 DISTINCT_SUBKEYS_UPPER_BOUND = 1000
@@ -132,36 +134,30 @@ def find_ref_paths(schema, current_path=('$',)):
 
 def clean_ref_defn_paths(schema):
     """
-    Remove keywords associated with JSON Schema that do not exist in JSON documents' format.
-  
+    Remove JSON Schema-specific keywords.
 
     Args:
         schema (dict): JSON Schema object.
 
     Returns:
-        dict: dictionary of cleaned JSON paths without schema-specific keywords.
+        dict: Cleaned JSON paths without schema-specific keywords.
     """
     ref_defn_paths = defaultdict(set)
 
     # Loop through referenced definitions and their corresponding paths
     for ref, path in find_ref_paths(schema):
-        # Prevent circular references (if the reference name is already part of the path)
+        # Prevent circular references
         if ref.split('/')[-1] in path:
             continue
 
-        # If the reference is a URL, skip it
+        # Skip URL references
         if ref[0] != '#':
             continue
 
-        # Remove JSON Schema keywords from the paths, handle complex properties
-        cleaned_path = []
-        for key in path:
-            if key not in JSON_SCHEMA_KEYWORDS:
-                cleaned_path.append(key)
+        # Remove JSON Schema keywords from the paths
+        cleaned_path = tuple(key for key in path if key not in JSON_SCHEMA_KEYWORDS)
 
-        # Convert the cleaned path to a tuple and add it to the dictionary
-        cleaned_path = tuple(cleaned_path)
-        # Skip paths containing complex properties keywords
+        # Skip paths with complex properties
         if any(keyword in cleaned_path for keyword in COMPLEX_PROPERTIES_KEYWORD):
             continue
 
@@ -170,56 +166,55 @@ def clean_ref_defn_paths(schema):
     return dict(sorted(ref_defn_paths.items()))
 
 
-def resolve_paths(path, ref_defn_paths, max_depth=10, current_depth=0):
-    """Resolve all the nested definitions to find them in the json file format
+def resolve_paths(ref_defn, ref_defn_paths, max_depth=10, current_depth=0):
+    """
+    Resolve all nested definitions.
 
     Args:
-        path (tuple): full path of key
-        ref_defn_paths (dict): dictionary of reference definitions and their paths.
-        max_depth (int): maximum recursion depth
-        current_depth (int): current recursion depth
+        ref_defn (str): Reference definition.
+        ref_defn_paths (dict): Dictionary of reference definitions and their cleaned paths.
+        max_depth (int): Maximum recursion depth.
+        current_depth (int): Current recursion depth.
 
     Returns:
-        list: list of paths
+        set: Resolved cleaned paths.
     """
     if current_depth >= max_depth:
-        # Reached the maximum recursion depth, return an empty list
-        return []
-    
+        return set()
+
     resolved_paths = set()
-    paths = ref_defn_paths.get(path, set())
+
+    paths = ref_defn_paths.get(ref_defn, set())
     for sub_path in paths:
-        # Check if the sub_path contains enough elements
         if len(sub_path) >= 3:
             defn_keyword = sub_path[1]
             defn_name = sub_path[2]
-            # Check if "definitions" or "$defs" exists in the sub_path
             if defn_keyword in DEFINITION_KEYWORDS:
-                referenced_defn_path = "#/" + defn_keyword + '/' + defn_name
-                # Resolve paths of the referenced definition recursively with increased depth
-                for top_defn_path in resolve_paths(referenced_defn_path, ref_defn_paths, max_depth, current_depth + 1):
-                    new_path = top_defn_path + sub_path[3:]
+                referenced_defn_path = f"#/{defn_keyword}/{defn_name}"
+                nested_paths = resolve_paths(referenced_defn_path, ref_defn_paths, max_depth, current_depth + 1)
+                for nested_path in nested_paths:
+                    new_path = nested_path + sub_path[3:]
                     resolved_paths.add(new_path)
             else:
                 resolved_paths.add(sub_path)
         else:
             resolved_paths.add(sub_path)
-    
+
     return resolved_paths
 
 
-def handle_nested_definitions(ref_defn_paths): 
-    """Apply the resolve funtions to all the paths of referenced definitions
+def handle_nested_definitions(ref_defn_paths):
+    """
+    Resolve all nested definitions.
 
     Args:
-        ref_defn_paths (dict): dictionary of reference definitions and their paths.
+        ref_defn_paths (dict): Dictionary of reference definitions and their cleaned paths.
 
     Returns:
-        dict: dictionary of referenced paths withous dependencies
+        dict: Dictionary of resolved paths for each reference definition.
     """
     new_ref_defn_paths = defaultdict(set)
 
-    # Resolve paths for each reference definition
     for ref_defn in ref_defn_paths.keys():
         resolved_paths = resolve_paths(ref_defn, ref_defn_paths)
         if resolved_paths:
@@ -229,20 +224,21 @@ def handle_nested_definitions(ref_defn_paths):
 
 
 def remove_definition_keywords(good_ref_defn_paths):
-    """Remove the keywords "definitions" and "defs" from all paths in the dictionary.
+    """
+    Remove keywords like "definitions" and "$defs".
 
     Args:
-        good_ref_defn_paths (dict): Dictionary of definition names and their paths of references.
+        good_ref_defn_paths (dict): Cleaned paths for reference definitions.
 
     Returns:
-        dict: Dictionary with "definitions" and "defs" removed from all paths.
+        dict: Updated cleaned paths with keywords removed.
     """
-    updated_paths = {}
+    updated_paths = defaultdict(set)
 
     for defn_name, paths in good_ref_defn_paths.items():
-        updated_paths[defn_name] = [
-            tuple(part for part in path if part not in DEFINITION_KEYWORDS) for path in paths
-        ]
+        for path in paths:
+            new_path = tuple(part for part in path if part not in DEFINITION_KEYWORDS)
+            updated_paths[defn_name].add(new_path)
 
     return updated_paths
 
@@ -489,34 +485,120 @@ def path_matches_with_wildkey(schema_path, json_path):
     # Paths must be the same length to match
     if len(schema_path) != len(json_path):
         return False
-
+    if schema_path == json_path:
+        return True
     # Iterate through each part of the schema and JSON paths
     return all(schema_part == "wildkey" or schema_part == json_part 
                for schema_part, json_part in zip(schema_path, json_path))
 
 
-def check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, prefix_paths_dict):
+def dereference_schema(schema):
     """
-    Check if the paths from JSON Schemas exist in JSON datasets.
+    Dereference the JSON schema using jsonref.
 
     Args:
-        cleaned_ref_defn_paths (dict): Dictionary of JSON definitions and their paths.
-        prefix_paths_dict (dict): Dictionary of paths and their corresponding value types.
+        schema (dict): The JSON schema object.
 
+    Returns:
+        dict: The dereferenced JSON schema.
+    """
+    try:
+        return jsonref.JsonRef.replace_refs(schema) 
+    except RecursionError:
+        raise ValueError("Circular reference detected in schema.")
+    except Exception as e:
+        print(f"Error dereferencing schema: {e}", flush=True)
+        return schema
+
+
+def get_schema_from_reference(deref_schema, ref_defn):
+    """
+    Get the schema from a reference definition.
+
+    Args:
+        deref_schema (dict): The dereferenced schema object.
+        ref_defn (str): The reference definition.
+
+    Raises:
+        ValueError: If the reference path cannot be resolved.
+
+    Returns:
+        dict: The schema from the reference definition.
+    """
+    try:
+        path_parts = ref_defn.lstrip('#/').split('/')
+        current_schema = deref_schema
+        for part in path_parts:
+            current_schema = current_schema.get(part)
+            if current_schema is None:
+                raise ValueError(f"Reference path '{ref_defn}' could not be resolved.")
+        return current_schema
+    except Exception as e:
+        print(f"Error getting schema from reference {ref_defn}: {e}", flush=True)
+        return {}
+
+
+def validate_json_path_values(values, defn_schema):
+    """
+    Validate the value at the specified JSON path against the reference schema using jsonschema.
+
+    Args:
+        values: List of values at the JSON path.
+        defn_schema: The reference defintiion schema to validate against.
+
+    Returns:
+        bool: True if all the values are valid according to the definition schema, False otherwise.
+    """
+    
+    for value in tqdm(values, desc="Validating JSON values", position=2, leave=False, total=len(values)):
+        try:
+            jsonschema.validate(instance=json.loads(value), schema=defn_schema)
+        except jsonschema.ValidationError:
+            print(f"Validation failed for value {value}", flush=True)
+            return False
+        except RecursionError:
+            print(f"Maximum recursion depth exceeded for value {value}", flush=True)
+            return False
+        except Exception as e:
+            print(f"Unexpected error validating {value}: {e}", flush=True)
+            return False
+    return True
+
+
+def check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, paths_dict, schema):
+    """
+    Check if the paths from JSON Schemas exist in JSON datasets.
+    
+    Args:
+        cleaned_ref_defn_paths (dict): Dictionary of referenced definitions and their paths.
+        paths_dict (dict): Dictionary of paths and their corresponding values.
+        schema (dict): JSON schema object.
+        
     Returns:
         dict: Dictionary of definitions with paths that exist in the JSON documents.
     """
-    # Use a set for efficient lookups
-    json_paths_set = set(prefix_paths_dict.keys())
     filtered_ref_defn_paths = defaultdict(set)
+    deref_schema = dereference_schema(schema)
 
     # Iterate through schema definitions
-    for ref_defn, schema_paths in cleaned_ref_defn_paths.items():
-        for schema_path in schema_paths:
-            for json_path in json_paths_set:
-                #if path_matches_with_wildkey(schema_path, json_path):
-                if schema_path == json_path:
-                    filtered_ref_defn_paths[ref_defn].add(json_path)
+    for ref_defn, schema_paths in tqdm(cleaned_ref_defn_paths.items(), desc="Number of referenced definitions", position=0, leave=False, total=len(cleaned_ref_defn_paths)):
+
+        # Get the schema for the reference definition
+        defn_schema = get_schema_from_reference(deref_schema, ref_defn)
+
+        for schema_path in tqdm(schema_paths, desc="Number of paths for a ref_defn", position=1, leave=False, total=len(schema_paths)):
+            # Check if the schema path contains 'wildkey'
+            contains_wildkey = "wildkey" in schema_path
+
+            for json_path, json_values in tqdm(paths_dict.items(), desc="Number of paths in JSON files", position=2, leave=False, total=len(paths_dict)):
+                if path_matches_with_wildkey(schema_path, json_path):
+                    #print(f"Matched schema path {schema_path} with JSON path {json_path}", flush=True)
+                    if contains_wildkey:
+                        if validate_json_path_values(json_values, defn_schema):
+                            filtered_ref_defn_paths[ref_defn].add(json_path)
+                    else:
+                        # Add non-'wildkey' matches without validation
+                        filtered_ref_defn_paths[ref_defn].add(json_path)
 
     return filtered_ref_defn_paths
 
@@ -548,10 +630,6 @@ def find_frequent_definitions(filtered_ref_defn_paths, paths_to_exclude):
 
     # Return dictionary of frequent references
     return frequent_ref_defn_paths
-
-
-
-
 
 
 def tokenize_schema(schema, tokenizer):
@@ -1212,14 +1290,15 @@ def process_schema(schema_name, filename):
     '''
 
     paths_dict, num_docs = process_dataset(schema_name, filename)
-    if paths_dict is None:
+    if len(paths_dict) == 0:
         failure_flags["path"] = 1
         #print(f"No paths extracted from {schema_name}.", flush=True)
         return None, None, schema_name, failure_flags
 
     #print("Check reference definition paths in the dataset")
     # Check reference definition paths in the dataset
-    filtered_ref_defn_paths = check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, paths_dict)
+    print(f"Schema: {schema_name}", flush=True)
+    filtered_ref_defn_paths = check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, paths_dict, schema)
     if not filtered_ref_defn_paths:
         failure_flags["schema_intersection"] = 1
         #print(f"No paths of properties in referenced definitions found in {schema_name} dataset.", flush=True)
@@ -1250,6 +1329,7 @@ def process_schema(schema_name, filename):
         df = create_dataframe(paths_dict, paths_to_exclude, num_docs)
         print(f"Number of paths in {schema_name}: {len(df)}", flush=True)
 
+    print(flush=True)
     # Update reference definitions
     updated_ref_defn_paths = update_ref_defn_paths(frequent_ref_defn_paths, df)
     if not updated_ref_defn_paths:
@@ -1302,8 +1382,29 @@ def preprocess_data(schemas, filename, ground_truth_file):
     freq_defn = 0
     properties = 0
 
-    #schemas = ["label-commenter-config-yml.json"]
-    
+    #schemas = ["cargo-manifest.json"]
+    '''
+    for schema in schemas:
+        df, frequent_ref_defn_paths, schema_name, failure_flags = process_schema(schema, filename)
+        print(f"Schema {schema_name} processed.", flush=True)
+
+        load_count += failure_flags["load"]
+        ref_defn += failure_flags["ref_defn"]
+        object_defn += failure_flags["object_defn"]
+        path += failure_flags["path"]
+        schema_intersection += failure_flags["schema_intersection"]
+        freq_defn += failure_flags["freq_defn"]
+        properties += failure_flags["properties"]
+
+        if df is not None and frequent_ref_defn_paths:
+            ground_truths[schema_name] = frequent_ref_defn_paths
+
+            if filename != "baseline_test_data.csv":
+                df = get_samples(df, frequent_ref_defn_paths, best_good_pairs=True)
+
+            # Append batch to CSV to avoid holding everything in memory
+            df.to_csv(filename, mode='a', header=not os.path.exists(filename), index=False, sep=';')
+    '''
     # Limit the number of concurrent workers to prevent memory overload
     for i in tqdm(range(0, len(schemas), BATCH_SIZE), position=0, desc="Processing schemas", leave=True, total=len(schemas)):
         batch = schemas[i:i+BATCH_SIZE]
@@ -1333,7 +1434,7 @@ def preprocess_data(schemas, filename, ground_truth_file):
 
                 except Exception as e:
                     print(f"Error processing schema {futures[future]}: {e}", flush=True)
-
+    
     # Save ground truth definitions once all processing is done
     save_ground_truths(ground_truths, ground_truth_file)
     print("Total schemas processed:", total_schemas)
