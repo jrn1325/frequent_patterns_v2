@@ -1071,7 +1071,6 @@ def evaluate_single_schema(schema, test_ground_truth):
         print(flush=True)
         # Return evaluation metrics and sorted clusters for the schema
         return schema, precision, recall, f1_score, actual_clusters, predicted_clusters
-        
     return None
 
 
