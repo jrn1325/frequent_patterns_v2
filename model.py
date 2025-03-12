@@ -22,19 +22,19 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup, EvalPrediction
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup, EvalPrediction
 
 import process_data
 
 MAX_TOK_LEN = 512
 MODEL_NAME = "microsoft/codebert-base" 
 ADAPTER_NAME = "frequent_patterns"
-SCHEMA_FOLDER = "processed_schemas"
+SCHEMA_FOLDER = "converted_processed_schemas"
 JSON_FOLDER = "processed_jsons"
-BATCH_SIZE = 120
+BATCH_SIZE = 128
 HIDDEN_SIZE = 768
 JSON_SUBSCHEMA_KEYWORDS = {"allOf", "oneOf", "anyOf", "not"}
-SCHEMA_KEYWORS = ["$defs", "definitions", "properties", "additionalProperties", "patternProperties", "items", "allOf", "anyOf", "oneOf"]
+JSON_SCHEMA_KEYWORS = ["$defs", "definitions", "properties", "additionalProperties", "patternProperties", "items", "prefixItems", "allOf", "anyOf", "oneOf"]
 
 
 # https://stackoverflow.com/a/73704579
@@ -244,19 +244,17 @@ class CustomDataset(Dataset):
     def __getitem__(self, idx):
         tokenized_schema = self.data.iloc[idx]["tokenized_schema"]
         label = self.data.iloc[idx]["label"]
-        path1_freq = self.data.iloc[idx]["path1_freq"] # Maybe consioder the difference of the nesting level
+        path1_freq = self.data.iloc[idx]["path1_freq"]
         path2_freq = self.data.iloc[idx]["path2_freq"]
-        nested_key_freq1 = self.data.iloc[idx]["nested_key_freq1"]
-        nested_key_freq2 = self.data.iloc[idx]["nested_key_freq2"]
         nesting_depth1 = self.data.iloc[idx]["nesting_depth1"]
         nesting_depth2 = self.data.iloc[idx]["nesting_depth2"]
-        similarity = self.data.iloc[idx]["cosine_similarity"]
+        cosine_similarity = self.data.iloc[idx]["cosine_similarity"]
         
         return {
             "input_ids": tokenized_schema,
             "attention_mask": [1] * len(tokenized_schema),
             "label": label,
-            "extra_features": [nesting_depth1, nesting_depth2, similarity, path1_freq, path2_freq],# nested_key_freq1, nested_key_freq2]
+            "extra_features": [path1_freq, path2_freq, cosine_similarity, nesting_depth1, nesting_depth2]
         }
 
 
@@ -298,18 +296,16 @@ class CustomEvalDataset(Dataset):
         tokenized_schema = self.data.iloc[idx]["tokenized_schema"]
         path1_freq = self.data.iloc[idx]["path1_freq"]
         path2_freq = self.data.iloc[idx]["path2_freq"]
-        nested_key_freq1 = self.data.iloc[idx]["nested_key_freq1"]
-        nested_key_freq2 = self.data.iloc[idx]["nested_key_freq2"]
         nesting_depth1 = self.data.iloc[idx]["nesting_depth1"]
         nesting_depth2 = self.data.iloc[idx]["nesting_depth2"]
-        similarity = self.data.iloc[idx]["cosine_similarity"]
+        cosine_similarity = self.data.iloc[idx]["cosine_similarity"]
         path1 = self.data.iloc[idx]["path1"]
         path2 = self.data.iloc[idx]["path2"]
 
         return {
             "input_ids": tokenized_schema,
             "attention_mask": [1] * len(tokenized_schema),
-            "extra_features": [nesting_depth1, nesting_depth2, similarity, path1_freq, path2_freq],# nested_key_freq1, nested_key_freq2],
+            "extra_features": [path1_freq, path2_freq, cosine_similarity, nesting_depth1, nesting_depth2],
             "path1": path1,
             "path2": path2
         }
@@ -337,22 +333,21 @@ def collate_eval_fn(batch, tokenizer):
 class CustomBERTModel(nn.Module):
     def __init__(self):
         super(CustomBERTModel, self).__init__()
-        
+
         # Load pre-trained CodeBERT with adapters
         self.codebert = AutoAdapterModel.from_pretrained(MODEL_NAME)
 
         # Add the adapter and classification head
         self.codebert.add_adapter(ADAPTER_NAME, config="seq_bn")
+        self.codebert.add_classification_head(ADAPTER_NAME, num_labels=2)
         self.codebert.set_active_adapters(ADAPTER_NAME)
-        self.codebert.add_classification_head(ADAPTER_NAME, num_labels=2) 
         self.codebert.train_adapter(ADAPTER_NAME)
 
         # Custom layers for processing additional inputs
-        self.extra_features = nn.Linear(5, HIDDEN_SIZE) 
+        self.extra_features = nn.Linear(5, HIDDEN_SIZE)
 
         # Final classifier to process concatenated logits and custom features
         self.modified_classifier = nn.Linear(HIDDEN_SIZE + 2, 2)
-
 
     def forward(self, input_ids, attention_mask, extra_features):
         # Pass input through the pre-trained CodeBERT with the adapter
@@ -371,6 +366,21 @@ class CustomBERTModel(nn.Module):
         logits = self.modified_classifier(combined_output)
     
         return logits
+
+    def train_adapter_and_model(self):
+        """
+        Ensure both the model and adapter are trainable.
+        """
+        # Set all the parameters of the model and adapter to require gradients.
+        for param in self.codebert.parameters():
+            param.requires_grad = True
+
+        # Now, set the adapter-specific parameters to require gradients.
+        # Get the adapter parameters from the dictionary and set them to require gradients.
+        for adapter in self.codebert.get_adapter(ADAPTER_NAME).values():
+            for param in adapter.parameters():
+                param.requires_grad = True
+
             
 
 def normalize_nesting_depths(df, eval_mode, max_depth=6):
@@ -409,7 +419,7 @@ def compute_metrics(pred: EvalPrediction):
     logits, labels = pred.predictions, pred.label_ids
     predictions = logits.argmax(-1)
     accuracy = accuracy_score(labels, predictions)
-    precision, recall, f1, _ = precision_recall_fscore_support(labels, predictions, average="binary")
+    precision, recall, f1, _ = precision_recall_fscore_support(labels, predictions)
     return {
         "accuracy": accuracy,
         "precision": precision,
@@ -417,10 +427,10 @@ def compute_metrics(pred: EvalPrediction):
         "f1": f1
     }
 
-    
+
 def save_model_and_adapter(model, save_path="frequent_pattern_model"):
     """
-    Save the custom model's state_dict and the adapter.
+    Save the custom model's state_dict and the adapter, as well as the pretrained base model.
 
     Args:
         model (CustomBERTModel): The custom model to save.
@@ -434,12 +444,49 @@ def save_model_and_adapter(model, save_path="frequent_pattern_model"):
     # Handle multi-GPU models
     model = model.module if isinstance(model, nn.DataParallel) else model
 
-    # Save the state_dict for the custom layers
+    # Save the state_dict for the custom layers (adapter and custom layers)
     torch.save(model.state_dict(), os.path.join(path, "frequent_patterns_model_state_dict.pth"))
 
-    # Save the CodeBERT adapter and base model
+    # Save the pretrained base model
     model.codebert.save_pretrained(path)
-    model.codebert.save_adapter(path, ADAPTER_NAME)  
+
+    # Save the adapter
+    model.codebert.save_adapter(path, ADAPTER_NAME)
+
+    print(f"Model and adapter saved to {path}")
+
+
+def load_model_and_adapter(save_path="frequent_pattern_model"):
+    """
+    Load the pretrained base model, adapter, and custom model weights.
+
+    Args:
+        save_path (str): Directory where the model and adapter are saved.
+    
+    Returns:
+        model (CustomBERTModel): The loaded model with pretrained weights and adapter.
+        tokenizer (PreTrainedTokenizer): The tokenizer used for processing schemas.
+    """
+
+    # Convert save_path to an absolute path to prevent issues with relative paths
+    save_path = os.path.abspath(save_path)
+
+    # Load the tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+    # Load the pretrained CodeBERT model
+    model = CustomBERTModel()
+
+    # Load the adapter
+    model.codebert.load_adapter(save_path, set_active=True)
+
+    # Load the saved state_dict for the custom layers
+    model_state_path = os.path.join(save_path, "frequent_patterns_model_state_dict.pth")
+    model.load_state_dict(torch.load(model_state_path), strict=False)
+
+    print(f"Model and adapter loaded from {save_path}")
+
+    return model, tokenizer
 
 
 def train_model(train_df, test_df):
@@ -452,8 +499,8 @@ def train_model(train_df, test_df):
     """
     # Hyperparameters
     accumulation_steps = 4
-    learning_rate = 2e-6
-    num_epochs = 25
+    learning_rate = (1e-5)/2
+    num_epochs = 40
 
     # Initialize wandb logging
     wandb.init(
@@ -492,9 +539,9 @@ def train_model(train_df, test_df):
     # Create datasets with dynamic padding and batching
     train_dataset = CustomDataset(train_df)
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda batch: collate_fn(batch, tokenizer))
-   
+
     # Set up scheduler to adjust the learning rate during training
-    num_training_steps = num_epochs * len(train_dataloader) // accumulation_steps
+    num_training_steps = (num_epochs * len(train_dataloader) // accumulation_steps)
     num_warmup_steps = int(0.1 * num_training_steps)
     lr_scheduler = get_linear_schedule_with_warmup(
         optimizer=optimizer,
@@ -502,11 +549,8 @@ def train_model(train_df, test_df):
         num_training_steps=num_training_steps,
     )
 
-    early_stopper = EarlyStopper(patience=1, min_delta=0.005) # training steps if the validation loss does not decrease by at least 0.005 for 1 consecutive epochs
-
     # Train the model
     model.train()
-    # Define the loss function
     loss_fn = torch.nn.CrossEntropyLoss()
 
     pbar = tqdm(range(num_epochs), position=0, desc="Epoch")
@@ -521,47 +565,45 @@ def train_model(train_df, test_df):
 
             # Forward pass
             logits = model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)
-  
+
             # Calculate the training loss
             training_loss = loss_fn(logits, labels)
-       
-            # Need to average the loss if we are using DataParallel
+
+            # Handle DataParallel case
             if training_loss.dim() > 0:
                 training_loss = training_loss.mean()
 
             training_loss.backward()
-            
+
             if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_dataloader):
                 optimizer.step()
                 lr_scheduler.step()
                 
                 # Calculate global training step
                 step = (epoch * len(train_dataloader) + i + 1) // accumulation_steps
-        
+
             total_loss += training_loss.item()
 
+        # Calculate average loss for the epoch
         average_loss = total_loss / len(train_dataloader)
 
-        # Test the model
-        testing_loss = test_model(test_df, tokenizer, model, device, wandb)
-        early_stop = early_stopper.early_stop(testing_loss)
-        if early_stop:
-            print("Early stopping")
-            break
+        # Evaluate the model on the test set
+        test_loss = test_model(test_df, tokenizer, model, device, wandb)
 
+        # Log training metrics
         wandb.log({
             "training_loss": average_loss,
-            "learning_rate": lr_scheduler.get_last_lr()[0], 
-            "step": step,
-            "epoch": epoch + 1
+            "testing_loss": test_loss,
+            "learning_rate": lr_scheduler.get_last_lr()[0],
+            "epoch": epoch + 1,
+            "step": step
         })
 
-    # Save the model and adapter after training
-    save_model_and_adapter(model)
+    save_model_and_adapter(model) 
     # Finish wandb logging
     wandb.finish()
-    
 
+    
 def test_model(test_df, tokenizer, model, device, wandb):
     """
     Tests the model on a given dataset and logs the evaluation metrics.
@@ -581,7 +623,7 @@ def test_model(test_df, tokenizer, model, device, wandb):
     test_dataset = CustomDataset(test_df)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda batch: collate_fn(batch, tokenizer))
 
-    model.eval()
+    model.eval()  # Ensure the model is in evaluation mode
     total_loss = 0.0
 
     # Define the loss function
@@ -590,18 +632,18 @@ def test_model(test_df, tokenizer, model, device, wandb):
     total_actual_labels = []
     total_predicted_labels = []
 
-    with torch.no_grad():
+    with torch.no_grad():  # No gradients are needed during evaluation
         for batch in tqdm(test_loader, total=len(test_loader), leave=False, desc="Testing"):
             batch = {k: v.to(device) for k, v in batch.items()}
             input_ids, attention_mask, labels, extra_features = batch["input_ids"], batch["attention_mask"], batch["label"], batch["extra_features"]
 
             # Forward pass
             logits = model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)   
-            
+
             # Calculate the testing loss
             testing_loss = loss_fn(logits, labels)
 
-            # Need to average the loss if we are using DataParallel
+            # Handle DataParallel (if used)
             if testing_loss.dim() > 0:
                 testing_loss = testing_loss.mean()
             total_loss += testing_loss.item()
@@ -612,16 +654,22 @@ def test_model(test_df, tokenizer, model, device, wandb):
             total_actual_labels.extend(actual_labels)
             total_predicted_labels.extend(predicted_labels)
 
+    # Calculate average loss for the epoch
     average_loss = total_loss / len(test_loader)
 
     # Calculate the accuracy, precision, recall, f1 score of the positive class
     accuracy = accuracy_score(total_actual_labels, total_predicted_labels)
-    precision = precision_score(total_actual_labels, total_predicted_labels, average="binary")
-    recall = recall_score(total_actual_labels, total_predicted_labels, average="binary")
-    f1 = f1_score(total_actual_labels, total_predicted_labels, average="binary")
+    precision = precision_score(total_actual_labels, total_predicted_labels)
+    recall = recall_score(total_actual_labels, total_predicted_labels)
+    f1 = f1_score(total_actual_labels, total_predicted_labels)
 
-    #print(f'accuracy: {accuracy}, precision: {precision}, recall: {recall}, F1: {f1}')
-    wandb.log({"accuracy": accuracy, "testing_loss": average_loss, "precision": precision, "recall": recall, "F1": f1})
+    # Log metrics to wandb
+    wandb.log({
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "F1": f1
+    })
 
     return average_loss
 
@@ -629,10 +677,29 @@ def test_model(test_df, tokenizer, model, device, wandb):
 
 
 
+def load_schema_and_dereference(schema_path):
+    """
+    Load and dereference a JSON schema from a file.
+
+    Args:
+        schema_path (str): The path to the JSON schema file.
+
+    Returns:
+        dict: The loaded and dereferenced JSON schema.
+    """
+    try:
+        with open(schema_path, 'r') as schema_file:
+            schema = jsonref.load(schema_file)
+            schema = jsonref.JsonRef.replace_refs(schema) 
+    except Exception as e:
+        print(f"Error loading schema {schema_path}: {e}")
+        return None
+    return schema
+
+
 def get_schema_paths(schema, current_path=('$',)):
     """
-    Recursively traverse the JSON schema and return the full paths of all nested properties,
-    excluding schema keywords from the path.
+    Recursively traverse the JSON schema and return the full paths of all nested properties.
 
     Args:
         schema (dict): The JSON schema object.
@@ -644,31 +711,59 @@ def get_schema_paths(schema, current_path=('$',)):
     if not isinstance(schema, dict):
         return
 
-    # Yield the current path if it's a dictionary (nested property)
+    # Yield the current path for every dictionary entry
     yield current_path
 
     for key, value in schema.items():
-        # Skip 'definitions', '$defs', and 'additionalProperties'
-        if key in {"definitions", "$defs", "additionalProperties"}:
-            continue
-
-        # Update the path for nested structures
-        if key == "properties":
+        # Handle object properties
+        if key == "properties" and isinstance(value, dict):
             for prop_key, prop_value in value.items():
-                # Recursively yield paths for each sub-property
                 yield from get_schema_paths(prop_value, current_path + (prop_key,))
 
-        elif key in {"allOf", "anyOf", "oneOf"}:
-            for item in value:
-                yield from get_schema_paths(item, current_path)
+        # Handle `patternProperties` (Regex-based object keys)
+        elif key == "patternProperties" and isinstance(value, dict):
+            for pattern, pattern_value in value.items():
+                yield from get_schema_paths(pattern_value, current_path + ("pattern_key" + pattern,))
 
-        elif key == "items":
-            # Represent 'items' in the path with '*'
-            yield from get_schema_paths(value, current_path + ('*',))
+        # Handle `items` for lists and objects
+        elif key in {"items", "prefixItems"}:
+            if isinstance(value, dict):
+                yield from get_schema_paths(value, current_path + ('*',))
+            elif isinstance(value, list):  # If `items` is a list (tuple schemas)
+                for idx, item in enumerate(value):
+                    yield from get_schema_paths(item, current_path + ('*',))
+
+        # Handle schema composition keywords (`allOf`, `anyOf`, `oneOf`)
+        elif key in {"allOf", "anyOf", "oneOf"} and isinstance(value, list):
+            for idx, item in enumerate(value):
+                yield from get_schema_paths(item, current_path + (f'{key}[{idx}]',))
+
+        # Include `additionalProperties` if it contains a schema
+        elif key == "additionalProperties" and isinstance(value, dict):
+            yield from get_schema_paths(value, current_path + ("additional_key",))
 
         # Recursively handle other nested dictionaries
         elif isinstance(value, dict):
             yield from get_schema_paths(value, current_path + (key,))
+
+
+def format_schema_paths(paths):
+    """
+    Format the schema paths by removing schema keywords.
+
+    Args:
+        paths (set): A set of schema paths.
+
+    Returns:
+        set: A formatted set of schema paths.
+    """
+    formatted_paths = set()
+
+    for path in paths:
+        path = tuple(part for part in path if part not in JSON_SCHEMA_KEYWORS)
+        formatted_paths.add(path)
+    return formatted_paths
+
 
 
 def in_schema(path, schema_paths):
@@ -747,28 +842,7 @@ def remove_additional_properties(filtered_df, schema):
 
 
 
-def load_model_and_adapter(save_path="frequent_pattern_model"):
-    """
-    Load the custom model and its adapter.
 
-    Args:
-        save_path (str): Path where the custom model and adapter are saved.
-
-    Returns:
-        CustomBERTModel: The loaded custom model.
-        AutoTokenizer: The tokenizer used for processing schemas.
-    """
-    # Initialize a new instance of the custom model and tokenizer
-    custom_model = CustomBERTModel()
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
-    # Load the base CodeBERT model and adapter
-    custom_model.codebert = AutoAdapterModel.from_pretrained(save_path)
-    custom_model.codebert.load_adapter(save_path, load_as=ADAPTER_NAME)
-    custom_model.codebert.set_active_adapters(ADAPTER_NAME)
-    custom_model.load_state_dict(torch.load(os.path.join(save_path, "frequent_patterns_model_state_dict.pth")))
-
-    return custom_model, tokenizer
 
 
 def create_schema_pairs_with_common_properties(df, max_depth=6):
@@ -828,8 +902,8 @@ def create_schema_pairs_with_common_properties(df, max_depth=6):
             "path2": path2,
             "path1_freq": row1["path_frequency"],
             "path2_freq": row2["path_frequency"],
-            "nested_key_freq1": row1["nested_key_frequency"],
-            "nested_key_freq2": row2["nested_key_frequency"],
+            "nested_keys1": row1["nested_keys"],
+            "nested_keys2": row2["nested_keys"],
             "nesting_depth1": path_to_depth[path1],
             "nesting_depth2": path_to_depth[path2],
             "schema1": row1["schema"],
@@ -863,7 +937,7 @@ def build_definition_graph(eval_loader, custom_model, device, schema_name):
         with torch.no_grad():
             logits = custom_model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)
             preds = torch.argmax(logits, dim=-1).tolist()
-            #print(f"Predictions: {preds}")
+
         # Append edges based on predictions
         for idx, pred in enumerate(preds):
             if pred == 1:
@@ -883,6 +957,7 @@ def find_definitions_from_graph(graph):
 
     Args:
         graph (nx.Graph): A graph representing schema connections.
+        formatted_schema_paths (set): A set of formatted schema paths.
 
     Returns:
         List[List]: A list of lists, each containing nodes representing a definition.
@@ -903,6 +978,7 @@ def find_definitions_from_graph(graph):
         filtered_cliques = []
         for clique in cliques:
             filtered_clique = [c for c in clique if c not in clique_set]
+            # Remove paths that are not in the schema
             if len(filtered_clique) > 1:
                 filtered_cliques.append(filtered_clique)
         processed_cliques.append(list(clique_set))
@@ -1013,8 +1089,13 @@ def evaluate_single_schema(schema, test_ground_truth):
         #if len(df) < 2:
         #    print(f"Schema {schema_name} has less than 2 paths after filtering.", flush=True)
         #    return None
-        
-           
+
+
+        # Load and derefence the schema
+        #schema = load_schema_and_dereference(os.path.join(SCHEMA_FOLDER, schema_name))
+        # Get the schema paths
+        #schema_paths = set(get_schema_paths(schema))
+     
         # Load the model and tokenizer
         custom_model, tokenizer = load_model_and_adapter()
 
@@ -1025,9 +1106,9 @@ def evaluate_single_schema(schema, test_ground_truth):
 
         # Create a DataFrame with pairs of schemas that have at least two common properties
         pairs_df = create_schema_pairs_with_common_properties(df)
-        
-        # Process and normalize nesting depths for evaluation
-        #normalized_df = normalize_nesting_depths(pairs_df, True, max_depth=6)
+        if pairs_df.empty:
+            print(f"No pairs found for schema {schema_name}.", flush=True)
+            return None
         
         # Tokenize and merge schemas
         eval_df = merge_schema_tokens(pairs_df, tokenizer)
@@ -1036,7 +1117,7 @@ def evaluate_single_schema(schema, test_ground_truth):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         original_model = AutoAdapterModel.from_pretrained(MODEL_NAME)
         original_model.to(device)
-        
+
         # Calculate the cosine similarity between the paths
         eval_df = process_data.calculate_cosine_similarity(eval_df, original_model, tokenizer, device)
         
