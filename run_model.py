@@ -13,6 +13,7 @@ def load_data():
     """
     train_df = pd.read_csv("sample_train_data.csv",sep=';') 
     test_df = pd.read_csv("sample_test_data.csv", sep=';') 
+    test_df = test_df.sample(frac=1).reset_index(drop=True)
     model.train_model(train_df, test_df)
 
 
@@ -21,7 +22,7 @@ def evaluate_model():
     Evaluate the model on the test set.
     """
     test_ground_truth = {}
-    with open("test_ground_truth.json", 'r') as json_file:
+    with open("test_ground_truth_v2.json", 'r') as json_file:
         for line in json_file:
             test_ground_truth.update(json.loads(line))
 
@@ -33,7 +34,7 @@ def evaluate_baseline_model():
     df = pd.read_csv("baseline_test_data.csv", sep=';')
 
     test_ground_truth = {}
-    with open("baseline_test_ground_truth.json", 'r') as json_file:
+    with open("test_ground_truth_v2.json", 'r') as json_file:
         for line in json_file:
             test_ground_truth.update(json.loads(line))
 
@@ -47,7 +48,7 @@ def main():
     it calls the evaluate_model function to evaluate the model. If the mode is unknown, it prints 
     an error message and exits.
     """
-    mode = sys.argv[-1]
+    mode, ori = sys.argv[-2:]
     if mode == "train":
         load_data()
     elif mode == "test":
@@ -55,9 +56,11 @@ def main():
         evaluate_model()
         print(time.time() - start_time)
     elif mode == "baseline":
+        start_time = time.time()
         evaluate_baseline_model()
+        print(time.time() - start_time)
     elif mode == "size":
-        model.get_dereferenced_schema_size()
+        model.get_json_schema_size(ori)
     elif mode == "info":
         train_df = pd.read_csv("sample_train_data.csv",sep=';') 
         train_df = pd.read_csv("sample_train_data.csv", sep=';')

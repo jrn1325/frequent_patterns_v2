@@ -377,10 +377,6 @@ def match_properties(schema, document):
     # Extract top-level schema properties
     schema_properties = set(schema.get("properties", {}).keys())
 
-    # If there are no top-level properties, return True
-    if not schema_properties:
-        return True
-
     # Extract top-level document properties
     document_properties = set(document.keys())
 
@@ -628,7 +624,7 @@ def validate_json_against_schema(json_data, schema_def, full_schema):
     except RecursionError as e:
         return False
 
-'''
+
 def check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, paths_dict, schema):
     """
     Check if the paths from JSON Schemas exist in JSON datasets, ensuring they conform to the schema definition.
@@ -680,7 +676,7 @@ def check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, paths_dict, 
                     else:
                         filtered_ref_defn_paths[ref_defn].add(json_path)
     return filtered_ref_defn_paths
-    
+'''
 
 def find_frequent_definitions(filtered_ref_defn_paths, paths_to_exclude):
     """
@@ -1221,6 +1217,8 @@ def label_samples(df, good_pairs, bad_pairs):
     schemas1 = [] 
     schemas2 = []  
     filenames = []  
+    nesting_depths1 = []
+    nesting_depths2 = []
 
     # Process good pairs: label them as 1 (positive)
     for path1, path2 in good_pairs:
@@ -1238,6 +1236,8 @@ def label_samples(df, good_pairs, bad_pairs):
         filenames.append(path1_row["filename"])
         schemas1.append(path1_row["schema"])
         schemas2.append(path2_row["schema"])
+        nesting_depths1.append(len(path1))
+        nesting_depths2.append(len(path2))
         
     # Process bad pairs: label them as 0 (negative)
     for path1, path2 in bad_pairs:
@@ -1255,6 +1255,8 @@ def label_samples(df, good_pairs, bad_pairs):
         filenames.append(path1_row["filename"])
         schemas1.append(path1_row["schema"])
         schemas2.append(path2_row["schema"])
+        nesting_depths1.append(len(path1))
+        nesting_depths2.append(len(path2))
 
     # Create a new DataFrame with separate columns for path1 and path2
     labeled_df = pd.DataFrame({
@@ -1262,6 +1264,8 @@ def label_samples(df, good_pairs, bad_pairs):
         "label": labels,
         "path1": paths1,
         "path2": paths2,
+        "nesting_depth1": nesting_depths1,
+        "nesting_depth2": nesting_depths2,
         "path1_freq": path1_freqs,
         "path2_freq": path2_freqs,
         "nested_keys1": nested_keys1,
@@ -1315,9 +1319,6 @@ def get_samples(df, frequent_ref_defn_paths, best_good_pairs):
         
         # Sampling logic
         if best_good_pairs:
-            # Take first 1,000 pairs
-            sample_good_pairs.update(good_pairs[:1000])
-        else:
             # Calculate distances for good pairs
             good_pairs_distances = [
                 ((path1, path2), cosine(schema_embeddings[path1], schema_embeddings[path2]))
@@ -1327,40 +1328,41 @@ def get_samples(df, frequent_ref_defn_paths, best_good_pairs):
             # Select top 1,000 pairs with greatest distances
             top_1000_good_pairs = nlargest(1000, good_pairs_distances, key=lambda x: x[1])
             sample_good_pairs.update(pair for pair, _ in top_1000_good_pairs)
+        else:
+            # Take first 1,000 pairs
+            sample_good_pairs.update(good_pairs[:1000])
 
-        
-    if len(paths) > len(all_good_paths):
-        # Process bad paths
-        all_pairs = list(itertools.combinations(paths, 2))
-      
-        # Create a set of schemas for all good paths for quick lookup
-        good_schemas = set(df.loc[df["path"].isin(all_good_paths), "schema"])
-        
-        # Create a dictionary for path-to-schema mapping for faster lookups
-        path_to_schema = df.set_index("path")["schema"].to_dict()
-        
-        # Loop through all pairs and add to bad pairs if not in good pairs
-        for path1, path2 in all_pairs:
-            if ((path1, path2) not in all_good_pairs and 
-                (path2, path1) not in all_good_pairs):
-                
-                schema1_good = path_to_schema.get(path1) in good_schemas
-                schema2_good = path_to_schema.get(path2) in good_schemas
-        
-                if not (schema1_good and schema2_good):
-                    all_bad_pairs.add((path1, path2))
-        
-        # Calculate distances for bad pairs
-        bad_pairs_distances = [
-            ((path1, path2), cosine(schema_embeddings[path1], schema_embeddings[path2]))
-            for path1, path2 in all_bad_pairs
-        ]
-        
-        # Select pairs with smallest distances 
-        num_bad_pairs = min(len(sample_good_pairs), len(all_bad_pairs))
-        top_bad_pairs = nsmallest(num_bad_pairs, bad_pairs_distances, key=lambda x: x[1])
-        sample_bad_pairs.update(pair for pair, _ in top_bad_pairs)
-   
+    # Process bad paths
+    all_pairs = list(itertools.combinations(paths, 2))
+    
+    # Create a set of schemas for all good paths for quick lookup
+    good_schemas = set(df.loc[df["path"].isin(all_good_paths), "schema"])
+    
+    # Create a dictionary for path-to-schema mapping for faster lookups
+    path_to_schema = df.set_index("path")["schema"].to_dict()
+    
+    # Loop through all pairs and add to bad pairs if not in good pairs
+    for path1, path2 in all_pairs:
+        if ((path1, path2) not in all_good_pairs and 
+            (path2, path1) not in all_good_pairs):
+            
+            schema1_good = path_to_schema.get(path1) in good_schemas
+            schema2_good = path_to_schema.get(path2) in good_schemas
+    
+            if not (schema1_good and schema2_good):
+                all_bad_pairs.add((path1, path2))
+    
+    # Calculate distances for bad pairs
+    bad_pairs_distances = [
+        ((path1, path2), cosine(schema_embeddings[path1], schema_embeddings[path2]))
+        for path1, path2 in all_bad_pairs
+    ]
+    
+    # Select pairs with smallest distances 
+    num_bad_pairs = min(len(sample_good_pairs), len(all_bad_pairs))
+    top_bad_pairs = nsmallest(num_bad_pairs, bad_pairs_distances, key=lambda x: x[1])
+    sample_bad_pairs.update(pair for pair, _ in top_bad_pairs)
+
     # Label data
     labeled_df = label_samples(df, sample_good_pairs, sample_bad_pairs)
    
@@ -1529,6 +1531,39 @@ def calculate_cosine_similarity(df, model, tokenizer, device):
 
     return df
 
+
+def calculate_cosine_similarity_2(df, model, tokenizer, device):
+    """
+    Computes cosine similarity between path1 and path2 for each filename separately.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing 'filename', 'path1', and 'path2' columns.
+        model (PreTrainedModel): Pretrained model to compute embeddings.
+        tokenizer (PreTrainedTokenizer): Tokenizer to tokenize paths.
+        device (str): Device to use for computation (e.g., 'cpu' or 'cuda').
+
+    Returns:
+        pd.DataFrame: DataFrame with an additional 'cosine_similarity' column.
+    """
+    all_results = []
+
+    # Process each schema (filename) separately
+    for filename, group in df.groupby("filename"):
+        unique_paths = set(group["path1"]).union(group["path2"])
+
+        # Compute embeddings for this file only
+        embeddings_cache = precompute_embeddings(unique_paths, model, tokenizer, device)
+
+        # Compute similarities for this specific file
+        similarities = calculate_similarities(group, embeddings_cache)
+
+        # Assign results to the group and store
+        group = group.copy()
+        group["cosine_similarity"] = similarities
+        all_results.append(group)
+
+    # Combine results from all filenames
+    return pd.concat(all_results, ignore_index=True)
 
 def save_ground_truths(ground_truths, ground_truth_file):
     """

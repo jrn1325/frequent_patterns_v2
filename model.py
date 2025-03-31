@@ -31,10 +31,11 @@ MODEL_NAME = "microsoft/codebert-base"
 ADAPTER_NAME = "frequent_patterns"
 SCHEMA_FOLDER = "converted_processed_schemas"
 JSON_FOLDER = "processed_jsons"
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 HIDDEN_SIZE = 768
 JSON_SUBSCHEMA_KEYWORDS = {"allOf", "oneOf", "anyOf", "not"}
-JSON_SCHEMA_KEYWORS = ["$defs", "definitions", "properties", "additionalProperties", "patternProperties", "items", "prefixItems", "allOf", "anyOf", "oneOf"]
+JSON_SCHEMA_KEYWORDS = {"properties", "patternProperties", "additionalProperties", "items", "prefixItems", "allOf", "oneOf", "anyOf", "not", "if", "then", "else", "$ref"}
+
 
 
  # Initialize the original model for calculating cosine similarity
@@ -311,6 +312,7 @@ class CustomEvalDataset(Dataset):
         #nesting_depth1 = len(path1)
         #nesting_depth2 = len(path2)
         #label = self.data.iloc[idx]["label"]
+        filename = self.data.iloc[idx]["filename"]
 
         return {
             "input_ids": tokenized_schema,
@@ -319,7 +321,8 @@ class CustomEvalDataset(Dataset):
             "path1": path1,
             "path2": path2,
             #"schema_similarity": schema_similarity,
-            #"label": label
+            #"label": label,
+            "filename": filename
         }
     
 
@@ -331,6 +334,7 @@ def collate_eval_fn(batch, tokenizer):
     path2 = [item["path2"] for item in batch]
     #schema_similarity = torch.tensor([item["schema_similarity"] for item in batch])
     #labels = torch.tensor([item["label"] for item in batch])
+    filenames = [item["filename"] for item in batch]
 
     padded_input_ids = pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
     padded_attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
@@ -342,7 +346,8 @@ def collate_eval_fn(batch, tokenizer):
         "path1": path1,
         "path2": path2,
         #"schema_similarity": schema_similarity,
-        #"label": labels
+        #"label": labels,
+        "filename": filenames
     }
 
 
@@ -670,17 +675,19 @@ def load_schema_and_dereference(schema_path):
             schema = jsonref.JsonRef.replace_refs(schema) 
     except Exception as e:
         print(f"Error loading schema {schema_path}: {e}")
-        return None
+        return schema
     return schema
 
 
-def get_schema_paths(schema, current_path=('$',)):
+def get_schema_paths(schema, current_path=('$',), is_data_level=False, max_depth=10):
     """
     Recursively traverse the JSON schema and return the full paths of all nested properties.
 
     Args:
         schema (dict): The JSON schema object.
         current_path (tuple): The current path tuple, starting from the root ('$').
+        is_data_level (bool): Indicates whether the function is inside a 'properties', 'patternProperties', or 'additionalProperties' block.
+        max_depth (int): Maximum depth allowed before stopping recursion.
 
     Yields:
         tuple: A tuple representing the path of each nested property as it would appear in a JSON document.
@@ -688,40 +695,46 @@ def get_schema_paths(schema, current_path=('$',)):
     if not isinstance(schema, dict):
         return
 
-    # Yield the current path for every dictionary entry
+    # Stop recursion if max depth is reached
+    if len(current_path) > max_depth:
+        #print(f"Warning: Max depth {max_depth} reached at {current_path}")
+        return
+
+    # Yield the current path
     yield current_path
 
     for key, value in schema.items():
         # Handle object properties
         if key == "properties" and isinstance(value, dict):
             for prop_key, prop_value in value.items():
-                yield from get_schema_paths(prop_value, current_path + (prop_key,))
+                yield from get_schema_paths(prop_value, current_path + (prop_key,), True, max_depth)
 
         # Handle `patternProperties` (Regex-based object keys)
         elif key == "patternProperties" and isinstance(value, dict):
             for pattern, pattern_value in value.items():
-                yield from get_schema_paths(pattern_value, current_path + ("pattern_key" + pattern,))
+                yield from get_schema_paths(pattern_value, current_path + ("pattern_key" + pattern,), True, max_depth)
+
+        # Include `additionalProperties` if it contains a schema
+        elif key == "additionalProperties" and isinstance(value, dict):
+            yield from get_schema_paths(value, current_path + ("additional_key",), True, max_depth)
 
         # Handle `items` for lists and objects
         elif key in {"items", "prefixItems"}:
             if isinstance(value, dict):
-                yield from get_schema_paths(value, current_path + ('*',))
-            elif isinstance(value, list):  # If `items` is a list (tuple schemas)
+                yield from get_schema_paths(value, current_path + ('*',), is_data_level, max_depth)
+            elif isinstance(value, list):
                 for idx, item in enumerate(value):
-                    yield from get_schema_paths(item, current_path + ('*',))
+                    yield from get_schema_paths(item, current_path + ('*',), is_data_level, max_depth)
 
         # Handle schema composition keywords (`allOf`, `anyOf`, `oneOf`)
         elif key in {"allOf", "anyOf", "oneOf"} and isinstance(value, list):
             for idx, item in enumerate(value):
-                yield from get_schema_paths(item, current_path + (f'{key}[{idx}]',))
-
-        # Include `additionalProperties` if it contains a schema
-        elif key == "additionalProperties" and isinstance(value, dict):
-            yield from get_schema_paths(value, current_path + ("additional_key",))
+                yield from get_schema_paths(item, current_path, is_data_level, max_depth)
 
         # Recursively handle other nested dictionaries
         elif isinstance(value, dict):
-            yield from get_schema_paths(value, current_path + (key,))
+            if is_data_level or key not in JSON_SCHEMA_KEYWORDS:
+                yield from get_schema_paths(value, current_path + (key,), is_data_level, max_depth)
 
 
 def format_schema_paths(paths):
@@ -757,63 +770,45 @@ def in_schema(path, schema_paths):
     return path in schema_paths
 
 
-def has_valid_prefix(path, schema_paths):
-    """
-    Check if the prefix of a tuple path exists in the schema paths.
 
-    Args:
-        path (tuple): The tuple path to check.
-        schema_paths (set): Set of schema paths.
-
-    Returns:
-        bool: True if the prefix exists in the schema paths, False otherwise.
-    """
-    prefix = path[:-1]
-    return prefix in schema_paths
-
-
-def remove_additional_properties(filtered_df, schema):
+def remove_additional_properties(filtered_df, schema_name):
     """
     Remove paths from the DataFrame that are not explicitly defined in the schema.
 
     Args:
         filtered_df (pd.DataFrame): DataFrame containing paths and associated data.
-        schema (str): The JSON schema name.
+        schema_name (str): The JSON schema filename.
 
     Returns:
         pd.DataFrame: Filtered DataFrame with paths that are explicitly defined in the schema.
     """
     # Load the schema
-    schema_path = os.path.join(SCHEMA_FOLDER, schema)
+    schema_path = os.path.join(SCHEMA_FOLDER, schema_name)
+
     try:
         with open(schema_path, 'r') as schema_file:
-            if schema == "package-json.json":
-                schema = json.load(schema_file)
-            else:
+            try:
                 schema = jsonref.load(schema_file)
-                schema = jsonref.JsonRef.replace_refs(schema) # Added this line
+            except RecursionError:
+                print(f"RecursionError: Loading {schema_name} without dereferencing.")
+                with open(schema_path, 'r') as schema_file: 
+                    schema = json.load(schema_file)  
     except Exception as e:
-        print(f"Error loading and dereferencing schema {schema_path}: {e}")
+        print(f"Error loading schema {schema_path}: {e}")
         return filtered_df
     
-    # Get all paths in the schema
-    schema_paths = set(get_schema_paths(schema))
+    # Get all paths in the schema safely
+    try:
+        schema_paths = set(get_schema_paths(schema))
+    except RecursionError:
+        print(f"RecursionError: Too much recursion when extracting paths from {schema_name}. Skipping filtering.")
+        return filtered_df 
 
     # Only keep rows where the 'path' exists in schema_paths
-    filtered_df = filtered_df[
-        filtered_df["path"].apply(lambda path: in_schema(path, schema_paths))
-    ]
-    '''
-    # Filter paths based on valid prefixes
-    filtered_df = filtered_df[
-        filtered_df["path"].apply(lambda path: has_valid_prefix(path, schema_paths))
-    ]
-    '''
+    filtered_df = filtered_df[filtered_df["path"].apply(lambda path: in_schema(path, schema_paths))]
 
-    # Reset the index of the filtered DataFrame
-    filtered_df = filtered_df.reset_index(drop=True)
-    return filtered_df
-
+    # Reset the index
+    return filtered_df.reset_index(drop=True)
 
 
 
@@ -853,13 +848,13 @@ def create_schema_pairs_with_common_properties(df, max_depth=6):
         for prop in properties:
             property_to_paths[prop].add(path)
 
-    # Find candidate pairs with at least 2 shared properties
+    # Find candidate pairs with at least 2 shared properties and 50 %  of properties in common
     candidate_pairs = set()
     for paths in property_to_paths.values():
         if len(paths) > 1:  
             for path1, path2 in combinations(paths, 2):
                 common_properties = path_to_properties[path1] & path_to_properties[path2]
-                if len(common_properties) >= 1:
+                if len(common_properties) >= 2 and len(common_properties) / len(path_to_properties[path1]) >= 0.25 and len(common_properties) / len(path_to_properties[path2]) >= 0.25:
                     candidate_pairs.add((path1, path2))
 
     # Precompute nesting depth normalization
@@ -922,6 +917,9 @@ def build_definition_graph(eval_loader, custom_model, device, schema_name):
                 path2 = batch["path2"][idx]
                 #print(f"Adding edge between {path1} and {path2}")
                 edges.append((path1, path2))
+            else:
+                #print(f"Skipping edge between {path1} and {path2}")
+                continue
         
     # Add edges to the graph
     graph.add_edges_from(edges)
@@ -955,24 +953,24 @@ def build_definition_graph_v2(test_ground_truth, schema_name):
     graph.add_edges_from(edges)
     return graph
 
+
 def build_definition_graph_v3(eval_loader, custom_model, device):
     """
-    Build a definition graph from tokenized schema pairs using the given model, with batching.
+    Build a definition graph from tokenized schema pairs using the given model, ensuring per-filename evaluation.
 
     Args:
         eval_loader (DataLoader): DataLoader containing the tokenized schema pairs.
         custom_model (PreTrainedModel): The model used for predicting connections.
         device (torch.device): The device (CPU or GPU) to run the model on.
-        schema_name (str): The name of the schema.
 
     Returns:
-        pd.DataFrame: DataFrame containing path1, path2, schema1, schema2, embedding_distance,
+        pd.DataFrame: DataFrame containing path1, path2, embedding_distance,
                       prediction, ground_truth, filename.
     """
-    records = []
+    all_results = []
+
 
     for batch in tqdm(eval_loader, total=len(eval_loader), leave=True, desc="Processing pairs for "):
-
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         input_ids, attention_mask, extra_features = batch["input_ids"], batch["attention_mask"], batch["extra_features"]
 
@@ -980,27 +978,20 @@ def build_definition_graph_v3(eval_loader, custom_model, device):
         with torch.no_grad():
             logits = custom_model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)
             preds = torch.argmax(logits, dim=-1).tolist()
-            print(f"Predictions: {preds}")
-
+            print(logits)
         for idx, pred in enumerate(preds):
-            path1 = batch["path1"][idx]
-            path2 = batch["path2"][idx]
-            schema_similarity = batch["schema_similarity"][idx].item()
-            ground_truth = batch["label"][idx].item()
-
-            records.append({
-                "path1": path1,
-                "path2": path2,
-                "distance": schema_similarity,
+            all_results.append({
+                "path1": batch["path1"][idx],
+                "path2": batch["path2"][idx],
+                "distance": batch["schema_similarity"][idx].item(),
                 "prediction": pred,
-                "ground_truth": ground_truth,
+                "ground_truth": batch["label"][idx].item(),
+                "filename": batch["filename"][idx]
             })
-
-    # Create DataFrame
-    df = pd.DataFrame(records)
-    # Wrte the DataFrame to a CSV file
-    df.to_csv("predictions.csv", index=False, header=True, sep=";")
-
+        
+    # Create DataFrame from the results
+    df = pd.DataFrame(all_results)
+   
     return df
 
 
@@ -1010,34 +1001,32 @@ def find_definitions_from_graph(graph):
 
     Args:
         graph (nx.Graph): A graph representing schema connections.
-        formatted_schema_paths (set): A set of formatted schema paths.
 
     Returns:
         List[List]: A list of lists, each containing nodes representing a definition.
     """
 
-    # Get all the cliques from the graph and sort them based on their lengths in ascending order
-    cliques = list(nx.algorithms.find_cliques(graph))
-    cliques.sort(key=lambda a: len(a))
-    
-    # Make sure a path only appears in one definition
+    # Extract cliques from the graph
+    cliques = list(nx.find_cliques(graph))
+
+    # Track processed nodes to ensure each path appears only in one definition
+    processed_nodes = set()
     processed_cliques = []
-    while cliques:
-        # Remove the last clique
-        largest_clique = cliques.pop()
-        # Create a set of vertices in the largest clique
-        clique_set = set(largest_clique)
-        # Filter out vertices from other cliques that are in the largest clique
-        filtered_cliques = []
-        for clique in cliques:
-            filtered_clique = [c for c in clique if c not in clique_set]
-            # Remove paths that are not in the schema
-            if len(filtered_clique) > 1:
-                filtered_cliques.append(filtered_clique)
-        processed_cliques.append(list(clique_set))
-        cliques = filtered_cliques
+
+    for clique in sorted(cliques, key=len, reverse=True):  # Process larger cliques first
+        clique_set = set(clique)
+
+        # Skip cliques that are fully covered by previously processed ones
+        if clique_set & processed_nodes:
+            clique_set -= processed_nodes
+
+
+        if len(clique_set) > 1:  # Ignore trivial definitions
+            processed_cliques.append(clique_set)
+            processed_nodes.update(clique_set)  # Mark these nodes as processed
 
     return processed_cliques
+
 
 
 def calc_jaccard_index(actual_cluster, predicted_cluster):
@@ -1200,7 +1189,7 @@ def get_all_samples(df, frequent_ref_defn_paths):
     return labeled_df
 
 '''
-def evaluate_single_schema(df, test_ground_truth):
+def evaluate_single_schema(df, schema_name):
     """
     Helper function to evaluate a single schema.
 
@@ -1217,22 +1206,16 @@ def evaluate_single_schema(df, test_ground_truth):
     # Load the model and tokenizer
     custom_model, tokenizer = load_model_and_adapter()
 
+    # Tokenize and merge schemas
+    eval_df = merge_schema_tokens(df, tokenizer)
+        
+    # Calculate the cosine similarity between the paths
+    eval_df = process_data.calculate_cosine_similarity_2(eval_df, original_model, tokenizer, device)    
+
     # Enable multiple GPU usage with DataParallel
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs for model parallelism.", flush=True)
         custom_model = nn.DataParallel(custom_model)
-    
-        # Create a DataFrame with pairs of schemas that have at least two common properties
-        #pairs_df = create_schema_pairs_with_common_properties(df)
-        #if pairs_df.empty:
-        #    print(f"No pairs found for schema {schema_name}.", flush=True)
-        #    return None
-        
-        # Tokenize and merge schemas
-        eval_df = merge_schema_tokens(df, tokenizer)
-        
-        # Calculate the cosine similarity between the paths
-        eval_df = process_data.calculate_cosine_similarity(eval_df, original_model, tokenizer, device)
         
         # Create datasets with dynamic padding and batching
         eval_dataset = CustomEvalDataset(eval_df)
@@ -1242,8 +1225,8 @@ def evaluate_single_schema(df, test_ground_truth):
         custom_model.eval()
         
         df = build_definition_graph_v3(eval_loader, custom_model, device)
-        sys.exit(0)
         return df
+     
     
 '''
 def evaluate_single_schema(schema, test_ground_truth):
@@ -1263,19 +1246,14 @@ def evaluate_single_schema(schema, test_ground_truth):
     df, frequent_ref_defn_paths, schema_name, failure_flags = process_data.process_schema(schema, "")
     print(f"Evaluating schema: {schema_name}", flush=True)
     if df is not None and frequent_ref_defn_paths is not None:
-        pairs_df = get_all_samples(df, frequent_ref_defn_paths)
+        #pairs_df = get_all_samples(df, frequent_ref_defn_paths)
         
         # Remove paths whose prefixes are not explicitly defined in the schema
-        #df = remove_additional_properties(df, schema_name)
-        #if len(df) < 2:
-        #    print(f"Schema {schema_name} has less than 2 paths after filtering.", flush=True)
-        #    return None
-
-
-        # Load and derefence the schema
-        #schema = load_schema_and_dereference(os.path.join(SCHEMA_FOLDER, schema_name))
-        # Get the schema paths
-        #schema_paths = set(get_schema_paths(schema))
+        df = remove_additional_properties(df, schema_name)
+        #print(schema_paths, flush=True)
+        if len(df) < 2:
+            print(f"Schema {schema_name} has less than 2 paths after filtering.", flush=True)
+            return None
         
         # Load the model and tokenizer
         custom_model, tokenizer = load_model_and_adapter()
@@ -1314,8 +1292,8 @@ def evaluate_single_schema(schema, test_ground_truth):
         actual_clusters = [sorted([tuple(path) for path in cluster]) for cluster in sorted(defn_paths_dict.values())]
 
         # Calculate the precision, recall, and F1-score
-        precision, recall, f1_score = calculate_metrics(actual_clusters, predicted_clusters)
-        #precision, recall, f1_score, _, _ = calc_scores(actual_clusters, predicted_clusters)
+        #precision, recall, f1_score = calculate_metrics(actual_clusters, predicted_clusters)
+        precision, recall, f1_score, _, _ = calc_scores(actual_clusters, predicted_clusters)
 
         print(f"Actual clusters: {schema_name}", flush=True)
         for cluster in actual_clusters:
@@ -1347,19 +1325,28 @@ def evaluate_data(test_ground_truth, output_file="evaluation_results.json"):
     f1_scores = []
     results = []
     frames = []
+    '''
     df = pd.read_csv("updated_test_data.csv",sep=';') 
+
+    # Split dataframe into multiple one for each filename
+    df = df.groupby("filename")
+
+    # Iterate through each filename group
+    for schema_name, group in tqdm(df, total=len(df), position=1, desc="Processing schemas"):
+        df = group.reset_index(drop=True)
+        df = evaluate_single_schema(df, schema_name) 
+        frames.append(df)
+    # Concatenate all dataframes into one   
+    df = pd.concat(frames, ignore_index=True)
+    # Save the concatenated dataframe to a CSV file
+    df.to_csv("predictions.csv", index=False, header=True, sep=";")
+    sys.exit(0)
+    '''
+
     # Process schemas sequentially
     for schema in tqdm(test_schemas, total=len(test_schemas), position=1):
         result = evaluate_single_schema(schema, test_ground_truth)
-        '''
-            df = evaluate_single_schema(df, test_ground_truth)
-            if df is not None:
-                frames.append(df)
-        
-        # Concatenate all DataFrames
-        result = pd.concat(frames)
-        result.to_csv("data.csv", index=False)
-        '''
+
         if result is not None:
             schema, precision, recall, f1_score, actual_clusters, predicted_clusters = result
             f1_scores.append(f1_score)
@@ -1375,7 +1362,7 @@ def evaluate_data(test_ground_truth, output_file="evaluation_results.json"):
                 "actual_clusters": actual_clusters,
                 "predicted_clusters": predicted_clusters
             })
-
+        
     # Calculate average F1-score and average recall, then add them to results
     if f1_scores:
         avg_f1_score = sum(f1_scores) / len(f1_scores)
@@ -1410,23 +1397,28 @@ def group_paths(df, test_ground_truth, min_common_keys=2, output_file="evaluatio
     f1_scores = []  # To store F1 scores for each schema
     precision_scores = []  # To store precision scores for each schema
     recall_scores = []  # To store recall scores for each schema
+    exlude_schemas = ["behat-yml.json", "bashly-yml.json", "solidarity.json", "taskcat.json", "woodpecker-pipeline-config.json", "starship.json"]  # Schemas to exclude from evaluation
 
     # Iterate through each filename group
     for schema_name, group in tqdm(df.groupby("filename"), position=1, total=len(df["filename"].unique()), desc="Grouping paths"):
+        # Skip schemas that are in the exclude list
+        if schema_name in exlude_schemas:
+            print(f"Skipping schema {schema_name} as it is in the exclude list.", flush=True)
+            continue
         # Convert string representation of paths to tuples
         group["path"] = group["path"].apply(ast.literal_eval)
 
         # Remove paths not explicitly defined in the schema
-        filtered_df = remove_additional_properties(group, schema_name)
-        print(f"Number of paths after filtering: {len(filtered_df)} for schema {schema_name}", flush=True)
+        #filtered_df = remove_additional_properties(group, schema_name)
+        #print(f"Number of paths after filtering: {len(filtered_df)} for schema {schema_name}", flush=True)
 
         # Skip schemas with insufficient paths after filtering
-        if filtered_df.empty or len(filtered_df) < 2:
-            print(f"Schema {schema_name} has less than 2 paths after filtering. Skipping.", flush=True)
-            continue
+        #if filtered_df.empty or len(filtered_df) < 2:
+        #    print(f"Schema {schema_name} has less than 2 paths after filtering. Skipping.", flush=True)
+        #    continue
 
-        paths = filtered_df["path"].tolist()
-        distinct_keys = filtered_df["distinct_nested_keys"].tolist()
+        paths = group["path"].tolist()
+        distinct_keys = group["distinct_nested_keys"].tolist()
 
         # Dictionary to track paths based on shared keys
         group_dict = defaultdict(list)
@@ -1461,6 +1453,7 @@ def group_paths(df, test_ground_truth, min_common_keys=2, output_file="evaluatio
 
         # Evaluate the predicted clusters against the ground truth
         precision, recall, f1_score, matched_definitions, matched_paths = calc_scores(actual_clusters, predicted_clusters)
+        #precision, recall, f1_score = calculate_metrics(actual_clusters, predicted_clusters)
         print(f"Schema: {schema_name}, Precision: {precision}, Recall: {recall}, F1-score: {f1_score}", flush=True)
         print(flush=True)
 
@@ -1506,7 +1499,7 @@ def get_json_schema_size(original):
         None: Prints the schema names and their sizes in kilobytes.
     """
     # Load the ground truth file
-    with open("test_ground_truth.json", 'r') as f:
+    with open("test_ground_truth_v2.json", 'r') as f:
         for line in f:
             json_data = json.loads(line)
             for schema_name in json_data.keys():
