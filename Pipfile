@@ -1,20 +1,19 @@
 [[source]]
 url = "https://pypi.org/simple"
-verify_ssl = false
-name = "pip_conf_index_global"
+verify_ssl = true
+name = "pypi"
 
 [packages]
-transformers = "*"
+tqdm = "*"
+jsonschema = "*"
+jsonref = "*"
 pandas = "*"
 torch = "*"
-wandb = "*"
 adapters = "*"
 scikit-learn = "*"
-accelerate = "*"
-adapter-transformers = "*"
-jsonschema = "*"
-jq = "*"
-joblib = "*"
+transformers = "*"
+wandb = "*"
+matplotlib = "*"
 
 [dev-packages]
 
