@@ -1409,16 +1409,16 @@ def group_paths(df, test_ground_truth, min_common_keys=2, output_file="evaluatio
         group["path"] = group["path"].apply(ast.literal_eval)
 
         # Remove paths not explicitly defined in the schema
-        #filtered_df = remove_additional_properties(group, schema_name)
-        #print(f"Number of paths after filtering: {len(filtered_df)} for schema {schema_name}", flush=True)
+        filtered_df = remove_additional_properties(group, schema_name)
+        print(f"Number of paths after filtering: {len(filtered_df)} for schema {schema_name}", flush=True)
 
         # Skip schemas with insufficient paths after filtering
-        #if filtered_df.empty or len(filtered_df) < 2:
-        #    print(f"Schema {schema_name} has less than 2 paths after filtering. Skipping.", flush=True)
-        #    continue
+        if filtered_df.empty or len(filtered_df) < 2:
+            print(f"Schema {schema_name} has less than 2 paths after filtering. Skipping.", flush=True)
+            continue
 
-        paths = group["path"].tolist()
-        distinct_keys = group["distinct_nested_keys"].tolist()
+        paths = filtered_df["path"].tolist()
+        distinct_keys = filtered_df["distinct_nested_keys"].tolist()
 
         # Dictionary to track paths based on shared keys
         group_dict = defaultdict(list)
@@ -1431,7 +1431,8 @@ def group_paths(df, test_ground_truth, min_common_keys=2, output_file="evaluatio
 
             # Attempt to add path to an existing group
             for existing_keys in list(group_dict.keys()):
-                if len(keys & existing_keys) >= min_common_keys:  # Check for key overlap
+                common_keys = keys & existing_keys
+                if len(common_keys) >= min_common_keys  and len(common_keys) / len(existing_keys) >= 0.25:
                     group_dict[existing_keys].append(path)
                     added_to_group = True
                     break
@@ -1442,7 +1443,7 @@ def group_paths(df, test_ground_truth, min_common_keys=2, output_file="evaluatio
 
         # Filter groups with more than one path and sort paths within groups
         predicted_clusters = [sorted(group) for group in group_dict.values() if len(group) > 1]
-        predicted_clusters = sorted(predicted_clusters)  # Sort groups for consistency
+        predicted_clusters = sorted(predicted_clusters)
 
         # Get the actual clusters for the current filename
         defn_paths_dict = test_ground_truth.get(schema_name, {})
