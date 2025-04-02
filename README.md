@@ -17,7 +17,7 @@ The core functionality of this project includes:
 Install the required Python packages using pip:
 
 ```bash
-pip install -r requirements.txt
+piplock install
 ```
 
 ## Dataset
@@ -29,7 +29,7 @@ The project expects JSON schema files to be stored in the `converted_processed_s
 1. Clone the repository.
 2. Install dependencies using:
    ```bash
-   pip install -r requirements.txt
+   piplock install
    ```
 3. Ensure your JSON schema files are placed in the `converted_processed_schemas` directory.
 4. Ensure the `test_ground_truth_v2.json` file is present in the root directory.
@@ -45,8 +45,8 @@ import pandas as pd
 import process_data  # Assuming process_data.py contains necessary data processing functions
 
 # Load and preprocess your data
-train_df = pd.read_csv("train_data.csv", sep=";")  # Ensure your path is correct.
-test_df = pd.read_csv("test_data.csv", sep=";")  # Ensure your path is correct.
+train_df = pd.read_csv("sample_train_data.csv", sep=";")  # Ensure your path is correct.
+test_df = pd.read_csv("sample_test_data.csv", sep=";")  # Ensure your path is correct.
 
 train_model(train_df, test_df)
 ```
