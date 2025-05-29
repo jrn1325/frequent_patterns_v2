@@ -3,8 +3,6 @@ import itertools
 import json
 import jsonref
 import math
-import matplotlib.pyplot as plt
-import networkx as nx
 import os
 import pandas as pd
 import subprocess
@@ -17,7 +15,8 @@ import wandb
 from adapters import AutoAdapterModel
 from collections import defaultdict, OrderedDict
 from itertools import combinations
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, precision_score, recall_score, f1_score, accuracy_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, accuracy_score
+from torch.cuda.amp import autocast, GradScaler
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
@@ -31,7 +30,7 @@ MODEL_NAME = "microsoft/codebert-base"
 ADAPTER_NAME = "frequent_patterns"
 SCHEMA_FOLDER = "converted_processed_schemas"
 JSON_FOLDER = "processed_jsons"
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 HIDDEN_SIZE = 768
 JSON_SUBSCHEMA_KEYWORDS = {"allOf", "oneOf", "anyOf", "not"}
 JSON_SCHEMA_KEYWORDS = {"properties", "patternProperties", "additionalProperties", "items", "prefixItems", "allOf", "oneOf", "anyOf", "not", "if", "then", "else", "$ref"}
@@ -251,17 +250,17 @@ class CustomDataset(Dataset):
     def __getitem__(self, idx):
         tokenized_schema = self.data.iloc[idx]["tokenized_schema"]
         label = self.data.iloc[idx]["label"]
-        path1_freq = self.data.iloc[idx]["path1_freq"]
-        path2_freq = self.data.iloc[idx]["path2_freq"]
-        nesting_depth1 = self.data.iloc[idx]["nesting_depth1"]
-        nesting_depth2 = self.data.iloc[idx]["nesting_depth2"]
-        cosine_similarity = self.data.iloc[idx]["cosine_similarity"]
-        
+        path_depth_diff = self.data.iloc[idx]["path_depth_diff"]
+        jaccard_keys = self.data.iloc[idx]["jaccard_keys"]
+        exact_key_match = self.data.iloc[idx]["exact_key_match"]
+        key_count_diff = self.data.iloc[idx]["key_count_diff"]
+        norm_prefix_len = self.data.iloc[idx]["norm_prefix_len"]
+
         return {
             "input_ids": tokenized_schema,
             "attention_mask": [1] * len(tokenized_schema),
             "label": label,
-            "extra_features": [path1_freq, path2_freq, cosine_similarity, nesting_depth1, nesting_depth2]
+            "extra_features": [path_depth_diff, jaccard_keys, exact_key_match, key_count_diff, norm_prefix_len]
         }
 
 
@@ -301,26 +300,21 @@ class CustomEvalDataset(Dataset):
 
     def __getitem__(self, idx):
         tokenized_schema = self.data.iloc[idx]["tokenized_schema"]
-        path1_freq = self.data.iloc[idx]["path1_freq"]
-        path2_freq = self.data.iloc[idx]["path2_freq"]
-        nesting_depth1 = self.data.iloc[idx]["nesting_depth1"]
-        nesting_depth2 = self.data.iloc[idx]["nesting_depth2"]
-        cosine_similarity = self.data.iloc[idx]["cosine_similarity"]
-        #schema_similarity = self.data.iloc[idx]["schema_similarity"]
         path1 = self.data.iloc[idx]["path1"]
         path2 = self.data.iloc[idx]["path2"]
-        #nesting_depth1 = len(path1)
-        #nesting_depth2 = len(path2)
-        #label = self.data.iloc[idx]["label"]
         filename = self.data.iloc[idx]["filename"]
+        path_depth_diff = self.data.iloc[idx]["path_depth_diff"]
+        jaccard_keys = self.data.iloc[idx]["jaccard_keys"]
+        exact_key_match = self.data.iloc[idx]["exact_key_match"]
+        key_count_diff = self.data.iloc[idx]["key_count_diff"]
+        norm_prefix_len = self.data.iloc[idx]["norm_prefix_len"]
 
         return {
             "input_ids": tokenized_schema,
             "attention_mask": [1] * len(tokenized_schema),
-            "extra_features": [path1_freq, path2_freq, cosine_similarity, nesting_depth1, nesting_depth2],
+            "extra_features": [path_depth_diff, jaccard_keys, exact_key_match, key_count_diff, norm_prefix_len],
             "path1": path1,
             "path2": path2,
-            #"schema_similarity": schema_similarity,
             #"label": label,
             "filename": filename
         }
@@ -332,7 +326,6 @@ def collate_eval_fn(batch, tokenizer):
     extra_features = torch.tensor([item["extra_features"] for item in batch])
     path1 = [item["path1"] for item in batch]
     path2 = [item["path2"] for item in batch]
-    #schema_similarity = torch.tensor([item["schema_similarity"] for item in batch])
     #labels = torch.tensor([item["label"] for item in batch])
     filenames = [item["filename"] for item in batch]
 
@@ -345,51 +338,42 @@ def collate_eval_fn(batch, tokenizer):
         "extra_features": extra_features,
         "path1": path1,
         "path2": path2,
-        #"schema_similarity": schema_similarity,
         #"label": labels,
         "filename": filenames
     }
 
 
 class CustomBERTModel(nn.Module):
-    def __init__(self):
-        super(CustomBERTModel, self).__init__()
-
-        # Load pre-trained CodeBERT with adapters
-        self.codebert = AutoAdapterModel.from_pretrained(MODEL_NAME)
-
-        # Add the adapter and classification head
+    def __init__(self, extra_feat_dim=5):
+        super().__init__()
+        self.codebert = AutoAdapterModel.from_pretrained("microsoft/codebert-base")
         self.codebert.add_adapter(ADAPTER_NAME, config="seq_bn")
-        self.codebert.add_classification_head(ADAPTER_NAME, num_labels=2)
         self.codebert.set_active_adapters(ADAPTER_NAME)
         self.codebert.train_adapter(ADAPTER_NAME)
 
-        # Custom layers for processing additional inputs
-        self.extra_features = nn.Linear(5, HIDDEN_SIZE)
+        hidden_size = self.codebert.config.hidden_size  # 768
 
-        # Final classifier to process concatenated logits and custom features
-        self.modified_classifier = nn.Linear(HIDDEN_SIZE + 2, 2)
+        self.extra_features = nn.Linear(extra_feat_dim, hidden_size)
+        self.dropout = nn.Dropout(0.1)
+        self.classifier = nn.Linear(hidden_size * 2, 2)
 
     def forward(self, input_ids, attention_mask, extra_features):
-        # Pass input through the pre-trained CodeBERT with the adapter
-        outputs = self.codebert(input_ids=input_ids, attention_mask=attention_mask)
-        
-        # Extract the logits from the classification head
-        logits = outputs.logits
+        # Use the base model to get hidden states, not classification output
+        outputs = self.codebert.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True
+        )
+        cls_embedding = outputs.last_hidden_state[:, 0, :]  # [CLS] token embedding
 
-        # Process the additional input features with the custom layer
-        extra_features_emb = F.relu(self.extra_features(extra_features.float()))
+        extra_emb = F.relu(self.extra_features(extra_features.float()))  # [B, H]
+        combined = torch.cat([cls_embedding, extra_emb], dim=-1)  # [B, 2H]
 
-        # Concatenate the CodeBERT logits and the processed feature embeddings
-        combined_output = torch.cat([logits, extra_features_emb], dim=-1)
-        
-        # Pass the combined output through the final classification layer
-        logits = self.modified_classifier(combined_output)
-    
-        return logits        
-        
+        logits = self.classifier(self.dropout(combined))  # [B, 2]
+        return logits
 
-def normalize_nesting_depths(df, eval_mode, max_depth=6):
+
+def normalize_nesting_depths(df, eval_mode, max_depth=10):
     """
     Calculates and normalizes the nesting depths by dividing by max_depth for a DataFrame, with optional capping at max_depth.
 
@@ -414,63 +398,124 @@ def normalize_nesting_depths(df, eval_mode, max_depth=6):
 
 def save_model_and_adapter(model, save_path="frequent_pattern_model"):
     """
-    Save the custom model's state_dict and the adapter, as well as the pretrained base model.
+    Save the model and adapter to a specified directory.
 
     Args:
-        model (CustomBERTModel): The custom model to save.
+        model (CustomBERTModel): The model to save.
+        save_path (str): Directory where the model and adapter will be saved.
     """
 
-    # Ensure the save directory exists
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
-    path = os.path.join(os.getcwd(), save_path)
+    os.makedirs(save_path, exist_ok=True)
+    path = os.path.abspath(save_path)
 
-    # Handle multi-GPU models
+    # Handle DataParallel
     model = model.module if isinstance(model, nn.DataParallel) else model
 
-    # Save the state_dict for the custom layers (adapter and custom layers)
-    torch.save(model.state_dict(), os.path.join(path, "frequent_patterns_model_state_dict.pth"))
-
-    # Save the pretrained base model
-    model.codebert.save_pretrained(path)
-
-    # Save the adapter
+    # Save adapter (inside codebert)
     model.codebert.save_adapter(path, ADAPTER_NAME)
 
-    print(f"Model and adapter saved to {path}")
+    # Save base model (only if you made changes to it — optional)
+    model.codebert.base_model.save_pretrained(path)
+
+    # Save custom classification layers
+    torch.save({
+        "extra_features": model.extra_features.state_dict(),
+        "classifier": model.classifier.state_dict()
+    }, os.path.join(path, "custom_layers.pth"))
+
+    print(f"Saved adapter and custom layers to {path}")
 
 
 def load_model_and_adapter(save_path="frequent_pattern_model"):
     """
     Load the pretrained base model, adapter, and custom model weights.
-
-    Args:
+    Args:   
         save_path (str): Directory where the model and adapter are saved.
-    
+
     Returns:
-        model (CustomBERTModel): The loaded model with pretrained weights and adapter.
-        tokenizer (PreTrainedTokenizer): The tokenizer used for processing schemas.
+        model (CustomBERTModel)
+        tokenizer (AutoTokenizer)
     """
 
-    # Convert save_path to an absolute path to prevent issues with relative paths
     save_path = os.path.abspath(save_path)
 
-    # Load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-    # Load the pretrained CodeBERT model
+    # Rebuild base CodeBERT model with adapter
+    codebert = AutoAdapterModel.from_pretrained(MODEL_NAME)
+    codebert.load_adapter(save_path, load_as=ADAPTER_NAME, set_active=True)
+
+    # Rebuild full custom model
     model = CustomBERTModel()
+    model.codebert = codebert
 
-    # Load the adapter
-    model.codebert.load_adapter(save_path, set_active=True)
-
-    # Load the saved state_dict for the custom layers
-    model_state_path = os.path.join(save_path, "frequent_patterns_model_state_dict.pth")
-    model.load_state_dict(torch.load(model_state_path), strict=False)
+    # Load only custom layers
+    custom_state_path = os.path.join(save_path, "custom_layers.pth")
+    custom_state = torch.load(custom_state_path)
+    model.extra_features.load_state_dict(custom_state["extra_features"])
+    model.classifier.load_state_dict(custom_state["classifier"])
 
     print(f"Model and adapter loaded from {save_path}")
-
     return model, tokenizer
+
+
+def shared_prefix_len(path1, path2):
+    return sum(1 for a, b in zip(path1, path2) if a == b)
+
+
+def normalized_prefix_len(path1, path2):
+    if not path1 or not path2:
+        return 0
+    return shared_prefix_len(path1, path2) / min(len(path1), len(path2))
+
+
+def jaccard(set1, set2):
+    set1, set2 = set(set1), set(set2)
+    union = set1 | set2
+    inter = set1 & set2
+    return len(inter) / len(union) if union else 0
+
+
+def num_props(schema_str):
+    try:
+        return len(ast.literal_eval(schema_str).get("properties", {}))
+    except:
+        return 0
+
+
+def add_extra_features(df, mode):
+    """
+    Adds extra features to the DataFrame, including path frequencies and cosine similarity.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing schema pairs.
+        mode (str): Mode of operation, either "train" or "eval".
+
+    Returns:
+        pd.DataFrame: Updated DataFrame with additional features.
+    """
+
+    if mode == "train":
+        df["nested_keys1"] = df["nested_keys1"].apply(ast.literal_eval)
+        df["nested_keys2"] = df["nested_keys2"].apply(ast.literal_eval)
+        
+    df["path_depth_diff"] = df.apply(lambda row: abs(row["nesting_depth1"] - row["nesting_depth2"]), axis=1)
+
+    df["jaccard_keys"] = df.apply(
+        lambda row: jaccard(set(row["nested_keys1"].keys()), set(row["nested_keys2"].keys())),
+        axis=1
+    )
+    df["exact_key_match"] = df.apply(
+        lambda row: int(set(row["nested_keys1"].keys()) == set(row["nested_keys2"].keys())),
+        axis=1
+    )
+    df["key_count_diff"] = df.apply(
+        lambda row: abs(len(row["nested_keys1"].keys()) - len(row["nested_keys2"].keys())) / min(len(row["nested_keys1"].keys()), len(row["nested_keys2"].keys())),
+        axis=1
+    )
+    df["norm_prefix_len"] = df.apply(lambda row: normalized_prefix_len(row["path1"], row["path2"]), axis=1)
+
+    return df
 
 
 def train_model(train_df, test_df):
@@ -484,7 +529,7 @@ def train_model(train_df, test_df):
     # Hyperparameters
     accumulation_steps = 4
     learning_rate = (1e-5)/4
-    num_epochs = 40
+    num_epochs = 20
 
     # Initialize wandb logging
     wandb.init(
@@ -496,35 +541,32 @@ def train_model(train_df, test_df):
         }
     )
 
-    # Initialize the custom model and tokenizer
+    # Initialize model and tokenizer
     model = CustomBERTModel()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-    # Set up optimizer
     optimizer = AdamW(model.parameters(), lr=learning_rate)
+    scaler = GradScaler()
 
-    # Use all available GPUs
+    # Multi-GPU support
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
 
-    # Move the model to the appropriate device (GPU if available)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # Process and normalize nesting depths for training and testing
-    train_df = normalize_nesting_depths(train_df, False, max_depth=6)
-    test_df = normalize_nesting_depths(test_df, False, max_depth=6)
-
-    # Merge tokens for each schema in the training and testing DataFrames
+    # Preprocessing
+    train_df = normalize_nesting_depths(train_df, False, max_depth=10)
+    test_df = normalize_nesting_depths(test_df, False, max_depth=10)
+    train_df = add_extra_features(train_df, "train")
+    test_df = add_extra_features(test_df, "train")
     train_df = merge_schema_tokens(train_df, tokenizer)
     test_df = merge_schema_tokens(test_df, tokenizer)
 
-    # Create datasets with dynamic padding and batching
     train_dataset = CustomDataset(train_df)
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda batch: collate_fn(batch, tokenizer))
 
-    # Set up scheduler to adjust the learning rate during training
     num_training_steps = (num_epochs * len(train_dataloader) // accumulation_steps)
     num_warmup_steps = int(0.1 * num_training_steps)
     lr_scheduler = get_linear_schedule_with_warmup(
@@ -533,9 +575,8 @@ def train_model(train_df, test_df):
         num_training_steps=num_training_steps,
     )
 
-    # Train the model
-    model.train()
     loss_fn = torch.nn.CrossEntropyLoss()
+    model.train()
 
     pbar = tqdm(range(num_epochs), position=0, desc="Epoch")
     for epoch in pbar:
@@ -544,35 +585,30 @@ def train_model(train_df, test_df):
             batch = {k: v.to(device) for k, v in batch.items()}
             input_ids, attention_mask, labels, extra_features = batch["input_ids"], batch["attention_mask"], batch["label"], batch["extra_features"]
 
-            # Forward pass
-            logits = model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)
+            with autocast():  # Enable mixed precision
+                logits = model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)
+                training_loss = loss_fn(logits, labels)
 
-            # Calculate the training loss
-            training_loss = loss_fn(logits, labels)
-
-            # Handle DataParallel case
             if training_loss.dim() > 0:
                 training_loss = training_loss.mean()
 
-            training_loss.backward()
+            # Backward with scaled loss
+            scaler.scale(training_loss).backward()
 
             if (i + 1) % accumulation_steps == 0:
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-                
-                # Calculate global training step
                 step = (epoch * len(train_dataloader) + i + 1) // accumulation_steps
 
             total_loss += training_loss.item()
 
-        # Calculate average loss for the epoch
         average_loss = total_loss / len(train_dataloader)
 
-        # Evaluate the model on the test set
+        # Evaluate after each epoch
         test_loss = test_model(test_df, tokenizer, model, device, wandb)
 
-        # Log training metrics
         wandb.log({
             "training_loss": average_loss,
             "testing_loss": test_loss,
@@ -581,10 +617,9 @@ def train_model(train_df, test_df):
             "step": step
         })
 
-    save_model_and_adapter(model) 
-    # Finish wandb logging
+    save_model_and_adapter(model)
     wandb.finish()
-
+ 
     
 def test_model(test_df, tokenizer, model, device, wandb):
     """
@@ -755,7 +790,6 @@ def format_schema_paths(paths):
     return formatted_paths
 
 
-
 def in_schema(path, schema_paths):
     """
     Check if the given path matches exactly any path in schema_paths.
@@ -768,7 +802,6 @@ def in_schema(path, schema_paths):
         bool: True if the path matches exactly any schema path, False otherwise.
     """
     return path in schema_paths
-
 
 
 def remove_additional_properties(filtered_df, schema_name):
@@ -811,25 +844,19 @@ def remove_additional_properties(filtered_df, schema_name):
     return filtered_df.reset_index(drop=True)
 
 
-
-
-
-
-
-
 def create_schema_pairs_with_common_properties(df, max_depth=6):
     """
-    Optimized version to create a DataFrame with pairs of schemas that have at least two common properties,
-    while normalizing nesting depth.
+    Create a DataFrame with pairs of schemas that have at least two common properties,
+    and at least 25% property overlap in both schemas. Also normalizes nesting depth.
 
     Args:
-        df (pd.DataFrame): Input DataFrame containing columns 'path', 'schema', 'filename'.
-        max_depth (int): Maximum depth for normalization.
+        df (pd.DataFrame): Input DataFrame with columns 'path', 'schema', 'filename', 'nested_keys'.
+        max_depth (int): Max depth for path normalization.
 
     Returns:
-        pd.DataFrame: A new DataFrame with pairs of schemas that share at least two properties.
+        pd.DataFrame: DataFrame with valid schema pairs and associated metadata.
     """
-    # Precompute path-to-row lookup to avoid slow df[df["path"] == path1] operations
+    # Precompute row lookup
     path_to_row = {row["path"]: row for _, row in df.iterrows()}
 
     # Extract schema properties once
@@ -837,33 +864,35 @@ def create_schema_pairs_with_common_properties(df, max_depth=6):
     for path, row in path_to_row.items():
         try:
             schema = json.loads(row["schema"])
-            properties = frozenset(extract_properties(schema).keys())
-        except (json.JSONDecodeError, TypeError):
+            props = extract_properties(schema)  # Assume this returns a dict of properties
+            properties = frozenset(props.keys())
+        except (json.JSONDecodeError, TypeError, AttributeError):
             properties = frozenset()
         path_to_properties[path] = properties
 
-    # Reverse index: property -> set of paths containing that property
-    property_to_paths = defaultdict(set)
-    for path, properties in path_to_properties.items():
-        for prop in properties:
-            property_to_paths[prop].add(path)
-
-    # Find candidate pairs with at least 2 shared properties and 50 %  of properties in common
+    # Compute all pairs with at least 2 shared properties and ≥25% overlap
+    all_paths = list(path_to_properties.keys())
     candidate_pairs = set()
-    for paths in property_to_paths.values():
-        if len(paths) > 1:  
-            for path1, path2 in combinations(paths, 2):
-                common_properties = path_to_properties[path1] & path_to_properties[path2]
-                if len(common_properties) >= 2 and len(common_properties) / len(path_to_properties[path1]) >= 0.25 and len(common_properties) / len(path_to_properties[path2]) >= 0.25:
-                    candidate_pairs.add((path1, path2))
+    for path1, path2 in combinations(all_paths, 2):
+        props1 = path_to_properties[path1]
+        props2 = path_to_properties[path2]
+        if not props1 or not props2:
+            continue
 
-    # Precompute nesting depth normalization
+        common = props1 & props2
+        if len(common) >= 1:
+            overlap1 = len(common) / len(props1)
+            overlap2 = len(common) / len(props2)
+            if overlap1 >= 0.25 and overlap2 >= 0.25:
+                candidate_pairs.add((path1, path2))
+
+    # Normalize nesting depth using actual tuple depth
     path_to_depth = {
-        path: min(len(path), max_depth) / max_depth
+        path: min(len(path) if isinstance(path, (list, tuple)) else len(eval(path)), max_depth) / max_depth
         for path in path_to_row
     }
 
-    # Collect valid pairs
+    # Build rows for final DataFrame
     rows = []
     for path1, path2 in candidate_pairs:
         row1, row2 = path_to_row[path1], path_to_row[path2]
@@ -872,8 +901,6 @@ def create_schema_pairs_with_common_properties(df, max_depth=6):
             "filename": row1["filename"],
             "path1": path1,
             "path2": path2,
-            "path1_freq": row1["path_frequency"],
-            "path2_freq": row2["path_frequency"],
             "nested_keys1": row1["nested_keys"],
             "nested_keys2": row2["nested_keys"],
             "nesting_depth1": path_to_depth[path1],
@@ -885,9 +912,32 @@ def create_schema_pairs_with_common_properties(df, max_depth=6):
     return pd.DataFrame(rows)
 
 
-def build_definition_graph(eval_loader, custom_model, device, schema_name):
+
+class DisjointSet:
+    def __init__(self):
+        self.parent = {}
+
+    def find(self, u):
+        if u not in self.parent:
+            self.parent[u] = u
+        if self.parent[u] != u:
+            self.parent[u] = self.find(self.parent[u])
+        return self.parent[u]
+
+    def union(self, u, v):
+        self.parent[self.find(u)] = self.find(v)
+
+    def groups(self):
+        clusters = {}
+        for node in self.parent:
+            root = self.find(node)
+            clusters.setdefault(root, []).append(node)
+        return [group for group in clusters.values() if len(group) > 1]
+
+
+def generate_clusters(eval_loader, custom_model, device, schema_name):
     """
-    Build a definition graph from tokenized schema pairs using the given model, with batching.
+    Generate clusters of schema connections based on model predictions.
 
     Args:
         eval_loader (DataLoader): DataLoader containing the tokenized schema pairs.
@@ -896,10 +946,9 @@ def build_definition_graph(eval_loader, custom_model, device, schema_name):
         schema_name (str): The name of the schema.
 
     Returns:
-        nx.Graph: A graph with edges representing predicted connections between pairs.
+        list: A list of clusters, where each cluster is a list of paths that are connected.
     """
-    graph = nx.Graph()
-    edges = []
+    ds = DisjointSet()
     for batch in tqdm(eval_loader, total=len(eval_loader), leave=True, desc="Processing pairs for " + schema_name):
         
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -908,125 +957,19 @@ def build_definition_graph(eval_loader, custom_model, device, schema_name):
         # Model prediction
         with torch.no_grad():
             logits = custom_model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)
-            preds = torch.argmax(logits, dim=-1).tolist()
+            print(f"Logits: {logits}, path1: {batch['path1']}, path2: {batch['path2']}")
+
+            preds = torch.argmax(logits.detach().cpu(), dim=-1).tolist()
 
         # Append edges based on predictions
         for idx, pred in enumerate(preds):
             if pred == 1:
-                path1 = batch["path1"][idx]
-                path2 = batch["path2"][idx]
-                #print(f"Adding edge between {path1} and {path2}")
-                edges.append((path1, path2))
+                ds.union(batch["path1"][idx], batch["path2"][idx])
             else:
-                #print(f"Skipping edge between {path1} and {path2}")
                 continue
         
-    # Add edges to the graph
-    graph.add_edges_from(edges)
-    return graph
-
-
-def build_definition_graph_v2(test_ground_truth, schema_name):
-    """
-    Build a definition graph from tokenized schema pairs using the given model, with batching.
-
-    Args:
-        eval_loader (DataLoader): DataLoader containing the tokenized schema pairs.
-        custom_model (PreTrainedModel): The model used for predicting connections.
-        device (torch.device): The device (CPU or GPU) to run the model on.
-        schema_name (str): The name of the schema.
-
-    Returns:
-        nx.Graph: A graph with edges representing predicted connections between pairs.
-    """
-    graph = nx.Graph()
-    edges = []
-   
-    defn_paths_dict = test_ground_truth.get(schema_name, {})
-    # Make a pair of paths
-    for defn_paths in defn_paths_dict.values():
-        for path1, path2 in combinations(defn_paths, 2):
-            print(f"Adding edge between {tuple(path1)} and {tuple(path2)}")
-            edges.append((tuple(path1), tuple(path2)))
-        
-    # Add edges to the graph
-    graph.add_edges_from(edges)
-    return graph
-
-
-def build_definition_graph_v3(eval_loader, custom_model, device):
-    """
-    Build a definition graph from tokenized schema pairs using the given model, ensuring per-filename evaluation.
-
-    Args:
-        eval_loader (DataLoader): DataLoader containing the tokenized schema pairs.
-        custom_model (PreTrainedModel): The model used for predicting connections.
-        device (torch.device): The device (CPU or GPU) to run the model on.
-
-    Returns:
-        pd.DataFrame: DataFrame containing path1, path2, embedding_distance,
-                      prediction, ground_truth, filename.
-    """
-    all_results = []
-
-
-    for batch in tqdm(eval_loader, total=len(eval_loader), leave=True, desc="Processing pairs for "):
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        input_ids, attention_mask, extra_features = batch["input_ids"], batch["attention_mask"], batch["extra_features"]
-
-        # Model prediction
-        with torch.no_grad():
-            logits = custom_model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)
-            preds = torch.argmax(logits, dim=-1).tolist()
-            print(logits)
-        for idx, pred in enumerate(preds):
-            all_results.append({
-                "path1": batch["path1"][idx],
-                "path2": batch["path2"][idx],
-                "distance": batch["schema_similarity"][idx].item(),
-                "prediction": pred,
-                "ground_truth": batch["label"][idx].item(),
-                "filename": batch["filename"][idx]
-            })
-        
-    # Create DataFrame from the results
-    df = pd.DataFrame(all_results)
-   
-    return df
-
-
-def find_definitions_from_graph(graph):
-    """
-    Find definitions from a graph representing schema connections.
-
-    Args:
-        graph (nx.Graph): A graph representing schema connections.
-
-    Returns:
-        List[List]: A list of lists, each containing nodes representing a definition.
-    """
-
-    # Extract cliques from the graph
-    cliques = list(nx.find_cliques(graph))
-
-    # Track processed nodes to ensure each path appears only in one definition
-    processed_nodes = set()
-    processed_cliques = []
-
-    for clique in sorted(cliques, key=len, reverse=True):  # Process larger cliques first
-        clique_set = set(clique)
-
-        # Skip cliques that are fully covered by previously processed ones
-        if clique_set & processed_nodes:
-            clique_set -= processed_nodes
-
-
-        if len(clique_set) > 1:  # Ignore trivial definitions
-            processed_cliques.append(clique_set)
-            processed_nodes.update(clique_set)  # Mark these nodes as processed
-
-    return processed_cliques
-
+    clusters = ds.groups()
+    return clusters
 
 
 def calc_jaccard_index(actual_cluster, predicted_cluster):
@@ -1109,6 +1052,23 @@ def calc_scores(actual_clusters, predicted_clusters, threshold=1.0):
     return precision, recall, f1_score, matched_definitions, matched_paths
 
 
+def get_pairs(clusters):
+    """
+    Given a list of clusters, return a set of all pairs in the same cluster.
+
+    Args:
+        clusters (list): List of clusters, where each cluster is a list of paths.
+    Returns:
+        set: A set of tuples representing pairs of paths in the same cluster.
+    """
+    pairs = set()
+    for cluster in clusters:
+        for a, b in combinations(cluster, 2):
+            pairs.add((a, b))
+            pairs.add((b, a))
+    return pairs
+
+
 def calculate_metrics(actual_clusters, predicted_clusters):
     """
     Calculate precision, recall, and F1-score for the given actual and predicted clusters.
@@ -1118,19 +1078,16 @@ def calculate_metrics(actual_clusters, predicted_clusters):
     Returns:    
         tuple: Precision, recall, and F1-score.
     """
-    # Convert each cluster to a set of tuples (whole paths)
-    actual_set = set(tuple(path) for cluster in actual_clusters for path in cluster)
-    predicted_set = set(tuple(path) for cluster in predicted_clusters for path in cluster)
+    actual_pairs = get_pairs(actual_clusters)
+    predicted_pairs = get_pairs(predicted_clusters)
 
-    # Compute TP, FP, FN
-    TP = len(actual_set & predicted_set)  # Correctly predicted paths
-    FP = len(predicted_set - actual_set)  # Extra paths in prediction
-    FN = len(actual_set - predicted_set)  # Missed paths in actual
+    tp = len(actual_pairs & predicted_pairs)# Correctly predicted paths
+    fp = len(predicted_pairs - actual_pairs)# Extra paths in prediction
+    fn = len(actual_pairs - predicted_pairs)# Missed paths in actual
 
-    # Precision, Recall, F1-Score 
-    precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
-    recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
 
     return precision, recall, f1
 
@@ -1188,47 +1145,7 @@ def get_all_samples(df, frequent_ref_defn_paths):
 
     return labeled_df
 
-'''
-def evaluate_single_schema(df, schema_name):
-    """
-    Helper function to evaluate a single schema.
 
-    Args:
-        schema (str): The schema filename to be evaluated.
-        device (torch.device): The device on which to run the model.
-        test_ground_truth (dict): Ground truth clusters for test schemas.
-
-    Returns:
-        tuple: Contains schema name, precision, recall, F1 score, sorted actual clusters, and sorted predicted clusters.
-        None: If the schema could not be processed.
-    """
-        
-    # Load the model and tokenizer
-    custom_model, tokenizer = load_model_and_adapter()
-
-    # Tokenize and merge schemas
-    eval_df = merge_schema_tokens(df, tokenizer)
-        
-    # Calculate the cosine similarity between the paths
-    eval_df = process_data.calculate_cosine_similarity_2(eval_df, original_model, tokenizer, device)    
-
-    # Enable multiple GPU usage with DataParallel
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs for model parallelism.", flush=True)
-        custom_model = nn.DataParallel(custom_model)
-        
-        # Create datasets with dynamic padding and batching
-        eval_dataset = CustomEvalDataset(eval_df)
-        eval_loader = DataLoader(eval_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda batch: collate_eval_fn(batch, tokenizer))
-        
-        custom_model.to(device)
-        custom_model.eval()
-        
-        df = build_definition_graph_v3(eval_loader, custom_model, device)
-        return df
-     
-    
-'''
 def evaluate_single_schema(schema, test_ground_truth):
     """
     Helper function to evaluate a single schema.
@@ -1243,18 +1160,20 @@ def evaluate_single_schema(schema, test_ground_truth):
         None: If the schema could not be processed.
     """
     
-    df, frequent_ref_defn_paths, schema_name, failure_flags = process_data.process_schema(schema, "")
+    df, frequent_ref_defn_paths, schema_name, failure_flags = process_data.process_schema(schema, schema)
     print(f"Evaluating schema: {schema_name}", flush=True)
-    if df is not None and frequent_ref_defn_paths is not None:
+    if df is not None and frequent_ref_defn_paths:
+        print(f"Schema {schema_name} has frequent reference definitions.", flush=True)
+
         #pairs_df = get_all_samples(df, frequent_ref_defn_paths)
-        
+        '''
         # Remove paths whose prefixes are not explicitly defined in the schema
         df = remove_additional_properties(df, schema_name)
         #print(schema_paths, flush=True)
         if len(df) < 2:
             print(f"Schema {schema_name} has less than 2 paths after filtering.", flush=True)
             return None
-        
+        '''
         # Load the model and tokenizer
         custom_model, tokenizer = load_model_and_adapter()
 
@@ -1273,7 +1192,10 @@ def evaluate_single_schema(schema, test_ground_truth):
         eval_df = merge_schema_tokens(pairs_df, tokenizer)
         
         # Calculate the cosine similarity between the paths
-        eval_df = process_data.calculate_cosine_similarity(eval_df, original_model, tokenizer, device)
+        #eval_df = process_data.calculate_cosine_similarity(eval_df, original_model, tokenizer, device)
+
+        # Add extra features to the DataFrame
+        eval_df = add_extra_features(eval_df, "eval")
         
         # Create datasets with dynamic padding and batching
         eval_dataset = CustomEvalDataset(eval_df)
@@ -1282,18 +1204,18 @@ def evaluate_single_schema(schema, test_ground_truth):
         custom_model.to(device)
         custom_model.eval()
         
-        graph = build_definition_graph(eval_loader, custom_model, device, schema_name)
+        predicted_clusters = generate_clusters(eval_loader, custom_model, device, schema_name)
         
         # Predict clusters and sort each predicted cluster alphabetically
-        predicted_clusters = [sorted(cluster) for cluster in find_definitions_from_graph(graph)]
+        #predicted_clusters = [sorted(cluster) for cluster in find_definitions_from_graph(graph)]
 
         # Get the ground truth clusters and sort each actual cluster alphabetically
         defn_paths_dict = test_ground_truth.get(schema_name, {})
         actual_clusters = [sorted([tuple(path) for path in cluster]) for cluster in sorted(defn_paths_dict.values())]
 
         # Calculate the precision, recall, and F1-score
-        #precision, recall, f1_score = calculate_metrics(actual_clusters, predicted_clusters)
-        precision, recall, f1_score, _, _ = calc_scores(actual_clusters, predicted_clusters)
+        precision, recall, f1_score = calculate_metrics(actual_clusters, predicted_clusters)
+        #precision, recall, f1_score, _, _ = calc_scores(actual_clusters, predicted_clusters)
 
         print(f"Actual clusters: {schema_name}", flush=True)
         for cluster in actual_clusters:
@@ -1306,6 +1228,8 @@ def evaluate_single_schema(schema, test_ground_truth):
         print(f"Schema: {schema_name}, Precision: {precision}, Recall: {recall}, F1-score: {f1_score}", flush=True)
         # Return evaluation metrics and sorted clusters for the schema
         return schema, precision, recall, f1_score, actual_clusters, predicted_clusters
+    else:
+        print(f"Schema {schema_name} could not be processed or has no frequent reference definitions.", flush=True)
         
     return None
 
@@ -1325,23 +1249,6 @@ def evaluate_data(test_ground_truth, output_file="evaluation_results.json"):
     f1_scores = []
     results = []
     frames = []
-    '''
-    df = pd.read_csv("updated_test_data.csv",sep=';') 
-
-    # Split dataframe into multiple one for each filename
-    df = df.groupby("filename")
-
-    # Iterate through each filename group
-    for schema_name, group in tqdm(df, total=len(df), position=1, desc="Processing schemas"):
-        df = group.reset_index(drop=True)
-        df = evaluate_single_schema(df, schema_name) 
-        frames.append(df)
-    # Concatenate all dataframes into one   
-    df = pd.concat(frames, ignore_index=True)
-    # Save the concatenated dataframe to a CSV file
-    df.to_csv("predictions.csv", index=False, header=True, sep=";")
-    sys.exit(0)
-    '''
 
     # Process schemas sequentially
     for schema in tqdm(test_schemas, total=len(test_schemas), position=1):
@@ -1380,7 +1287,7 @@ def evaluate_data(test_ground_truth, output_file="evaluation_results.json"):
     
 
 
-def group_paths(df, test_ground_truth, min_common_keys=2, output_file="evaluation_results_baseline_model.json"):
+def group_paths(df, test_ground_truth, min_common_keys=1, output_file="evaluation_results_baseline_model.json"):
     """
     Group paths that have at least a specified number of distinct nested keys in common per filename and evaluate.
 
@@ -1397,47 +1304,36 @@ def group_paths(df, test_ground_truth, min_common_keys=2, output_file="evaluatio
     f1_scores = []  # To store F1 scores for each schema
     precision_scores = []  # To store precision scores for each schema
     recall_scores = []  # To store recall scores for each schema
-    exlude_schemas = ["behat-yml.json", "bashly-yml.json", "solidarity.json", "taskcat.json", "woodpecker-pipeline-config.json", "starship.json"]  # Schemas to exclude from evaluation
 
     # Iterate through each filename group
     for schema_name, group in tqdm(df.groupby("filename"), position=1, total=len(df["filename"].unique()), desc="Grouping paths"):
-        # Skip schemas that are in the exclude list
-        if schema_name in exlude_schemas:
-            print(f"Skipping schema {schema_name} as it is in the exclude list.", flush=True)
-            continue
+  
         # Convert string representation of paths to tuples
         group["path"] = group["path"].apply(ast.literal_eval)
 
-        # Remove paths not explicitly defined in the schema
-        filtered_df = remove_additional_properties(group, schema_name)
-        print(f"Number of paths after filtering: {len(filtered_df)} for schema {schema_name}", flush=True)
+        paths = group["path"].tolist()
+        distinct_keys = group["distinct_nested_keys"].tolist()
 
-        # Skip schemas with insufficient paths after filtering
-        if filtered_df.empty or len(filtered_df) < 2:
-            print(f"Schema {schema_name} has less than 2 paths after filtering. Skipping.", flush=True)
-            continue
+        # Prepare and sort by number of keys descending
+        path_key_pairs = [
+            (path, frozenset(ast.literal_eval(keys)))
+            for path, keys in zip(paths, distinct_keys)
+        ]
+        path_key_pairs.sort(key=lambda x: -len(x[1]))
 
-        paths = filtered_df["path"].tolist()
-        distinct_keys = filtered_df["distinct_nested_keys"].tolist()
-
-        # Dictionary to track paths based on shared keys
         group_dict = defaultdict(list)
 
-        # Process each path and its associated keys
-        for path, keys in zip(paths, distinct_keys):
-            keys = frozenset(ast.literal_eval(keys))  # Convert string to frozenset
-            
+        for path, keys in path_key_pairs:
             added_to_group = False
 
-            # Attempt to add path to an existing group
-            for existing_keys in list(group_dict.keys()):
+            for existing_keys in sorted(group_dict.keys(), key=lambda k: -len(group_dict[k])):
                 common_keys = keys & existing_keys
-                if len(common_keys) >= min_common_keys  and len(common_keys) / len(existing_keys) >= 0.25:
-                    group_dict[existing_keys].append(path)
+                if len(common_keys) >= min_common_keys and len(common_keys) / len(existing_keys) >= 0.25:
+                    merged_keys = keys | existing_keys
+                    group_dict[merged_keys] = group_dict.pop(existing_keys) + [path]
                     added_to_group = True
                     break
 
-            # Create a new group if no existing group matches
             if not added_to_group:
                 group_dict[keys] = [path]
 
@@ -1453,8 +1349,8 @@ def group_paths(df, test_ground_truth, min_common_keys=2, output_file="evaluatio
         print(f"Predicted clusters: {predicted_clusters}", flush=True)
 
         # Evaluate the predicted clusters against the ground truth
-        precision, recall, f1_score, matched_definitions, matched_paths = calc_scores(actual_clusters, predicted_clusters)
-        #precision, recall, f1_score = calculate_metrics(actual_clusters, predicted_clusters)
+        #precision, recall, f1_score, matched_definitions, matched_paths = calc_scores(actual_clusters, predicted_clusters)
+        precision, recall, f1_score = calculate_metrics(actual_clusters, predicted_clusters)
         print(f"Schema: {schema_name}, Precision: {precision}, Recall: {recall}, F1-score: {f1_score}", flush=True)
         print(flush=True)
 
@@ -1471,8 +1367,8 @@ def group_paths(df, test_ground_truth, min_common_keys=2, output_file="evaluatio
             "f1_score": f1_score,
             "actual_clusters": actual_clusters,
             "predicted_clusters": predicted_clusters,
-            "matched_definitions": matched_definitions,
-            "matched_paths": list(matched_paths),
+            #"matched_definitions": matched_definitions,
+            #"matched_paths": list(matched_paths),
         }
         all_results.append(results)
 
@@ -1482,9 +1378,9 @@ def group_paths(df, test_ground_truth, min_common_keys=2, output_file="evaluatio
         avg_precision = sum(precision_scores) / len(precision_scores)
         avg_recall = sum(recall_scores) / len(recall_scores)
         all_results.append({
-            "average_f1_score": avg_f1_score,
             "average_precision": avg_precision,
-            "average_recall": avg_recall
+            "average_recall": avg_recall,
+            "average_f1_score": avg_f1_score
         })
 
     # Write all results to the specified JSON file
