@@ -3,25 +3,29 @@ import itertools
 import json
 import jsonref
 import math
+import numpy as np
 import os
 import pandas as pd
+import random
 import subprocess
 import sys
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 
+from accelerate import Accelerator
 from adapters import AutoAdapterModel
 from collections import defaultdict, OrderedDict
 from itertools import combinations
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, accuracy_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, accuracy_score, roc_auc_score
 from torch.cuda.amp import autocast, GradScaler
 from torch.nn.utils.rnn import pad_sequence
-from torch.optim import AdamW
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup, EvalPrediction
+from transformers import AdamW, AutoTokenizer, get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup, AutoModel
+
 
 import process_data
 
@@ -30,18 +34,16 @@ MODEL_NAME = "microsoft/codebert-base"
 ADAPTER_NAME = "frequent_patterns"
 SCHEMA_FOLDER = "converted_processed_schemas"
 JSON_FOLDER = "processed_jsons"
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 HIDDEN_SIZE = 768
 JSON_SUBSCHEMA_KEYWORDS = {"allOf", "oneOf", "anyOf", "not"}
 JSON_SCHEMA_KEYWORDS = {"properties", "patternProperties", "additionalProperties", "items", "prefixItems", "allOf", "oneOf", "anyOf", "not", "if", "then", "else", "$ref"}
 
 
 
- # Initialize the original model for calculating cosine similarity
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-original_model = AutoAdapterModel.from_pretrained(MODEL_NAME)
-original_model.to(device)
+
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
 
 # https://stackoverflow.com/a/73704579
 class EarlyStopper:
@@ -239,7 +241,6 @@ class CustomDataset(Dataset):
     Returns:
         dict: A dictionary containing the input IDs, attention mask, label, and nesting depths of the schemas.
     """
-
     
     def __init__(self, dataframe):
         self.data = dataframe
@@ -248,37 +249,44 @@ class CustomDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        tokenized_schema = self.data.iloc[idx]["tokenized_schema"]
-        label = self.data.iloc[idx]["label"]
-        path_depth_diff = self.data.iloc[idx]["path_depth_diff"]
-        jaccard_keys = self.data.iloc[idx]["jaccard_keys"]
-        exact_key_match = self.data.iloc[idx]["exact_key_match"]
-        key_count_diff = self.data.iloc[idx]["key_count_diff"]
-        norm_prefix_len = self.data.iloc[idx]["norm_prefix_len"]
+        row = self.data.iloc[idx]
+        tokenized_schema = row["tokenized_schema"]
+        label = row["label"]
+        extra_features = [
+            row["path_depth_diff"],
+            row["jaccard_keys"],
+            row["shared_prefix_count"],
+            row["key_count_diff"],
+            row["norm_prefix_len"]
+        ]
 
         return {
             "input_ids": tokenized_schema,
             "attention_mask": [1] * len(tokenized_schema),
             "label": label,
-            "extra_features": [path_depth_diff, jaccard_keys, exact_key_match, key_count_diff, norm_prefix_len]
+            "extra_features": extra_features
         }
 
 
-def collate_fn(batch, tokenizer):
-    input_ids = [torch.tensor(item["input_ids"]) for item in batch]
-    attention_mask = [torch.tensor(item["attention_mask"]) for item in batch]
-    labels = torch.tensor([item["label"] for item in batch])
-    extra_features = torch.tensor([item["extra_features"] for item in batch])
+class CollateFn:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
 
-    padded_input_ids = pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
-    padded_attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+    def __call__(self, batch):
+        input_ids = [torch.tensor(item["input_ids"], dtype=torch.long) for item in batch]
+        attention_mask = [torch.tensor(item["attention_mask"], dtype=torch.long) for item in batch]
+        labels = torch.tensor([item["label"] for item in batch], dtype=torch.float)
+        extra_features = torch.tensor([item["extra_features"] for item in batch], dtype=torch.float)
 
-    return {
-        "input_ids": padded_input_ids,
-        "attention_mask": padded_attention_mask,
-        "label": labels,
-        "extra_features": extra_features
-    }
+        padded_input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        padded_attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+
+        return {
+            "input_ids": padded_input_ids,
+            "attention_mask": padded_attention_mask,
+            "label": labels,
+            "extra_features": extra_features
+        }
 
 
 class CustomEvalDataset(Dataset):
@@ -299,78 +307,149 @@ class CustomEvalDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        tokenized_schema = self.data.iloc[idx]["tokenized_schema"]
-        path1 = self.data.iloc[idx]["path1"]
-        path2 = self.data.iloc[idx]["path2"]
-        filename = self.data.iloc[idx]["filename"]
-        path_depth_diff = self.data.iloc[idx]["path_depth_diff"]
-        jaccard_keys = self.data.iloc[idx]["jaccard_keys"]
-        exact_key_match = self.data.iloc[idx]["exact_key_match"]
-        key_count_diff = self.data.iloc[idx]["key_count_diff"]
-        norm_prefix_len = self.data.iloc[idx]["norm_prefix_len"]
+        row = self.data.iloc[idx]
+        tokenized_schema = row["tokenized_schema"]
+        path1 = row["path1"]
+        path2 = row["path2"]
+        filename = row["filename"]
+        extra_features = [
+            row["path_depth_diff"],
+            row["jaccard_keys"],
+            row["shared_prefix_count"],
+            row["key_count_diff"],
+            row["norm_prefix_len"]
+        ]
 
         return {
             "input_ids": tokenized_schema,
             "attention_mask": [1] * len(tokenized_schema),
-            "extra_features": [path_depth_diff, jaccard_keys, exact_key_match, key_count_diff, norm_prefix_len],
+            "extra_features": extra_features,
             "path1": path1,
             "path2": path2,
-            #"label": label,
             "filename": filename
         }
     
 
-def collate_eval_fn(batch, tokenizer):
-    input_ids = [torch.tensor(item["input_ids"]) for item in batch]
-    attention_mask = [torch.tensor(item["attention_mask"]) for item in batch]
-    extra_features = torch.tensor([item["extra_features"] for item in batch])
-    path1 = [item["path1"] for item in batch]
-    path2 = [item["path2"] for item in batch]
-    #labels = torch.tensor([item["label"] for item in batch])
-    filenames = [item["filename"] for item in batch]
+class CollateEvalFn:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
 
-    padded_input_ids = pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
-    padded_attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+    def __call__(self, batch):
+        input_ids = [torch.tensor(item["input_ids"]) for item in batch]
+        attention_mask = [torch.tensor(item["attention_mask"]) for item in batch]
+        extra_features = torch.tensor([item["extra_features"] for item in batch])
+        path1 = [item["path1"] for item in batch]
+        path2 = [item["path2"] for item in batch]
+        filenames = [item["filename"] for item in batch]
 
-    return {
-        "input_ids": padded_input_ids,
-        "attention_mask": padded_attention_mask,
-        "extra_features": extra_features,
-        "path1": path1,
-        "path2": path2,
-        #"label": labels,
-        "filename": filenames
-    }
+        padded_input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        padded_attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
 
+        return {
+            "input_ids": padded_input_ids,
+            "attention_mask": padded_attention_mask,
+            "extra_features": extra_features,
+            "path1": path1,
+            "path2": path2,
+            "filename": filenames
+        }
+
+
+class OriginalBERTModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bert = AutoModel.from_pretrained(MODEL_NAME)
+        self.dropout = nn.Dropout(0.3)
+        self.classifier = nn.Linear(self.bert.config.hidden_size, 1) 
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        cls_embedding = outputs.last_hidden_state[:, 0, :] 
+        logits = self.classifier(self.dropout(cls_embedding))
+        return logits
+    
 
 class CustomBERTModel(nn.Module):
-    def __init__(self, extra_feat_dim=5):
+    def __init__(self, extra_feat_dim=5, train_mode="adapter"):  # "adapter" or "full"
         super().__init__()
-        self.codebert = AutoAdapterModel.from_pretrained("microsoft/codebert-base")
-        self.codebert.add_adapter(ADAPTER_NAME, config="seq_bn")
-        self.codebert.set_active_adapters(ADAPTER_NAME)
-        self.codebert.train_adapter(ADAPTER_NAME)
+        self.codebert = AutoAdapterModel.from_pretrained(MODEL_NAME)
 
-        hidden_size = self.codebert.config.hidden_size  # 768
+        if train_mode == "adapter":
+            self.codebert.add_adapter(ADAPTER_NAME, config="seq_bn")
+            self.codebert.set_active_adapters(ADAPTER_NAME)
+            self.codebert.train_adapter(ADAPTER_NAME)
 
+        elif train_mode == "full":
+            for param in self.codebert.parameters():
+                param.requires_grad = True
+
+        else:
+            raise ValueError("train_mode must be 'adapter' or 'full'")
+
+        hidden_size = self.codebert.config.hidden_size
         self.extra_features = nn.Linear(extra_feat_dim, hidden_size)
-        self.dropout = nn.Dropout(0.1)
-        self.classifier = nn.Linear(hidden_size * 2, 2)
+        self.dropout = nn.Dropout(0.3)
+        self.classifier = nn.Linear(hidden_size * 2, 1)
 
     def forward(self, input_ids, attention_mask, extra_features):
-        # Use the base model to get hidden states, not classification output
         outputs = self.codebert.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=True
         )
-        cls_embedding = outputs.last_hidden_state[:, 0, :]  # [CLS] token embedding
-
-        extra_emb = F.relu(self.extra_features(extra_features.float()))  # [B, H]
-        combined = torch.cat([cls_embedding, extra_emb], dim=-1)  # [B, 2H]
-
-        logits = self.classifier(self.dropout(combined))  # [B, 2]
+        cls_embedding = outputs.last_hidden_state[:, 0, :]
+        extra_emb = F.relu(self.extra_features(extra_features.float()))
+        combined = torch.cat([cls_embedding, extra_emb], dim=-1)
+        logits = self.classifier(self.dropout(combined))
         return logits
+
+
+def save_model(bert_model, ori):
+    """
+    Saves the model and adapter (if using custom CodeBERT with adapter).
+    
+    Args:
+        bert_model (nn.Module): The model to save (already unwrapped from DDP/DP).
+        ori (bool): Whether the model is the original CodeBERT or a custom model with an adapter.
+    """
+    save_path = "original_model.pt" if ori else "frequent_pattern_model.pt"
+    torch.save(bert_model.state_dict(), save_path)
+
+    if not ori:
+        # Save the adapter from the underlying CodeBERT model
+        bert_model.codebert.save_adapter(ADAPTER_NAME, ADAPTER_NAME)
+
+
+def load_model_and_adapter(ori):
+    """
+    Load the pretrained model and adapter, with custom classification layers if needed.
+    Args:
+        ori (bool): Whether to load the original CodeBERT model or a custom model with an adapter.
+    """
+
+    if ori:
+        bert_model = OriginalBERTModel()
+        state_dict = torch.load("original_model.pt")
+        bert_model.load_state_dict(state_dict)
+
+    else:
+        # Load CodeBERT base + adapter
+        codebert = AutoAdapterModel.from_pretrained(MODEL_NAME)
+        codebert.load_adapter(ADAPTER_NAME, load_as=ADAPTER_NAME, set_active=True)
+
+        # Create wrapper model
+        bert_model = CustomBERTModel()
+        bert_model.codebert = codebert
+
+        # Now load weights into full model (must match save_model structure)
+        state_dict = torch.load("frequent_pattern_model.pt")
+
+        # This shows you if anything is missing or misnamed
+        bert_model.load_state_dict(state_dict, strict=False)
+    
+    return bert_model
+
+
 
 
 def normalize_nesting_depths(df, eval_mode, max_depth=10):
@@ -396,69 +475,6 @@ def normalize_nesting_depths(df, eval_mode, max_depth=10):
     return df
 
 
-def save_model_and_adapter(model, save_path="frequent_pattern_model"):
-    """
-    Save the model and adapter to a specified directory.
-
-    Args:
-        model (CustomBERTModel): The model to save.
-        save_path (str): Directory where the model and adapter will be saved.
-    """
-
-    os.makedirs(save_path, exist_ok=True)
-    path = os.path.abspath(save_path)
-
-    # Handle DataParallel
-    model = model.module if isinstance(model, nn.DataParallel) else model
-
-    # Save adapter (inside codebert)
-    model.codebert.save_adapter(path, ADAPTER_NAME)
-
-    # Save base model (only if you made changes to it — optional)
-    model.codebert.base_model.save_pretrained(path)
-
-    # Save custom classification layers
-    torch.save({
-        "extra_features": model.extra_features.state_dict(),
-        "classifier": model.classifier.state_dict()
-    }, os.path.join(path, "custom_layers.pth"))
-
-    print(f"Saved adapter and custom layers to {path}")
-
-
-def load_model_and_adapter(save_path="frequent_pattern_model"):
-    """
-    Load the pretrained base model, adapter, and custom model weights.
-    Args:   
-        save_path (str): Directory where the model and adapter are saved.
-
-    Returns:
-        model (CustomBERTModel)
-        tokenizer (AutoTokenizer)
-    """
-
-    save_path = os.path.abspath(save_path)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
-    # Rebuild base CodeBERT model with adapter
-    codebert = AutoAdapterModel.from_pretrained(MODEL_NAME)
-    codebert.load_adapter(save_path, load_as=ADAPTER_NAME, set_active=True)
-
-    # Rebuild full custom model
-    model = CustomBERTModel()
-    model.codebert = codebert
-
-    # Load only custom layers
-    custom_state_path = os.path.join(save_path, "custom_layers.pth")
-    custom_state = torch.load(custom_state_path)
-    model.extra_features.load_state_dict(custom_state["extra_features"])
-    model.classifier.load_state_dict(custom_state["classifier"])
-
-    print(f"Model and adapter loaded from {save_path}")
-    return model, tokenizer
-
-
 def shared_prefix_len(path1, path2):
     return sum(1 for a, b in zip(path1, path2) if a == b)
 
@@ -474,13 +490,6 @@ def jaccard(set1, set2):
     union = set1 | set2
     inter = set1 & set2
     return len(inter) / len(union) if union else 0
-
-
-def num_props(schema_str):
-    try:
-        return len(ast.literal_eval(schema_str).get("properties", {}))
-    except:
-        return 0
 
 
 def add_extra_features(df, mode):
@@ -505,56 +514,37 @@ def add_extra_features(df, mode):
         lambda row: jaccard(set(row["nested_keys1"].keys()), set(row["nested_keys2"].keys())),
         axis=1
     )
-    df["exact_key_match"] = df.apply(
-        lambda row: int(set(row["nested_keys1"].keys()) == set(row["nested_keys2"].keys())),
-        axis=1
-    )
+
     df["key_count_diff"] = df.apply(
         lambda row: abs(len(row["nested_keys1"].keys()) - len(row["nested_keys2"].keys())) / min(len(row["nested_keys1"].keys()), len(row["nested_keys2"].keys())),
         axis=1
     )
     df["norm_prefix_len"] = df.apply(lambda row: normalized_prefix_len(row["path1"], row["path2"]), axis=1)
 
+    df["shared_prefix_count"] = df.apply(lambda row: shared_prefix_len(row["path1"], row["path2"]), axis=1)
+
+
     return df
 
 
-def train_model(train_df, test_df):
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # For multi-GPU setups
+
+    torch.backends.cudnn.deterministic = True  # Ensures reproducibility, but may slow down
+    torch.backends.cudnn.benchmark = False     # Disable benchmark mode for reproducibility
+
+
+def train_model(train_df, test_df, ori=False, train_mode="adapter"):
     """
-    Trains the model using an AdapterTrainer, logging metrics with wandb and evaluating at each epoch.
-
-    Args:
-        train_df (pd.DataFrame): DataFrame with training data.
-        test_df (pd.DataFrame): DataFrame with validation data.
+    Train the model in either adapter-only or full fine-tuning mode.
     """
-    # Hyperparameters
-    accumulation_steps = 4
-    learning_rate = (1e-5)/4
-    num_epochs = 20
+    accelerator = Accelerator()
+    device = accelerator.device
 
-    # Initialize wandb logging
-    wandb.init(
-        project="custom-codebert_frequent_patterns",
-        config={
-            "learning_rate": learning_rate,
-            "epochs": num_epochs,
-            "batch_size": BATCH_SIZE
-        }
-    )
-
-    # Initialize model and tokenizer
-    model = CustomBERTModel()
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
-    optimizer = AdamW(model.parameters(), lr=learning_rate)
-    scaler = GradScaler()
-
-    # Multi-GPU support
-    if torch.cuda.device_count() > 1:
-        print(f"Using {torch.cuda.device_count()} GPUs")
-        model = nn.DataParallel(model)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    set_seed(42)  # for reproducibility
 
     # Preprocessing
     train_df = normalize_nesting_depths(train_df, False, max_depth=10)
@@ -565,131 +555,173 @@ def train_model(train_df, test_df):
     test_df = merge_schema_tokens(test_df, tokenizer)
 
     train_dataset = CustomDataset(train_df)
-    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda batch: collate_fn(batch, tokenizer))
+    collate_with_tokenizer = CollateFn(tokenizer)
 
-    num_training_steps = (num_epochs * len(train_dataloader) // accumulation_steps)
-    num_warmup_steps = int(0.1 * num_training_steps)
-    lr_scheduler = get_linear_schedule_with_warmup(
-        optimizer=optimizer,
-        num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_training_steps,
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        collate_fn=collate_with_tokenizer,
+        num_workers=4,
+        pin_memory=False,
     )
 
-    loss_fn = torch.nn.CrossEntropyLoss()
-    model.train()
+    accumulation_steps = 4
+    learning_rate = 1e-5
+    num_epochs = 25
 
-    pbar = tqdm(range(num_epochs), position=0, desc="Epoch")
-    for epoch in pbar:
-        total_loss = 0
-        for i, batch in enumerate(tqdm(train_dataloader, position=1, total=len(train_dataloader), leave=False, desc="Training")):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            input_ids, attention_mask, labels, extra_features = batch["input_ids"], batch["attention_mask"], batch["label"], batch["extra_features"]
+    if ori:
+        bert_model = OriginalBERTModel()
+    else:
+        bert_model = CustomBERTModel(train_mode=train_mode)
+    optimizer = AdamW(bert_model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    loss_fn = nn.BCEWithLogitsLoss()
+    scaler = GradScaler()
 
-            with autocast():  # Enable mixed precision
-                logits = model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)
-                training_loss = loss_fn(logits, labels)
+    # Prepare everything with accelerator (model, optimizer, dataloader)
+    bert_model, optimizer, train_loader = accelerator.prepare(
+        bert_model, optimizer, train_loader
+    )
 
-            if training_loss.dim() > 0:
-                training_loss = training_loss.mean()
+    num_training_steps = (num_epochs * len(train_loader)) // accumulation_steps
+    num_warmup_steps = int(0.1 * num_training_steps)
+    lr_scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps, num_training_steps
+    )
 
-            # Backward with scaled loss
-            scaler.scale(training_loss).backward()
+    if accelerator.is_main_process:
+        import wandb
+        wandb.init(
+            project="custom-codebert_frequent_patterns",
+            config={
+                "learning_rate": learning_rate,
+                "epochs": num_epochs,
+                "batch_size": BATCH_SIZE,
+                "accumulation_steps": accumulation_steps
+            }
+        )
 
-            if (i + 1) % accumulation_steps == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                step = (epoch * len(train_dataloader) + i + 1) // accumulation_steps
+    try:
+        for epoch in range(num_epochs):
+            bert_model.train()
+            total_loss = 0.0
 
-            total_loss += training_loss.item()
+            pbar = tqdm(train_loader, disable=not accelerator.is_main_process, desc=f"Training {epoch+1}/{num_epochs}")
+            for step_idx, batch in enumerate(pbar):
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["label"].float().unsqueeze(1).to(device)
+                extra_features = batch["extra_features"].float().to(device)
 
-        average_loss = total_loss / len(train_dataloader)
+                with autocast():
+                    if ori:
+                        logits = bert_model(input_ids=input_ids, attention_mask=attention_mask)
+                    else:
+                        logits = bert_model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)
 
-        # Evaluate after each epoch
-        test_loss = test_model(test_df, tokenizer, model, device, wandb)
+                    loss = loss_fn(logits, labels)
+                    loss = loss.mean()
 
-        wandb.log({
-            "training_loss": average_loss,
-            "testing_loss": test_loss,
-            "learning_rate": lr_scheduler.get_last_lr()[0],
-            "epoch": epoch + 1,
-            "step": step
-        })
+                scaler.scale(loss).backward()
 
-    save_model_and_adapter(model)
-    wandb.finish()
- 
-    
-def test_model(test_df, tokenizer, model, device, wandb):
+                if (step_idx + 1) % accumulation_steps == 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(bert_model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    lr_scheduler.step()
+
+                total_loss += loss.item()
+
+            avg_loss = total_loss / len(train_loader)
+
+            if accelerator.is_main_process:
+                test_loss = test_model(test_df, bert_model, device, wandb, ori, accelerator)
+                wandb.log({
+                    "training_loss": avg_loss,
+                    "testing_loss": test_loss,
+                    "learning_rate": optimizer.param_groups[0]["lr"],
+                    "epoch": epoch + 1
+                })
+
+        if accelerator.is_main_process:
+            save_model(bert_model, ori)
+            wandb.finish()
+
+    except Exception as e:
+        print(f"Caught exception: {e}")
+        raise
+
+
+def test_model(test_df, bert_model, device, wandb, ori, accelerator):
     """
-    Tests the model on a given dataset and logs the evaluation metrics.
-
-    Args:
-        test_df (pd.DataFrame): DataFrame with testing data.
-        tokenizer (PreTrainedTokenizer): The tokenizer used for processing schemas.
-        model (CustomBERTModel): The model to evaluate.
-        device (torch.device): The device to run the model on.
-        wandb: The wandb object for logging.
-
-    Returns:
-        float: The average testing loss.
+    Evaluate the model and aggregate metrics using Huggingface Accelerate.
     """
-
-    # Create datasets with dynamic padding and batching
     test_dataset = CustomDataset(test_df)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda batch: collate_fn(batch, tokenizer))
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        collate_fn=CollateFn(tokenizer),
+        num_workers=4,
+        pin_memory=False,
+    )
 
-    model.eval()  # Ensure the model is in evaluation mode
+    bert_model.eval()
+    loss_fn = nn.BCEWithLogitsLoss()
     total_loss = 0.0
 
-    # Define the loss function
-    loss_fn = torch.nn.CrossEntropyLoss()
+    local_actual, local_predicted, local_probs = [], [], []
 
-    total_actual_labels = []
-    total_predicted_labels = []
+    with torch.no_grad():
+        for batch in tqdm(test_loader, disable=not accelerator.is_main_process, desc="Testing"):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["label"].float().unsqueeze(1).to(device)
+            extra_features = batch["extra_features"].float().to(device)
 
-    with torch.no_grad():  # No gradients are needed during evaluation
-        for batch in tqdm(test_loader, total=len(test_loader), leave=False, desc="Testing"):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            input_ids, attention_mask, labels, extra_features = batch["input_ids"], batch["attention_mask"], batch["label"], batch["extra_features"]
+            if ori:
+                logits = bert_model(input_ids=input_ids, attention_mask=attention_mask)
+            else:
+                logits = bert_model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)
 
-            # Forward pass
-            logits = model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)   
+            loss = loss_fn(logits, labels)
+            total_loss += loss.item()
 
-            # Calculate the testing loss
-            testing_loss = loss_fn(logits, labels)
+            probs = torch.sigmoid(logits)               # [B, 1]
+            preds = (probs > 0.5).long()                # [B, 1]
 
-            # Handle DataParallel (if used)
-            if testing_loss.dim() > 0:
-                testing_loss = testing_loss.mean()
-            total_loss += testing_loss.item()
+            local_actual.append(labels)
+            local_predicted.append(preds)
+            local_probs.append(probs)
 
-            # Get the actual and predicted labels
-            actual_labels = labels.cpu().numpy()
-            predicted_labels = torch.argmax(logits, dim=1).cpu().numpy()
-            total_actual_labels.extend(actual_labels)
-            total_predicted_labels.extend(predicted_labels)
+    local_actual = torch.cat(local_actual)             # [N, 1]
+    local_predicted = torch.cat(local_predicted)       # [N, 1]
+    local_probs = torch.cat(local_probs)               # [N, 1]
 
-    # Calculate average loss for the epoch
-    average_loss = total_loss / len(test_loader)
+    # Gather across GPUs
+    actual = accelerator.gather_for_metrics(local_actual).detach().cpu().numpy().squeeze()
+    predicted = accelerator.gather_for_metrics(local_predicted).detach().cpu().numpy().squeeze()
+    probs_all = accelerator.gather_for_metrics(local_probs).detach().cpu().numpy().squeeze()
 
-    # Calculate the accuracy, precision, recall, f1 score of the positive class
-    accuracy = accuracy_score(total_actual_labels, total_predicted_labels)
-    precision = precision_score(total_actual_labels, total_predicted_labels)
-    recall = recall_score(total_actual_labels, total_predicted_labels)
-    f1 = f1_score(total_actual_labels, total_predicted_labels)
+    if accelerator.is_main_process:
+        accuracy = accuracy_score(actual, predicted)
+        precision = precision_score(actual, predicted)
+        recall = recall_score(actual, predicted)
+        f1 = f1_score(actual, predicted)
+        auc = roc_auc_score(actual, probs_all)
 
-    # Log metrics to wandb
-    wandb.log({
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "F1": f1
-    })
+        wandb.log({
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "F1": f1,
+            "AUC": auc
+        })
 
+    average_loss = total_loss / max(1, len(test_loader))
     return average_loss
-
 
 
 
@@ -844,60 +876,68 @@ def remove_additional_properties(filtered_df, schema_name):
     return filtered_df.reset_index(drop=True)
 
 
-def create_schema_pairs_with_common_properties(df, max_depth=6):
+
+
+def compute_normalized_depth(path, max_depth=10):
+    try:
+        if isinstance(path, (tuple, list)):
+            depth = len(path)
+        else:
+            depth = len(ast.literal_eval(path))
+    except Exception:
+        depth = 1
+    return min(depth, max_depth) / max_depth
+
+
+def create_schema_pairs_with_common_properties(df, max_depth=10, jaccard_threshold=0.25, min_common_props=2):
     """
-    Create a DataFrame with pairs of schemas that have at least two common properties,
-    and at least 25% property overlap in both schemas. Also normalizes nesting depth.
+    Create candidate schema pairs with overlapping properties and normalized path depth.
 
     Args:
-        df (pd.DataFrame): Input DataFrame with columns 'path', 'schema', 'filename', 'nested_keys'.
-        max_depth (int): Max depth for path normalization.
+        df (pd.DataFrame): DataFrame with 'path', 'schema', 'filename', 'nested_keys'.
+        max_depth (int): Max depth to normalize.
+        jaccard_threshold (float): Minimum Jaccard similarity between properties.
+        min_common_props (int): Minimum shared properties.
+        min_total_props (int): Skip schemas with fewer than this number of properties.
 
     Returns:
-        pd.DataFrame: DataFrame with valid schema pairs and associated metadata.
+        pd.DataFrame: Schema pair candidates.
     """
-    # Precompute row lookup
     path_to_row = {row["path"]: row for _, row in df.iterrows()}
 
-    # Extract schema properties once
     path_to_properties = {}
     for path, row in path_to_row.items():
         try:
             schema = json.loads(row["schema"])
-            props = extract_properties(schema)  # Assume this returns a dict of properties
+            props = extract_properties(schema)
             properties = frozenset(props.keys())
-        except (json.JSONDecodeError, TypeError, AttributeError):
+        except Exception:
             properties = frozenset()
         path_to_properties[path] = properties
 
-    # Compute all pairs with at least 2 shared properties and ≥25% overlap
-    all_paths = list(path_to_properties.keys())
     candidate_pairs = set()
+    all_paths = list(path_to_properties.keys())
+
     for path1, path2 in combinations(all_paths, 2):
         props1 = path_to_properties[path1]
         props2 = path_to_properties[path2]
-        if not props1 or not props2:
-            continue
 
         common = props1 & props2
-        if len(common) >= 1:
-            overlap1 = len(common) / len(props1)
-            overlap2 = len(common) / len(props2)
-            if overlap1 >= 0.25 and overlap2 >= 0.25:
-                candidate_pairs.add((path1, path2))
+        if len(common) < min_common_props:
+            continue
 
-    # Normalize nesting depth using actual tuple depth
+        if jaccard(props1, props2) >= jaccard_threshold:
+            candidate_pairs.add((path1, path2))
+
     path_to_depth = {
-        path: min(len(path) if isinstance(path, (list, tuple)) else len(eval(path)), max_depth) / max_depth
+        path: compute_normalized_depth(path, max_depth=max_depth)
         for path in path_to_row
     }
 
-    # Build rows for final DataFrame
-    rows = []
+    output_rows = []
     for path1, path2 in candidate_pairs:
         row1, row2 = path_to_row[path1], path_to_row[path2]
-
-        rows.append({
+        output_rows.append({
             "filename": row1["filename"],
             "path1": path1,
             "path2": path2,
@@ -909,7 +949,7 @@ def create_schema_pairs_with_common_properties(df, max_depth=6):
             "schema2": row2["schema"],
         })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(output_rows)
 
 
 
@@ -935,41 +975,41 @@ class DisjointSet:
         return [group for group in clusters.values() if len(group) > 1]
 
 
-def generate_clusters(eval_loader, custom_model, device, schema_name):
+def generate_clusters(eval_loader, custom_model, schema_name, ori):
     """
     Generate clusters of schema connections based on model predictions.
 
     Args:
         eval_loader (DataLoader): DataLoader containing the tokenized schema pairs.
         custom_model (PreTrainedModel): The model used for predicting connections.
-        device (torch.device): The device (CPU or GPU) to run the model on.
         schema_name (str): The name of the schema.
+        ori (bool): Whether to use the original CodeBERT model or a custom model.
 
     Returns:
         list: A list of clusters, where each cluster is a list of paths that are connected.
     """
     ds = DisjointSet()
+
     for batch in tqdm(eval_loader, total=len(eval_loader), leave=True, desc="Processing pairs for " + schema_name):
-        
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        input_ids, attention_mask, extra_features = batch["input_ids"], batch["attention_mask"], batch["extra_features"]
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        extra_features = batch["extra_features"]
 
-        # Model prediction
         with torch.no_grad():
-            logits = custom_model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)
-            print(f"Logits: {logits}, path1: {batch['path1']}, path2: {batch['path2']}")
+            if ori:
+                logits = custom_model(input_ids=input_ids, attention_mask=attention_mask)
+            else:
+                logits = custom_model(input_ids=input_ids, attention_mask=attention_mask, extra_features=extra_features)
 
-            preds = torch.argmax(logits.detach().cpu(), dim=-1).tolist()
+            preds = (logits > 0).long().squeeze(-1).cpu().tolist()
 
         # Append edges based on predictions
         for idx, pred in enumerate(preds):
             if pred == 1:
                 ds.union(batch["path1"][idx], batch["path2"][idx])
-            else:
-                continue
-        
-    clusters = ds.groups()
-    return clusters
+
+    return ds.groups()
+
 
 
 def calc_jaccard_index(actual_cluster, predicted_cluster):
@@ -1146,100 +1186,79 @@ def get_all_samples(df, frequent_ref_defn_paths):
     return labeled_df
 
 
-def evaluate_single_schema(schema, test_ground_truth):
+def evaluate_single_schema(schema, ori, test_ground_truth):
     """
     Helper function to evaluate a single schema.
 
     Args:
         schema (str): The schema filename to be evaluated.
-        device (torch.device): The device on which to run the model.
+        ori (bool): Whether to use the original CodeBERT model or a custom model.
         test_ground_truth (dict): Ground truth clusters for test schemas.
 
     Returns:
-        tuple: Contains schema name, precision, recall, F1 score, sorted actual clusters, and sorted predicted clusters.
-        None: If the schema could not be processed.
+        tuple: schema name, precision, recall, F1, actual clusters, predicted clusters
+        or None if schema could not be processed.
     """
-    
+    accelerator = Accelerator()
+    collate_with_tokenizer = CollateEvalFn(tokenizer)
+
     df, frequent_ref_defn_paths, schema_name, failure_flags = process_data.process_schema(schema, schema)
-    print(f"Evaluating schema: {schema_name}", flush=True)
+
     if df is not None and frequent_ref_defn_paths:
         print(f"Schema {schema_name} has frequent reference definitions.", flush=True)
 
-        #pairs_df = get_all_samples(df, frequent_ref_defn_paths)
-        '''
-        # Remove paths whose prefixes are not explicitly defined in the schema
-        df = remove_additional_properties(df, schema_name)
-        #print(schema_paths, flush=True)
-        if len(df) < 2:
-            print(f"Schema {schema_name} has less than 2 paths after filtering.", flush=True)
-            return None
-        '''
-        # Load the model and tokenizer
-        custom_model, tokenizer = load_model_and_adapter()
+        # Load the model
+        model = load_model_and_adapter(ori)
 
-        # Enable multiple GPU usage with DataParallel
-        if torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs for model parallelism.", flush=True)
-            custom_model = nn.DataParallel(custom_model)
-        
-        # Create a DataFrame with pairs of schemas that have at least two common properties
+        # Preprocess data
         pairs_df = create_schema_pairs_with_common_properties(df)
         if pairs_df.empty:
             print(f"No pairs found for schema {schema_name}.", flush=True)
             return None
-        
-        # Tokenize and merge schemas
+
         eval_df = merge_schema_tokens(pairs_df, tokenizer)
-        
-        # Calculate the cosine similarity between the paths
-        #eval_df = process_data.calculate_cosine_similarity(eval_df, original_model, tokenizer, device)
-
-        # Add extra features to the DataFrame
         eval_df = add_extra_features(eval_df, "eval")
-        
-        # Create datasets with dynamic padding and batching
         eval_dataset = CustomEvalDataset(eval_df)
-        eval_loader = DataLoader(eval_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=lambda batch: collate_eval_fn(batch, tokenizer))
-        
-        custom_model.to(device)
-        custom_model.eval()
-        
-        predicted_clusters = generate_clusters(eval_loader, custom_model, device, schema_name)
-        
-        # Predict clusters and sort each predicted cluster alphabetically
-        #predicted_clusters = [sorted(cluster) for cluster in find_definitions_from_graph(graph)]
+        eval_loader = DataLoader(eval_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_with_tokenizer)
 
-        # Get the ground truth clusters and sort each actual cluster alphabetically
+        # Prepare model and dataloader for Accelerate
+        model, eval_loader = accelerator.prepare(model, eval_loader)
+        model.eval()
+
+        # Predict clusters
+        predicted_clusters = generate_clusters(eval_loader, model, schema_name, ori)
+
+        # Ground truth
         defn_paths_dict = test_ground_truth.get(schema_name, {})
         actual_clusters = [sorted([tuple(path) for path in cluster]) for cluster in sorted(defn_paths_dict.values())]
 
-        # Calculate the precision, recall, and F1-score
+        # Metrics
         precision, recall, f1_score = calculate_metrics(actual_clusters, predicted_clusters)
-        #precision, recall, f1_score, _, _ = calc_scores(actual_clusters, predicted_clusters)
 
         print(f"Actual clusters: {schema_name}", flush=True)
         for cluster in actual_clusters:
             print(cluster, flush=True)
-        
+
         print(f"Predicted clusters: {schema_name}", flush=True)
         for cluster in predicted_clusters:
             print(cluster, flush=True)
 
         print(f"Schema: {schema_name}, Precision: {precision}, Recall: {recall}, F1-score: {f1_score}", flush=True)
-        # Return evaluation metrics and sorted clusters for the schema
+
         return schema, precision, recall, f1_score, actual_clusters, predicted_clusters
     else:
         print(f"Schema {schema_name} could not be processed or has no frequent reference definitions.", flush=True)
-        
+
     return None
 
 
-def evaluate_data(test_ground_truth, output_file="evaluation_results.json"):
+def evaluate_data(test_ground_truth, ori, output_file="evaluation_results.json"):
     """
     Evaluate the model on the entire test data sequentially and store results in a JSON file.
 
     Args:
         test_ground_truth (dict): Dictionary containing ground truth information for test data.
+        ori (bool): Whether to use the original CodeBERT model or a custom model.
         output_file (str): Path to the JSON file to store the evaluation results.
     """
     # Get the test schemas
@@ -1248,11 +1267,11 @@ def evaluate_data(test_ground_truth, output_file="evaluation_results.json"):
     precision_scores = []
     f1_scores = []
     results = []
-    frames = []
 
+    #test_schemas = ["gitpod-configuration.json"]
     # Process schemas sequentially
     for schema in tqdm(test_schemas, total=len(test_schemas), position=1):
-        result = evaluate_single_schema(schema, test_ground_truth)
+        result = evaluate_single_schema(schema, ori, test_ground_truth)
 
         if result is not None:
             schema, precision, recall, f1_score, actual_clusters, predicted_clusters = result
@@ -1275,10 +1294,16 @@ def evaluate_data(test_ground_truth, output_file="evaluation_results.json"):
         avg_f1_score = sum(f1_scores) / len(f1_scores)
         avg_recall = sum(recalls) / len(recalls)
         avg_precision = sum(precision_scores) / len(precision_scores)
-        print(f'Average F1-score: {avg_f1_score}', flush=True)
-        print(f'Average Recall: {avg_recall}', flush=True)
         print(f'Average Precision: {avg_precision}', flush=True)
+        print(f'Average Recall: {avg_recall}', flush=True)
+        print(f'Average F1-score: {avg_f1_score}', flush=True)
+       
         results.append({"average_precision": avg_precision,  "average_recall": avg_recall, "average_f1_score": avg_f1_score})
+
+    if ori:
+        output_file = "ori_" + output_file
+    else:   
+        output_file = "custom_" + output_file
 
     # Write results to JSON file
     with open(output_file, "w") as json_file:
@@ -1287,58 +1312,63 @@ def evaluate_data(test_ground_truth, output_file="evaluation_results.json"):
     
 
 
-def group_paths(df, test_ground_truth, min_common_keys=1, output_file="evaluation_results_baseline_model.json"):
+
+
+
+
+
+
+
+
+
+
+
+
+def group_paths(df, test_ground_truth, min_common_keys=2, output_file="evaluation_results_baseline_model.json"):
     """
-    Group paths that have at least a specified number of distinct nested keys in common per filename and evaluate.
+    Greedily group paths that share a core set of nested keys. New paths can only join a group
+    if they overlap with the original keys that caused the group to be formed.
 
     Args:
-        df (pd.DataFrame): DataFrame containing columns "path", "distinct_nested_keys", and "filename".
-        test_ground_truth (dict): Dictionary containing ground truth clusters for test data.
-        min_common_keys (int, optional): Minimum number of distinct nested keys required for paths to be grouped together. Default is 2.
-        output_file (str, optional): Path to the output JSON file. Default is "evaluation_results_baseline_model.json".
+        df (pd.DataFrame): DataFrame with columns: "path", "distinct_nested_keys", "filename"
+        test_ground_truth (dict): Ground truth clusters
+        min_common_keys (int): Minimum shared keys for grouping
+        output_file (str): Where to write evaluation results
 
     Returns:
         None
     """
-    all_results = []  # To accumulate results for each filename
-    f1_scores = []  # To store F1 scores for each schema
-    precision_scores = []  # To store precision scores for each schema
-    recall_scores = []  # To store recall scores for each schema
+    all_results = []
+    f1_scores, precision_scores, recall_scores = [], [], []
 
-    # Iterate through each filename group
-    for schema_name, group in tqdm(df.groupby("filename"), position=1, total=len(df["filename"].unique()), desc="Grouping paths"):
-  
-        # Convert string representation of paths to tuples
+    for schema_name, group in tqdm(df.groupby("filename"), desc="Grouping paths", position=1):
         group["path"] = group["path"].apply(ast.literal_eval)
-
         paths = group["path"].tolist()
         distinct_keys = group["distinct_nested_keys"].tolist()
 
-        # Prepare and sort by number of keys descending
         path_key_pairs = [
             (path, frozenset(ast.literal_eval(keys)))
             for path, keys in zip(paths, distinct_keys)
         ]
-        path_key_pairs.sort(key=lambda x: -len(x[1]))
+        path_key_pairs.sort(key=lambda x: -len(x[1]))  # largest keysets first
 
-        group_dict = defaultdict(list)
+        # Each group: (required_shared_keys, all_merged_keys, list_of_paths)
+        groups = []
 
         for path, keys in path_key_pairs:
-            added_to_group = False
-
-            for existing_keys in sorted(group_dict.keys(), key=lambda k: -len(group_dict[k])):
-                common_keys = keys & existing_keys
-                if len(common_keys) >= min_common_keys and len(common_keys) / len(existing_keys) >= 0.25:
-                    merged_keys = keys | existing_keys
-                    group_dict[merged_keys] = group_dict.pop(existing_keys) + [path]
-                    added_to_group = True
+            added = False
+            for i, (required_keys, full_keys, path_list) in enumerate(groups):
+                if len(keys & required_keys) >= min_common_keys:
+                    updated_keys = full_keys | keys
+                    groups[i] = (required_keys, updated_keys, path_list + [path])
+                    added = True
                     break
 
-            if not added_to_group:
-                group_dict[keys] = [path]
+            if not added:
+                groups.append((keys, keys, [path]))
 
-        # Filter groups with more than one path and sort paths within groups
-        predicted_clusters = [sorted(group) for group in group_dict.values() if len(group) > 1]
+        # Filter groups with more than one path, sort paths within clusters
+        predicted_clusters = [sorted([tuple(p) for p in path_list]) for _, _, path_list in groups if len(path_list) > 1]
         predicted_clusters = sorted(predicted_clusters)
 
         # Get the actual clusters for the current filename
@@ -1349,30 +1379,26 @@ def group_paths(df, test_ground_truth, min_common_keys=1, output_file="evaluatio
         print(f"Predicted clusters: {predicted_clusters}", flush=True)
 
         # Evaluate the predicted clusters against the ground truth
-        #precision, recall, f1_score, matched_definitions, matched_paths = calc_scores(actual_clusters, predicted_clusters)
         precision, recall, f1_score = calculate_metrics(actual_clusters, predicted_clusters)
         print(f"Schema: {schema_name}, Precision: {precision}, Recall: {recall}, F1-score: {f1_score}", flush=True)
         print(flush=True)
 
-        # Store individual F1 scores for average calculation later
+        # Store individual scores
         f1_scores.append(f1_score)
         precision_scores.append(precision)
         recall_scores.append(recall)
 
-        # Collect results for the current schema
         results = {
             "schema": schema_name,
             "precision": precision,
             "recall": recall,
             "f1_score": f1_score,
             "actual_clusters": actual_clusters,
-            "predicted_clusters": predicted_clusters,
-            #"matched_definitions": matched_definitions,
-            #"matched_paths": list(matched_paths),
+            "predicted_clusters": predicted_clusters
         }
         all_results.append(results)
 
-    # Calculate average F1 score if there are any scores
+    # Add macro average across schemas
     if f1_scores:
         avg_f1_score = sum(f1_scores) / len(f1_scores)
         avg_precision = sum(precision_scores) / len(precision_scores)
@@ -1383,7 +1409,7 @@ def group_paths(df, test_ground_truth, min_common_keys=1, output_file="evaluatio
             "average_f1_score": avg_f1_score
         })
 
-    # Write all results to the specified JSON file
+    # Save all results
     with open(output_file, "w") as json_file:
         json.dump(all_results, json_file, indent=4)
 

@@ -1,5 +1,6 @@
 import ast
 import concurrent.futures
+import hashlib
 import itertools
 import json
 import jsonschema
@@ -46,7 +47,7 @@ JSON_SUBSCHEMA_KEYWORDS = {"allOf", "oneOf", "anyOf"}
 SCHEMA_FOLDER = "converted_processed_schemas"
 JSON_FOLDER = "processed_jsons"
 MAX_TOK_LEN = 512
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 MODEL_NAME = "microsoft/codebert-base" 
 
 
@@ -445,46 +446,56 @@ def parse_document(doc, path = ("$",), values = []):
         if isinstance(value, (dict, list)):
             yield from parse_document(value, path + (key,), values)
 
-    
-def process_document(doc, paths_dict):
+
+def process_document(doc, paths_dict, path_freqs):
     """
-    Extracts paths whose values are object-type from the given JSON document and stores them in dictionaries,
-    grouping values by paths.
+    Extracts object-like paths from the given JSON document and stores them in dictionaries,
+    grouping values by paths and tracking path frequency.
 
     Args:
         doc (dict): The JSON document from which paths are extracted.
-        paths_dict (dict): Dictionary of paths and their values, using sets to avoid duplicates.
+        paths_dict (dict): Dictionary mapping each path to a list of values (as JSON strings).
+        path_freqs (Counter): Dictionary tracking how often each path appears.
     """
     for path, value in parse_document(doc):
+        path_freqs[path] += 1
+
         if path not in paths_dict:
-            paths_dict[path] = set()
+            paths_dict[path] = []
 
         if isinstance(value, dict):
             value_str = json.dumps(value, sort_keys=True)
-            paths_dict[path].add(value_str)
+            paths_dict[path].append(value_str)
 
         elif isinstance(value, list) and all(isinstance(item, dict) for item in value):
             sorted_list = sorted(
                 [json.dumps(item, sort_keys=True) for item in value]
             )
             value_str = json.dumps(sorted_list, sort_keys=True)
-            paths_dict[path].add(value_str)
+            paths_dict[path].append(value_str)
+
+
+def get_doc_hash(doc):
+    """Return a hash of the canonical JSON form of the document."""
+    try:
+        canonical = json.dumps(doc, sort_keys=True)
+        return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    except Exception:
+        return None
 
 
 def process_dataset(dataset):
     """
     Process and extract object-like paths from a JSON lines dataset, filtering documents
-    by matching schema properties.
-
-    Args:
-        dataset (str): The filename of the dataset (assumed to exist in JSON_FOLDER).
+    by matching schema properties and ignoring duplicate documents.
 
     Returns:
-        tuple: (paths_dict, num_docs) where paths_dict is a dict of paths and values,
-               and num_docs is the number of processed matching documents.
+        tuple: (paths_dict, num_docs)
     """
-    paths_dict = defaultdict(set)
+    paths_dict = defaultdict(list)
+    path_freqs = Counter()
     num_docs = 0
+    seen_hashes = set()
 
     schema_path = os.path.join(SCHEMA_FOLDER, dataset)
     schema = load_schema(schema_path)
@@ -500,22 +511,31 @@ def process_dataset(dataset):
 
             try:
                 matched = False
+                items = doc if isinstance(doc, list) else [doc]
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
 
-                if isinstance(doc, dict) and match_properties(schema, doc):
-                    process_document(doc, paths_dict)
-                    matched = True
+                    doc_hash = get_doc_hash(item)
+                    if doc_hash is None or doc_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(doc_hash)
 
-                elif isinstance(doc, list):
-                    for item in doc:
-                        if isinstance(item, dict) and match_properties(schema, item):
-                            process_document(item, paths_dict)
-                            matched = True
+                    if match_properties(schema, item):
+                        process_document(item, paths_dict, path_freqs)
+                        matched = True
 
                 if matched:
                     num_docs += 1
 
             except Exception as e:
                 print(f"[Line {line_number}] Error processing document in {dataset}: {e}", flush=True)
+
+    # Remove paths that occur only once
+    paths_dict = {
+        path: values for path, values in paths_dict.items()
+        if path_freqs[path] > 1
+    }
 
     return paths_dict, num_docs
 
@@ -721,65 +741,55 @@ def unique_oneOf(schemas):
     return list(serialized.values())
 
 
+def flatten_oneOf(schema):
+    if "oneOf" in schema:
+        result = []
+        for s in schema["oneOf"]:
+            if isinstance(s, dict) and "oneOf" in s:
+                result.extend(flatten_oneOf(s)["oneOf"])
+            else:
+                result.append(s)
+        return {"oneOf": unique_oneOf(result)}
+    return schema
+
+
 def merge_schemas(schema1, schema2, depth=0, max_depth=10):
-    """
-    Recursively merges two JSON schemas.
-    - If schemas have different types, they are combined under `oneOf`.
-    - Merges properties and required fields for objects.
-    - Recursively merges `items` for array schemas.
-
-    Args:
-        schema1 (dict): The first JSON schema.
-        schema2 (dict): The second JSON schema.
-        depth (int): Current recursion depth.
-        max_depth (int): Maximum allowed recursion depth.
-
-    Returns:
-        dict: The merged JSON schema.
-    """
     if depth > max_depth:
         raise RecursionError(f"Exceeded max recursion depth of {max_depth}")
-
+    
     if not isinstance(schema1, dict) or not isinstance(schema2, dict):
         raise TypeError("Both schema1 and schema2 must be dictionaries.")
+    
+    schema1 = flatten_oneOf(schema1)
+    schema2 = flatten_oneOf(schema2)
+    
+    type1 = schema1.get("type")
+    type2 = schema2.get("type")
 
-    schema1_type = schema1.get("type")
-    schema2_type = schema2.get("type")
+    if type1 == type2:
+        new_schema = deepcopy(schema1)
 
-    # If types match, merge accordingly
-    if schema1_type == schema2_type:
-        new_schema = deepcopy(schema1)  # Ensure original schema is not modified
-
-        if schema1_type == "object":
-            new_schema.setdefault("properties", {})
-            schema2_properties = schema2.get("properties", {})
-
-            # Merge `required` fields
+        if type1 == "object":
             new_schema["required"] = sorted(set(schema1.get("required", [])) | set(schema2.get("required", [])))
+            for k, v in schema2.get("properties", {}).items():
+                if k in new_schema["properties"]:
+                    new_schema["properties"][k] = merge_schemas(new_schema["properties"][k], v, depth + 1)
+                else:
+                    new_schema["properties"][k] = v
 
-            # Recursively merge properties
-            for prop, value in schema2_properties.items():
-                new_schema["properties"][prop] = merge_schemas(new_schema["properties"].get(prop, {}), value, depth + 1)
+            return new_schema
 
-        elif schema1_type == "array" and "items" in schema1 and "items" in schema2:
+        elif type1 == "array" and "items" in schema1 and "items" in schema2:
             new_schema["items"] = merge_schemas(schema1["items"], schema2["items"], depth + 1)
+            return new_schema
 
         return new_schema
 
-    # Handle different types by combining them under `oneOf`
-    if "oneOf" in schema1 and "oneOf" in schema2:
-        return {"oneOf": unique_oneOf(schema1["oneOf"] + schema2["oneOf"])}
-
-    if "oneOf" in schema1:
-        return {"oneOf": unique_oneOf(schema1["oneOf"] + [schema2])}
-
-    if "oneOf" in schema2:
-        return {"oneOf": unique_oneOf([schema1] + schema2["oneOf"])}
-
-    return {"oneOf": unique_oneOf([schema1, schema2])}
+    # Flatten and merge into oneOf
+    return flatten_oneOf({"oneOf": [schema1, schema2]})
 
 
-def discover_schema(value, max_depth=1, current_depth=0):
+def discover_schema(value, max_depth=2, current_depth=0):
     """
     Determine the structure (type) of the JSON key's value, considering only top-level properties of objects
     and top-level items of arrays.
@@ -825,70 +835,52 @@ def discover_schema(value, max_depth=1, current_depth=0):
 
 
 def discover_schema_from_values(values):
-    """
-    Determine the schema for a list of values.
-    Args:
-        values (list): The list of values to determine the schema for.
-        model: The model to use for tokenizing the schema.
-    Returns:
-        dict: The schema representing the structure of the list of values.
-    """
     if not values:
         return {"type": "null"}
-    else:
-        return reduce(merge_schemas, (discover_schema(v) for v in values))
+    schemas = [discover_schema(v) for v in values]
+    return reduce(merge_schemas, schemas)
 
 
-def extract_all_keys(obj, prefix=()):
+def calculate_nested_keys_frequency(values, num_docs):
     """
-    Recursively extract all keys from a nested dict, returning a list of key paths or just keys.
+    Calculate frequency of each top-level key relative to total number of documents.
+
     Args:
-        obj (dict or list): The object to extract keys from.
-        prefix (tuple): The current path in the hierarchy.
-    Returns:
-        list: A list of keys or key paths.
-    """
-
-    keys = []
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            keys.append(k)
-            keys.extend(extract_all_keys(v, prefix + (k,)))
-    elif isinstance(obj, list):
-        for item in obj:
-            keys.extend(extract_all_keys(item, prefix))
-    return keys
-
-
-def calculate_nested_key_frequencies(values):
-    """
-    Given a list of dict values, calculate the frequency of each nested key.
+        values (list): List of dicts or list-of-dicts at the path.
+        num_docs (int): Total number of documents in the dataset.
 
     Returns:
-        dict: {key: relative_frequency}, relative_frequency between 0 and 1.
+        dict: {key: relative_frequency} where frequency is fraction of total documents
+              where path and key co-occur.
     """
-    counter = Counter()
-    total_values = len(values)
+    from collections import Counter
+
+    key_presence_counter = Counter()
 
     for val in values:
-        # Get all keys in this value
-        keys = extract_all_keys(val)
-        # Count unique keys per value to avoid double counting keys within the same value
-        unique_keys = set(keys)
-        counter.update(unique_keys)
+        dicts_to_check = val if isinstance(val, list) else [val]
+        keys_in_doc = set()
+        for d in dicts_to_check:
+            if not isinstance(d, dict):
+                continue
+            keys_in_doc.update(d.keys())
+        for key in keys_in_doc:
+            key_presence_counter[key] += 1
 
-    # Normalize by total number of values
-    frequencies = {k: v / total_values for k, v in counter.items()}
-    return frequencies
+    if num_docs == 0:
+        return {}
+
+    return {k: v / num_docs for k, v in key_presence_counter.items()}
 
 
-def create_dataframe(paths_dict, paths_to_exclude):
+def create_dataframe(paths_dict, paths_to_exclude, num_docs):
     """
     Create a DataFrame of paths and their merged schemas.
 
     Args:
         paths_dict (dict): Dictionary of paths and their serialized JSON values.
         paths_to_exclude (set): Paths to exclude.
+        num_docs (int): Total number of documents processed (for path frequency computation).
 
     Returns:
         pd.DataFrame: DataFrame with tokenized schemas and metadata.
@@ -900,31 +892,44 @@ def create_dataframe(paths_dict, paths_to_exclude):
         if path in paths_to_exclude:
             continue
 
-         # Parse and discover the schema from values
+        # Full list: needed for frequency analysis
         parsed_values = [json.loads(v) for v in values]
+
+        # Deduplicated: needed for efficient schema inference
+        unique_value_strs = list(set(values))
+        unique_parsed_values = [json.loads(v) for v in unique_value_strs]
+
         try:
-            schema = discover_schema_from_values(parsed_values)
+            schema = discover_schema_from_values(unique_parsed_values)
         except Exception as e:
             print(f"Error discovering schema for path {path}: {e}", flush=True)
             paths_to_exclude.add(path)
             continue
 
-        # Check if the schema has more than one property
         if len(schema.get("properties", {})) >= 1:
-            nested_keys = calculate_nested_key_frequencies(parsed_values)
+            nested_freqs = calculate_nested_keys_frequency(parsed_values, num_docs)
+            #print(f"Processing path: {path}", flush=True)
+            #print(f"Nested key freqs: {nested_freqs}", flush=True)
+
             tokenized_schema = tokenize_schema(json.dumps(schema), tokenizer)
-            df_data.append([path, len(path), nested_keys, tokenized_schema, json.dumps(schema)])
+
+            df_data.append([
+                path,
+                len(path),
+                nested_freqs,
+                tokenized_schema,
+                json.dumps(schema)
+            ])
         else:
-            # Update paths_to_exclude if schema has less than or equal to one property
             paths_to_exclude.add(path)
 
     columns = ["path", "nesting_depth", "nested_keys", "tokenized_schema", "schema"]
-    df = pd.DataFrame(df_data, columns=columns)
-
-    return df
+    return pd.DataFrame(df_data, columns=columns)
 
 
-def create_dataframe_baseline_model(paths_dict, paths_to_exclude):
+
+
+def create_dataframe_baseline_model(paths_dict, paths_to_exclude, num_docs):
     """
     Create a DataFrame of paths and distinct nested keys.
 
@@ -945,7 +950,7 @@ def create_dataframe_baseline_model(paths_dict, paths_to_exclude):
         # Parse and discover the schema from values
         parsed_values = [json.loads(v) for v in values]
        
-        nested_keys = calculate_nested_key_frequencies(parsed_values)
+        nested_keys = calculate_nested_keys_frequency(parsed_values, num_docs)
         if len(nested_keys) == 0:
             paths_to_exclude.add(path)
             continue
@@ -1059,9 +1064,9 @@ def process_schema(schema_name, filename):
     '''
     # Create DataFrame
     if filename == "baseline_test_data.csv":
-        df = create_dataframe_baseline_model(paths_dict, paths_to_exclude)
+        df = create_dataframe_baseline_model(paths_dict, paths_to_exclude, num_docs)
     else:
-        df = create_dataframe(paths_dict, paths_to_exclude)
+        df = create_dataframe(paths_dict, paths_to_exclude, num_docs)
         print(f"Number of paths in {schema_name}: {len(df)}", flush=True)
 
     # Update reference definitions
@@ -1319,8 +1324,12 @@ def get_samples(df, frequent_ref_defn_paths, best_good_pairs=False):
         if ((p1, p2) not in all_good_pairs and (p2, p1) not in all_good_pairs):
             schema1_good = path_to_schema.get(p1) in good_schemas
             schema2_good = path_to_schema.get(p2) in good_schemas
-            if not (schema1_good and schema2_good):
+            keys1 = set(df.loc[df["path"] == p1, "nested_keys"].values[0].keys())
+            keys2 = set(df.loc[df["path"] == p2, "nested_keys"].values[0].keys())
+
+            if not (schema1_good and schema2_good) and len(keys1 & keys2) >= 1:
                 all_bad_pairs.add((p1, p2))
+
 
     bad_pairs_distances = [
         ((p1, p2), cosine(schema_embeddings[p1], schema_embeddings[p2]))
@@ -1377,7 +1386,6 @@ def preprocess_data(schemas, filename, ground_truth_file):
     freq_defn = 0
     properties = 0
 
-    #schemas = ["bashly-yml.json"]
 
     # Limit the number of concurrent workers to prevent memory overload
     for i in tqdm(range(0, len(schemas), BATCH_SIZE), position=0, desc="Processing schemas", leave=True, total=len(schemas)):
@@ -1388,7 +1396,6 @@ def preprocess_data(schemas, filename, ground_truth_file):
             for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), position=1, desc="Processing batch", leave=False):
                 try:
                     df, frequent_ref_defn_paths, schema_name, failure_flags = future.result()
-                    
                     load_count += failure_flags["load"]
                     ref_defn += failure_flags["ref_defn"]
                     object_defn += failure_flags["object_defn"]
@@ -1420,65 +1427,7 @@ def preprocess_data(schemas, filename, ground_truth_file):
     print("Schemas with frequent definitions:", total_schemas - load_count - ref_defn - object_defn - path - schema_intersection - freq_defn)
     print("Schemas with properties:", total_schemas - load_count - ref_defn - object_defn - path - schema_intersection - freq_defn - properties)
 
-'''
-def preprocess_data(schemas, filename, ground_truth_file):
-    """
-    Process all the data from the JSON files to get their embeddings sequentially.
 
-    Args:
-        schemas (list): List of schema filenames.
-        filename (str): Filename to save the resulting DataFrame.
-        ground_truth_file (str): Filename to save the ground truth definitions.
-    """
-
-    ground_truths = defaultdict(dict)
-    
-    total_schemas = len(schemas)
-    load_count = 0
-    ref_defn = 0
-    object_defn = 0
-    path = 0
-    schema_intersection = 0
-    freq_defn = 0
-    properties = 0
-    #schemas = ["firebase.json"]
-    for schema in tqdm(schemas, position=0, desc="Processing schemas", leave=True, total=total_schemas):
-        try:
-            df, frequent_ref_defn_paths, schema_name, failure_flags = process_schema(schema, filename)
-            
-        except Exception as e:
-            print(f"Error processing schema {schema}: {e}", flush=True)
-
-        load_count += failure_flags["load"]
-        ref_defn += failure_flags["ref_defn"]
-        object_defn += failure_flags["object_defn"]
-        path += failure_flags["path"]
-        schema_intersection += failure_flags["schema_intersection"]
-        freq_defn += failure_flags["freq_defn"]
-        properties += failure_flags["properties"]
-
-        if df is not None and frequent_ref_defn_paths:
-            ground_truths[schema_name] = frequent_ref_defn_paths
-            
-            if filename != "baseline_test_data.csv":
-                df = get_samples(df, frequent_ref_defn_paths, best_good_pairs=True)
-            
-            # Append batch to CSV to avoid holding everything in memory
-            df.to_csv(filename, mode='a', header=not os.path.exists(filename), index=False, sep=';')
-
-        
-
-    # Save ground truth definitions once all processing is done
-    save_ground_truths(ground_truths, ground_truth_file)
-    print("Total schemas processed:", total_schemas)
-    print("Schemas that loaded:", total_schemas - load_count)
-    print("Schemas with referenced definitions:", total_schemas - load_count - ref_defn)
-    print("Schemas with object definitions:", total_schemas - load_count - ref_defn - object_defn)
-    print("Schemas with paths:", total_schemas - load_count - ref_defn - object_defn - path)
-    print("Schemas with schema intersection:", total_schemas - load_count - ref_defn - object_defn - path - schema_intersection)
-    print("Schemas with frequent definitions:", total_schemas - load_count - ref_defn - object_defn - path - schema_intersection - freq_defn)
-    print("Schemas with properties:", total_schemas - load_count - ref_defn - object_defn - path - schema_intersection - freq_defn - properties)
-'''
 def delete_file_if_exists(filename):
     """
     Deletes the specified file if it exists.
@@ -1536,6 +1485,7 @@ def main():
             # Preprocess the training and testing data
             preprocess_data(train_set, filename="sample_train_data.csv", ground_truth_file="train_ground_truth.json")
             preprocess_data(test_set, filename="sample_test_data.csv", ground_truth_file="test_ground_truth.json")
+            #preprocess_data(test_set, filename="test.csv", ground_truth_file="test.json")
             # End the timer
             end_time = time.time()
             # Calculate the elapsed time

@@ -1,32 +1,43 @@
 import json
 import model
-import multiprocessing
+import os
 import pandas as pd
 import sys
 import time
+import torch
+import torch.multiprocessing as mp
 
 
 
-def load_data():
+def load_data(ori):
     """
     Load sampled training and testing datasets from CSV files and train the model.
     """
     train_df = pd.read_csv("sample_train_data.csv",sep=';') 
     test_df = pd.read_csv("sample_test_data.csv", sep=';') 
-    test_df = test_df.sample(frac=1).reset_index(drop=True)
-    model.train_model(train_df, test_df)
+
+    if ori == "ori":
+        model.train_model(train_df, test_df, ori=True)
+    else:
+        model.train_model(train_df, test_df, ori=False, train_mode="adapter")
 
 
-def evaluate_model():
+
+def evaluate_model(ori):
     """
     Evaluate the model on the test set.
+
+    If ori is True, it uses the original data; otherwise, it uses the sampled data.
     """
     test_ground_truth = {}
-    with open("test_ground_truth_v2.json", 'r') as json_file:
+    with open("test_ground_truth.json", 'r') as json_file:
         for line in json_file:
             test_ground_truth.update(json.loads(line))
+    if ori == "ori":
+        model.evaluate_data(test_ground_truth, True)
+    else:
+        model.evaluate_data(test_ground_truth, False)
 
-    model.evaluate_data(test_ground_truth)
 
 
 def evaluate_baseline_model():
@@ -34,7 +45,7 @@ def evaluate_baseline_model():
     df = pd.read_csv("baseline_test_data.csv", sep=';')
 
     test_ground_truth = {}
-    with open("test_ground_truth_v2.json", 'r') as json_file:
+    with open("test_ground_truth.json", 'r') as json_file:
         for line in json_file:
             test_ground_truth.update(json.loads(line))
 
@@ -50,10 +61,10 @@ def main():
     """
     mode, ori = sys.argv[-2:]
     if mode == "train":
-        load_data()
+        load_data(ori)
     elif mode == "test":
         start_time = time.time()
-        evaluate_model()
+        evaluate_model(ori)
         print(time.time() - start_time)
     elif mode == "baseline":
         start_time = time.time()
@@ -98,5 +109,5 @@ def main():
   
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method("spawn", force=True)
+    mp.set_start_method("spawn", force=True)
     main()
