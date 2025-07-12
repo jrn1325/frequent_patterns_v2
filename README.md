@@ -32,7 +32,7 @@ The project expects JSON schema files to be stored in the `converted_processed_s
    piplock install
    ```
 3. Ensure your JSON schema files are placed in the `converted_processed_schemas` directory.
-4. Ensure the `test_ground_truth_v2.json` file is present in the root directory.
+4. Ensure the `test_ground_truth.json` file is present in the root directory.
 
 ## Usage
 
@@ -59,7 +59,7 @@ To evaluate the model, run the `evaluate_data` function:
 import json
 
 # Load the ground truth data
-with open("test_ground_truth_v2.json", 'r') as f:
+with open("test_ground_truth.json", 'r') as f:
     test_ground_truth = json.load(f)
 
 evaluate_data(test_ground_truth)
@@ -73,7 +73,7 @@ To evaluate the baseline model (grouping paths based on common keys), run the `g
 import json
 
 # Load the ground truth data
-with open("test_ground_truth_v2.json", 'r') as f:
+with open("test_ground_truth.json", 'r') as f:
     test_ground_truth = json.load(f)
 
 group_paths(df, test_ground_truth)
@@ -99,6 +99,5 @@ group_paths(df, test_ground_truth)
 ## Additional Notes
 
 - The `process_data.py` script contains functions for data processing, including schema parsing, path extraction, and cosine similarity calculation.
-- The `dereference_schema.js` script is a Node.js script used for dereferencing JSON schemas.
 - The project uses `wandb` for experiment tracking and logging. Ensure you have `wandb` installed and configured.
 - The model and adapter are saved in the `frequent_pattern_model` directory after training.
