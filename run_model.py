@@ -7,6 +7,7 @@ import time
 import torch
 import torch.multiprocessing as mp
 
+from collections import defaultdict
 
 
 def load_data(ori):
@@ -20,8 +21,6 @@ def load_data(ori):
         model.train_model(train_df, test_df, ori=True)
     else:
         model.train_model(train_df, test_df, ori=False, train_mode="adapter")
-
-
 
 def evaluate_model(ori):
     """
@@ -38,8 +37,6 @@ def evaluate_model(ori):
     else:
         model.evaluate_data(test_ground_truth, False)
 
-
-
 def evaluate_baseline_model():
     
     df = pd.read_csv("baseline_test_data.csv", sep=';')
@@ -51,7 +48,50 @@ def evaluate_baseline_model():
 
     model.group_paths(df, test_ground_truth)
 
-                        
+def evaluate_schema():
+    """
+    Evaluate the schema of the model.
+    This function is currently a placeholder and does not perform any operations.
+    """
+    # Load CSV
+    test_df = pd.read_csv("sample_test_data.csv", sep=';')
+
+    schemas_by_file = defaultdict(list)
+
+    # Collect all path-schema pairs per file
+    for _, row in test_df.iterrows():
+        filename = row["filename"]
+        for path_col, schema_col in [("path1", "schema1"), ("path2", "schema2")]:
+            path = model.parse_path(row[path_col])
+            try:
+                schema = json.loads(row[schema_col])
+            except Exception:
+                continue
+            schemas_by_file[filename].append((path, schema))
+
+    # Build and write schemas
+    output_dir = "global_schemas"
+    os.makedirs(output_dir, exist_ok=True)
+
+    for filename, path_schema_pairs in schemas_by_file.items():
+        seen = set()
+        global_schema = {"type": "object", "properties": {}}
+        for path, schema in path_schema_pairs:
+            key = (tuple(path), json.dumps(schema, sort_keys=True))
+            if key in seen:
+                continue
+            seen.add(key)
+            partial = {"type": "object", "properties": {}}
+            model.insert_path(partial, path, schema)
+            model.merge_dicts(global_schema, partial)
+        out_path = os.path.join(output_dir, filename)
+        with open(out_path, "w") as f:
+            json.dump(global_schema, f, indent=2)
+ 
+
+
+
+
 def main():
     """
     Main function to train or evaluate the model based on the provided mode from the command-line arguments. 
@@ -70,8 +110,15 @@ def main():
         start_time = time.time()
         evaluate_baseline_model()
         print(time.time() - start_time)
+    elif mode == "eval":
+        start_time = time.time()
+        evaluate_schema()
+        print(time.time() - start_time)
     elif mode == "size":
-        model.get_json_schema_size(ori)
+        #model.get_json_schema_size(ori)
+        original_schemas_dir = "global_schemas"
+        abstracted_schemas_dir = "global_schemas_abstracted"
+        model.compare_schema_sizes(original_schemas_dir, abstracted_schemas_dir)
     elif mode == "info":
         train_df = pd.read_csv("sample_train_data.csv",sep=';') 
         train_df = pd.read_csv("sample_train_data.csv", sep=';')

@@ -18,6 +18,8 @@ import wandb
 from accelerate import Accelerator
 from adapters import AutoAdapterModel
 from collections import defaultdict, OrderedDict
+
+from copy import deepcopy
 from itertools import combinations
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, accuracy_score, roc_auc_score
 from torch.cuda.amp import autocast, GradScaler
@@ -1309,8 +1311,81 @@ def evaluate_data(test_ground_truth, ori, output_file="evaluation_results.json")
     with open(output_file, "w") as json_file:
         json.dump(results, json_file, indent=4)
     
-    
 
+def parse_path(path_str):
+    """Convert tuple string like "('$', 'a', 'b')" → ['a', 'b']
+    Args:        
+        path_str (str): String representation of a path tuple.
+    
+    Returns:
+        list: List of path components, excluding the root '$'.
+    """
+    try:
+        path_tuple = ast.literal_eval(path_str)
+        return list(path_tuple[1:])  # remove '$'
+    except Exception:
+        return []
+
+def insert_path(schema_dict, path, subschema):
+    """
+    Insert a subschema at a nested path into a global schema.
+    
+    Args:
+        schema_dict (dict): The global schema dictionary to modify.
+        path (list): The path where the subschema should be inserted.
+        subschema (dict): The subschema to insert at the specified path.
+    """
+    current = schema_dict.setdefault("properties", {})
+    for key in path[:-1]:
+        current = current.setdefault(key, {"type": "object", "properties": {}})["properties"]
+    current[path[-1]] = subschema
+
+def merge_dicts(a, b):
+    """
+    Deep merge b into a.
+    
+    Args:
+        a (dict): The target dictionary to merge into.
+        b (dict): The source dictionary to merge from.
+    """
+    for key in b:
+        if key in a and isinstance(a[key], dict) and isinstance(b[key], dict):
+            merge_dicts(a[key], b[key])
+        else:
+            a[key] = deepcopy(b[key])
+
+def compare_schema_sizes(original_schemas_dir, abstracted_schemas_dir):
+    """
+    Compare the sizes of original and abstracted JSON schemas in KB.
+    
+    Args:
+        original_schemas_dir (str): Directory containing original JSON schemas.
+        abstracted_schemas_dir (str): Directory containing abstracted JSON schemas.
+    """
+    total_original_kb = 0
+    total_abstracted_kb = 0
+
+    for filename in os.listdir(original_schemas_dir):
+        if filename.endswith('.json') and os.path.exists(os.path.join(abstracted_schemas_dir, filename)):
+            with open(os.path.join(original_schemas_dir, filename)) as f1, \
+                 open(os.path.join(abstracted_schemas_dir, filename)) as f2:
+                original_json = json.load(f1)
+                abstracted_json = json.load(f2)
+                o = len(json.dumps(original_json, separators=(',', ':'), sort_keys=True).encode("utf-8")) / 1024
+                a = len(json.dumps(abstracted_json, separators=(',', ':'), sort_keys=True).encode("utf-8")) / 1024
+                total_original_kb += o
+                total_abstracted_kb += a
+                print(f"File: {filename}, Original Size: {o:.2f} KB, Abstracted Size: {a:.2f} KB, Reduction: {100 * (1 - a / o):.2f}%", flush=True)
+
+    overall_reduction = 100 * (1 - total_abstracted_kb / total_original_kb) if total_original_kb > 0 else 0
+    print(f"\nTotal Original Size: {total_original_kb:.2f} KB")
+    print(f"Total Abstracted Size: {total_abstracted_kb:.2f} KB")
+    print(f"Overall Size Reduction: {overall_reduction:.2f}%")
+
+
+
+
+ 
 
 
 
