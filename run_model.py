@@ -116,9 +116,10 @@ def main():
         print(time.time() - start_time)
     elif mode == "size":
         #model.get_json_schema_size(ori)
-        original_schemas_dir = "global_schemas"
+        deref_schemas_dir = "global_schemas_deref"
+        original_schemas_dir = "global_schemas_ori"
         abstracted_schemas_dir = "global_schemas_abstracted"
-        model.compare_schema_sizes(original_schemas_dir, abstracted_schemas_dir)
+        model.compare_schema_sizes(deref_schemas_dir, original_schemas_dir, abstracted_schemas_dir)
     elif mode == "info":
         train_df = pd.read_csv("sample_train_data.csv",sep=';') 
         train_df = pd.read_csv("sample_train_data.csv", sep=';')

@@ -1354,44 +1354,58 @@ def merge_dicts(a, b):
         else:
             a[key] = deepcopy(b[key])
 
-def compare_schema_sizes(original_schemas_dir, abstracted_schemas_dir):
+def compare_schema_sizes(deref_schemas_dir, original_schemas_dir, abstracted_schemas_dir):
     """
     Compare the sizes of original and abstracted JSON schemas in KB.
     
     Args:
+        deref_schemas_dir (str): Directory containing dereferenced JSON schemas.
         original_schemas_dir (str): Directory containing original JSON schemas.
         abstracted_schemas_dir (str): Directory containing abstracted JSON schemas.
     """
+    total_deref_kb = 0
     total_original_kb = 0
     total_abstracted_kb = 0
+    reductions = []
 
     for filename in os.listdir(original_schemas_dir):
-        if filename.endswith('.json') and os.path.exists(os.path.join(abstracted_schemas_dir, filename)):
-            with open(os.path.join(original_schemas_dir, filename)) as f1, \
-                 open(os.path.join(abstracted_schemas_dir, filename)) as f2:
-                original_json = json.load(f1)
-                abstracted_json = json.load(f2)
+        with open(os.path.join(deref_schemas_dir, filename)) as f1, \
+                open(os.path.join(original_schemas_dir, filename)) as f2, \
+                open(os.path.join(abstracted_schemas_dir, filename)) as f3:
+            try:
+                deref_json = json.load(f1)
+                original_json = json.load(f2)
+                abstracted_json = json.load(f3)
+            except json.JSONDecodeError as e:
+                print(f"Error decoding JSON in {filename}: {e}", flush=True)
+                continue
+            
+            try:
+                d = len(json.dumps(deref_json, separators=(',', ':'), sort_keys=True).encode("utf-8")) / 1024
                 o = len(json.dumps(original_json, separators=(',', ':'), sort_keys=True).encode("utf-8")) / 1024
                 a = len(json.dumps(abstracted_json, separators=(',', ':'), sort_keys=True).encode("utf-8")) / 1024
-                total_original_kb += o
-                total_abstracted_kb += a
-                print(f"File: {filename}, Original Size: {o:.2f} KB, Abstracted Size: {a:.2f} KB, Reduction: {100 * (1 - a / o):.2f}%", flush=True)
+            except TypeError as e:
+                print(f"Error calculating size for {filename}: {e}", flush=True)
+                continue
 
-    overall_reduction = 100 * (1 - total_abstracted_kb / total_original_kb) if total_original_kb > 0 else 0
-    print(f"\nTotal Original Size: {total_original_kb:.2f} KB")
+            total_deref_kb += d
+            total_original_kb += o
+            total_abstracted_kb += a
+            reduction = (d - a) / (d - o) * 100 if (d - o) != 0 else 0
+            reductions.append(reduction)
+            print(f"File: {filename}, Dereferenced Size: {d:.2f} KB, Abstracted Size: {a:.2f} KB, Original Size: {o:.2f} KB,  Size Reduction: {reduction:.2f}%", flush=True)
+
+    print(f"\nTotal Dereferenced Size: {total_deref_kb:.2f} KB")
     print(f"Total Abstracted Size: {total_abstracted_kb:.2f} KB")
-    print(f"Overall Size Reduction: {overall_reduction:.2f}%")
+    print(f"Total Original Size: {total_original_kb:.2f} KB")
+    
+    # Compute average reduction across all files
+    if reductions:
+        average_reduction = sum(reductions) / len(reductions)
+    else:
+        average_reduction = 0
 
-
-
-
- 
-
-
-
-
-
-
+    print(f"\nAverage Size Reduction Across Files: {average_reduction:.2f}%")
 
 
 
@@ -1497,11 +1511,11 @@ def get_json_schema_size(original):
         None: Prints the schema names and their sizes in kilobytes.
     """
     # Load the ground truth file
-    with open("test_ground_truth_v2.json", 'r') as f:
+    with open("test_ground_truth.json", 'r') as f:
         for line in f:
             json_data = json.loads(line)
             for schema_name in json_data.keys():
-                schema_path = os.path.join(SCHEMA_FOLDER, schema_name)
+                schema_path = os.path.join("deref", schema_name)
                 try:
 
                     with open(schema_path, 'r') as schema_file:
@@ -1522,90 +1536,4 @@ def get_json_schema_size(original):
                     continue
 
 
-
-def get_definition(ref, schema):
-    """
-    Retrieve the object definition from a JSON schema based on a `$ref` reference string.
-
-    Args:
-        ref (str): The `$ref` reference string pointing to a specific definition within the schema.
-        schema (dict): The full JSON schema containing definitions.
-
-    Returns:
-        dict: The dereferenced object from the schema corresponding to the `$ref` string.
-
-    Raises:
-        KeyError: If the `$ref` path does not exist in the schema.
-    """
-    try:
-        if ref.startswith("#/definitions/"):
-            parts = ref.split("/")
-            definition = schema["definitions"]
-            for part in parts[2:]:
-                if part:
-                    definition = definition[part]
-            return definition
-
-        elif ref.startswith("$defs/"):
-            parts = ref.split("/")
-            definition = schema["$defs"]
-            for part in parts[1:]:
-                if part:
-                    definition = definition[part]
-            return definition
-
-    except KeyError as e:
-        raise KeyError(f"Reference {ref} could not be resolved in schema.") from e
-
-    # Unhandled reference format
-    return None
-
-
-def dereference_schema(schema_path, excluded_paths):
-    # Convert the excluded_paths to a JSON representation
-    excluded_paths_str = json.dumps(excluded_paths)
-    
-    # Log the paths for debugging
-    print(f"Running with schema_path: {schema_path} and excluded_paths: {excluded_paths_str}")
-
-    # Build the command to call the Node.js script with the file paths
-    command = ["node", "dereference_schema.js", schema_path, excluded_paths_str]
-
-    # Run the Node.js script and capture the output
-    result = subprocess.run(command, capture_output=True, text=True)
-
-    # Handle the output and extract the sizes
-    if result.returncode == 0:
-        sizes = result.stdout.strip()
-        print(sizes)
-        return sizes
-
-    else:
-        print(f"Error executing Node.js script: {result.stderr}")
-        return None
-
-
-def get_dereferenced_schema_size():
-    """
-    Calls the Node.js script to get the dereferenced schema size while excluding specified paths.
-
-        Returns:
-        float: The size of the dereferenced schema in kilobytes.
-    """
-    try:
-        with open("evaluation_results_baseline_model.json", 'r') as json_file:
-            json_data = json.load(json_file)
-
-    except json.JSONDecodeError as e:
-        print(f"Error loading JSON file: {e}")
-        return
-    
-    for entry in json_data[:-1]:  # Ensure the loop handles all the entries except the last one
-        schema_name = entry["schema"]
-        matched_paths = entry["matched_definitions"]
-        schema_path = os.path.join(SCHEMA_FOLDER, schema_name)
-
-        # Calling the dereference_schema function with matched_paths (partial definition)
-        result = dereference_schema(schema_path, matched_paths)
-        
 
