@@ -34,9 +34,6 @@ from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-
-
-
 warnings.filterwarnings("ignore")
 
 # Create constant variables
@@ -1445,7 +1442,7 @@ def delete_file_if_exists(filename):
 def main():
     try:
         # Parse command-line arguments
-        train_size, random_value, m = sys.argv[-3:]
+        train_size, random_value, model = sys.argv[-3:]
         train_ratio = float(train_size)
         random_value = int(random_value)
 
@@ -1453,7 +1450,7 @@ def main():
         # Split the data into training and testing sets
         train_set, test_set = split_data(train_ratio, random_value)
 
-        if m == "baseline":
+        if model == "baseline":
             # Files to be checked for deletion
             files_to_delete = [
                 "baseline_test_data.csv",
