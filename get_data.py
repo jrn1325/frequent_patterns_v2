@@ -2,7 +2,7 @@ import json
 import os
 import shutil
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 # --- Configuration ---
@@ -106,6 +106,34 @@ def save_dataset(docs, output_path):
     except Exception as e:
         print(f"Error saving JSON lines to {output_path}: {e}", flush=True)
 
+def process_documents(dataset_name, dataset_path):
+    """
+    Process JSON documents in a dataset and save them.
+    
+    Args:
+        dataset_name (str): Name of the dataset file.
+        dataset_path (str): Path to the dataset file.
+    """
+    output_path = os.path.join(PROCESSED_JSONS_FOLDER, dataset_name)
+
+    try:
+        with open(dataset_path, 'r', encoding='utf-8') as infile, \
+             open(output_path, 'w', encoding='utf-8') as outfile:
+            for line in infile:
+                try:
+                    doc = json.loads(line)
+
+                    # Only write if JSON is an object or array
+                    if isinstance(doc, (dict, list)):
+                        outfile.write(json.dumps(doc) + '\n')
+                    else:
+                        print(f"Skipping non-object/array JSON in {dataset_name}: {doc}", flush=True)
+
+                except json.JSONDecodeError:
+                    print(f"Invalid JSON line in {dataset_name}, skipping.", flush=True)
+                    
+    except Exception as e:
+        print(f"Error processing documents for {dataset_name}: {e}", flush=True)
 
 # --- Core Processing ---
 def process_single_dataset(dataset_name):
@@ -148,12 +176,8 @@ def process_single_dataset(dataset_name):
     # Save schema
     save_schema(schema, PROCESSED_SCHEMAS_FOLDER / dataset_name)
 
-    # Save JSON documents if they exist and are valid
-    json_docs = load_json(dataset_path)
-    if isinstance(json_docs, list) and json_docs:
-        save_dataset(json_docs, PROCESSED_JSONS_FOLDER / dataset_name)
-    else:
-        print(f"No JSON documents found in {dataset_name}.", flush=True)
+    # Process JSON dataset
+    process_documents(dataset_name, dataset_path)
 
     return flags
 
@@ -167,7 +191,7 @@ def process_all_datasets():
     datasets = [f for f in SCHEMA_FOLDER.iterdir() if f.is_file()]
     total = len(datasets)
 
-    with ProcessPoolExecutor() as executor:
+    with ThreadPoolExecutor() as executor:
         futures = {executor.submit(process_single_dataset, dataset.name): dataset.name for dataset in datasets}
 
         for future in tqdm(as_completed(futures), total=total, desc="Processing Datasets"):
