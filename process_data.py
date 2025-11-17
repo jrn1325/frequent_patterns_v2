@@ -1,38 +1,24 @@
-import ast
+import argparse
 import concurrent.futures
-import hashlib
-import itertools
 import json
-import jsonschema
-import multiprocessing
+import math
+import numpy as np
 import os
 import pandas as pd
-import random
 import re
 import sys
 import time
 import torch
 import torch.multiprocessing as mp
-import torch.nn as nn
-import torch.nn.functional as F
 import warnings
 
-
-from adapters import AutoAdapterModel
 from collections import defaultdict, Counter
 from collections.abc import Mapping
-from copy import copy, deepcopy
-from functools import reduce
-from heapq import nlargest, nsmallest
-from itertools import combinations
-from jsonschema import validate
-from scipy.spatial.distance import cosine
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import GroupShuffleSplit
-from torch.nn.functional import normalize
-from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoModel, AutoTokenizer
+
 
 warnings.filterwarnings("ignore")
 
@@ -46,11 +32,17 @@ JSON_FOLDER = "processed_jsons"
 MAX_TOK_LEN = 512
 BATCH_SIZE = 64
 MODEL_NAME = "microsoft/codebert-base" 
+ARRAY_WILDCARD = "<ARRAY_ITEM>"
 
+# Load CodeBERT
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModel.from_pretrained(MODEL_NAME)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device) 
 
-
-
-
+# -------------------------------
+# Data Splitting 
+# -------------------------------
 def split_data(train_ratio, random_value):
     """
     Split the list of schemas into training and testing sets making sure that schemas from the same source are grouped together.
@@ -78,7 +70,59 @@ def split_data(train_ratio, random_value):
 
     return train_set, test_set
 
+def get_json_format(value):
+    """
+    Determine the JSON data type based on the input value's type.
 
+    Args:
+        value: The value to check.
+
+    Returns:
+        str: The corresponding JSON data type.
+    """
+    # Mapping from Python types to JSON types
+    python_to_json_type = {
+        str: "string",
+        int: "integer",
+        float: "number",
+        bool: "boolean",
+        list: "array",
+        dict: "object",
+        type(None): "null"
+    }
+
+    # Return mapped JSON type or "object" for unknown types
+    return python_to_json_type.get(type(value), "object")
+
+def match_properties(schema, document):
+    """
+    Check if there is an intersection between the top-level properties in the schema and the document.
+    If the schema has no 'properties', assume it matches any document.
+
+    Args:
+        schema (dict): JSON Schema object.
+        document (dict): JSON object.
+
+    Returns:
+        bool: True if there is an intersection or the schema has no properties, False otherwise.
+    """
+    # Extract top-level schema properties
+    schema_properties = set(schema.get("properties", {}).keys())
+
+    # If schema has no properties, treat it as open/unknown
+    if not schema_properties:
+        return True
+
+    # Extract top-level document properties
+    document_properties = set(document.keys())
+
+    # Check if there is an intersection
+    return bool(schema_properties & document_properties)
+
+
+# -------------------------------
+# Schema Parsing
+# -------------------------------
 def load_schema(schema_path):
     """
     Load a JSON schema from a file.
@@ -96,7 +140,6 @@ def load_schema(schema_path):
             print(f"Error loading schema {schema_path}: {e}", flush=True)
             return None
         
-
 def find_ref_paths(schema, current_path=("$",), is_data_level=False):
     """
     Recursively find paths where the key is $ref in a JSON schema.
@@ -136,7 +179,7 @@ def find_ref_paths(schema, current_path=("$",), is_data_level=False):
         elif key in {"items", "prefixItems"} and isinstance(value, (list, Mapping)):
             # 'items' is structural unless inside a user-defined property
             new_data_level = is_data_level or key == "items"
-            updated_path = current_path + ('*',)
+            updated_path = current_path + (ARRAY_WILDCARD,)
             if isinstance(value, list):
                 for item in value:
                     yield from find_ref_paths(item, updated_path, new_data_level)
@@ -163,7 +206,6 @@ def find_ref_paths(schema, current_path=("$",), is_data_level=False):
             if is_data_level or key not in JSON_SCHEMA_KEYWORDS:
                 yield from find_ref_paths(value, current_path + (key,), is_data_level)
 
-
 def clean_ref_defn_paths(schema):
     """
     Remove JSON Schema-specific keywords from reference paths while detecting circular references.
@@ -180,17 +222,10 @@ def clean_ref_defn_paths(schema):
         ref_parts = ref.split('/')
         if len(ref_parts) != 3:
             continue
-        '''
-        # Detect and skip circular references
-        defn = ref_parts[-2] + '.' + ref_parts[-1]
-        path_str = '.'.join(path)
-        if defn in path_str:
-            continue
-        '''
+    
         ref_defn_paths[ref].add(path)
 
     return ref_defn_paths
-
 
 def resolve_paths(ref_defn, ref_defn_paths, max_depth=10, current_depth=0):
     """
@@ -228,7 +263,6 @@ def resolve_paths(ref_defn, ref_defn_paths, max_depth=10, current_depth=0):
 
     return resolved_paths
 
-
 def handle_nested_definitions(ref_defn_paths):
     """
     Resolve all nested definitions iteratively.
@@ -245,7 +279,6 @@ def handle_nested_definitions(ref_defn_paths):
         new_ref_defn_paths[ref_defn] = resolve_paths(ref_defn, ref_defn_paths)
 
     return new_ref_defn_paths
-
 
 def remove_definition_keywords(good_ref_defn_paths):
     """
@@ -266,7 +299,6 @@ def remove_definition_keywords(good_ref_defn_paths):
 
     return updated_paths
 
-
 def resolve_ref(defn_root, ref_path):
     """
     Resolve $ref within the schema.
@@ -283,7 +315,6 @@ def resolve_ref(defn_root, ref_path):
     if resolved and "$ref" in resolved:
         return resolve_ref(defn_root, resolved["$ref"])
     return resolved
-
 
 def is_object_like(defn_obj, defn_root):
     """
@@ -327,7 +358,6 @@ def is_object_like(defn_obj, defn_root):
 
     return False
 
-
 def get_ref_defn_of_type_obj(json_schema, ref_defn_paths):
     """
     Filter out references to definitions that do not represent object-like schemas (e.g., no 'properties').
@@ -363,210 +393,143 @@ def get_ref_defn_of_type_obj(json_schema, ref_defn_paths):
     return paths_to_exclude
 
 
-
-
-
-def get_json_format(value):
+# -------------------------------
+# Document Parsing
+# -------------------------------
+def extract_paths(doc, path=("$",)):
     """
-    Determine the JSON data type based on the input value's type.
+    Get the path of each key and its value from the JSON document.
 
     Args:
-        value: The value to check.
-
-    Returns:
-        str: The corresponding JSON data type.
-    """
-    # Mapping from Python types to JSON types
-    python_to_json_type = {
-        str: "string",
-        int: "integer",
-        float: "number",
-        bool: "boolean",
-        list: "array",
-        dict: "object",
-        type(None): "null"
-    }
-
-    # Return mapped JSON type or "object" for unknown types
-    return python_to_json_type.get(type(value), "object")
-
-
-def match_properties(schema, document):
-    """
-    Check if there is an intersection between the top-level properties in the schema and the document.
-    If the schema has no 'properties', assume it matches any document.
-
-    Args:
-        schema (dict): JSON Schema object.
-        document (dict): JSON object.
-
-    Returns:
-        bool: True if there is an intersection or the schema has no properties, False otherwise.
-    """
-    # Extract top-level schema properties
-    schema_properties = set(schema.get("properties", {}).keys())
-
-    # If schema has no properties, treat it as open/unknown
-    if not schema_properties:
-        return True
-
-    # Extract top-level document properties
-    document_properties = set(document.keys())
-
-    # Check if there is an intersection
-    return bool(schema_properties & document_properties)
-
-
-def parse_document(doc, path = ("$",), values = []):
-    """Get the path of each key and its value from the json documents.
-
-    Args:
-        doc (dict): JSON document.
-        path (tuple, optional): list of keys full path. Defaults to ('$',).
-        values (list, optional): list of keys' values. Defaults to [].
-
-    Raises:
-        ValueError: Returns an error if the json object is not a dict or list
+        doc (dict or list): JSON document to traverse.
+        path (tuple, optional): The current path of keys. Defaults to ("$",).
 
     Yields:
-        dict: list of JSON object key value pairs
+        tuple: A tuple containing the path and the corresponding value.
+
+    Raises:
+        ValueError: If the input document is not a dict or list.
     """
     if isinstance(doc, dict):
-        iterator = doc.items()
+        for key, value in doc.items():
+            current_path = path + (key,)
+            yield current_path, value
+            if isinstance(value, (dict, list)):
+                yield from extract_paths(value, current_path)
+
     elif isinstance(doc, list):
-        iterator = [('*', item) for item in doc] if doc else []
+        for index, item in enumerate(doc):
+            current_path = path + (ARRAY_WILDCARD,)
+            yield current_path, item
+            if isinstance(item, (dict, list)):
+                yield from extract_paths(item, current_path)
+
     else:
-        raise ValueError("Expected dict or list, got {}".format(type(doc).__name__))
-  
-    for key, value in iterator:
-        yield path + (key,), value
-        if isinstance(value, (dict, list)):
-            yield from parse_document(value, path + (key,), values)
+        raise ValueError(f"Expected dict or list, got {type(doc).__name__}")
 
-
-def process_document(doc, paths_dict, path_freqs):
+def process_document(doc, path_values, path_freqs):
     """
-    Extracts object-like paths from the given JSON document and stores them in dictionaries,
-    grouping values by paths and tracking path frequency.
+    Extracts paths from the given JSON document and stores them in dictionaries,
+    grouping paths that share the same prefix and capturing the frequency and data type of nested keys.
 
     Args:
-        doc (dict): The JSON document from which paths are extracted.
-        paths_dict (dict): Dictionary mapping each path to a list of values (as JSON strings).
-        path_freqs (Counter): Dictionary tracking how often each path appears.
+        doc: JSON document
+        path_values: dict mapping path tuples to type information
+        path_freqs: Counter for path frequencies
+    """ 
+    for path, value in extract_paths(doc):
+        if len(path) > 1:
+            nested_key = path[-1]
+            if nested_key == ARRAY_WILDCARD:
+                continue
+
+            prefix = path[:-1]
+            value_type = get_json_format(value)
+
+            if prefix not in path_values:
+                path_values[prefix] = {}
+
+            if nested_key not in path_values[prefix]:
+                path_values[prefix][nested_key] = {"frequency": 0, "type": set()}
+            # Update frequency and type for the nested key
+            path_values[prefix][nested_key]["frequency"] += 1
+            path_values[prefix][nested_key]["type"].add(value_type)
+
+            # Update parent frequency (number of times this object appears)
+            path_freqs[prefix] = path_freqs.get(prefix, 0) + 1
+
+def process_dataset(dataset, paths_to_exclude):
     """
-    for path, value in parse_document(doc):
-        path_freqs[path] += 1
+    Process a JSON-lines dataset and extract object-like paths,
+    filtering documents that match the schema and collecting
+    frequencies + types of each path.
 
-        if path not in paths_dict:
-            paths_dict[path] = []
-
-        if isinstance(value, dict):
-            value_str = json.dumps(value, sort_keys=True)
-            paths_dict[path].append(value_str)
-
-        elif isinstance(value, list) and all(isinstance(item, dict) for item in value):
-            sorted_list = sorted(
-                [json.dumps(item, sort_keys=True) for item in value]
-            )
-            value_str = json.dumps(sorted_list, sort_keys=True)
-            paths_dict[path].append(value_str)
-
-
-def get_doc_hash(doc):
-    """Return a hash of the canonical JSON form of the document."""
-    try:
-        canonical = json.dumps(doc, sort_keys=True)
-        return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
-    except Exception:
-        return None
-
-
-def process_dataset(dataset):
-    """
-    Process and extract object-like paths from a JSON lines dataset, filtering documents
-    by matching schema properties and ignoring duplicate documents.
+    Args:
+        dataset (str): Dataset filename.
+        paths_to_exclude (set): Paths to exclude.
 
     Returns:
-        tuple: (paths_dict, num_docs)
+        tuple: (path_values, path_freqs, valid_docs)
     """
-    paths_dict = defaultdict(list)
+    path_values = defaultdict(lambda: defaultdict(lambda: {"frequency": 0, "type": set()}))
     path_freqs = Counter()
-    num_docs = 0
-    seen_hashes = set()
+    valid_docs = []
 
+  
+    # Load schema
     schema_path = os.path.join(SCHEMA_FOLDER, dataset)
     schema = load_schema(schema_path)
 
+    # Load dataset
     dataset_path = os.path.join(JSON_FOLDER, dataset)
-    with open(dataset_path, 'r') as file:
-        for line_number, line in enumerate(file, 1):
+
+    with open(dataset_path, "r", encoding="utf-8") as file:
+        for line in file:
             try:
                 doc = json.loads(line)
-            except json.JSONDecodeError as e:
-                print(f"[Line {line_number}] JSON decode error in {dataset}: {e}", flush=True)
-                continue
 
-            try:
-                matched = False
-                items = doc if isinstance(doc, list) else [doc]
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
+                # Case 1: simple dict
+                if isinstance(doc, dict) and match_properties(schema, doc):
+                    process_document(doc, path_values, path_freqs)
+                    valid_docs.append(doc)
 
-                    doc_hash = get_doc_hash(item)
-                    if doc_hash is None or doc_hash in seen_hashes:
-                        continue
-                    seen_hashes.add(doc_hash)
-
-                    if match_properties(schema, item):
-                        process_document(item, paths_dict, path_freqs)
-                        matched = True
-
-                if matched:
-                    num_docs += 1
+                # Case 2: dataset is JSONL of lists-of-dicts
+                elif isinstance(doc, list):
+                    for item in doc:
+                        if isinstance(item, dict) and match_properties(schema, item):
+                            process_document(item, path_values, path_freqs)
+                            valid_docs.append(item)
 
             except Exception as e:
-                print(f"[Line {line_number}] Error processing document in {dataset}: {e}", flush=True)
+                print(f"[{dataset}] Error parsing line: {e}")
+                continue
 
-    # Remove paths that occur only once
-    paths_dict = {
-        path: values for path, values in paths_dict.items()
-        if path_freqs[path] > 1
+    # No extracted object paths
+    if len(path_values) == 0:
+        print(f"No object-like paths extracted from {dataset}.")
+        return None, None, valid_docs
+
+    # Add all infrequent paths (freq <= 1) to paths_to_exclude
+    infrequent = {p for p, f in path_freqs.items() if f <= 1}
+    paths_to_exclude.update(infrequent)
+
+    # Keep only frequent paths that are not excluded
+    frequent_paths = {
+        p for p, f in path_freqs.items()
+        if f > 1 and p not in paths_to_exclude
     }
 
-    return paths_dict, num_docs
+    # Filter path_freqs and path_values safely
+    path_freqs = {p: f for p, f in path_freqs.items() if p in frequent_paths}
+    path_values = {p: v for p, v in path_values.items() if p in frequent_paths}
+
+    print(f"Processed {dataset}: {len(valid_docs)} valid documents, {len(path_values)} frequent paths retained.", flush=True)
+    return path_values, path_freqs, valid_docs
 
 
-def match_paths(schema_path, json_path):
-    """
-    Check if a schema path matches a JSON path, allowing for wildcard and regex components.
-
-    Args:
-        schema_path (tuple): A tuple from the schema, may include "additional_key" or "pattern_key<regex>".
-        json_path (tuple): A tuple representing a concrete path in a JSON document.
-
-    Returns:
-        bool: True if the schema path matches the JSON path, False otherwise.
-    """
-    if len(schema_path) != len(json_path):
-        return False
-
-    for schema_part, json_part in zip(schema_path, json_path):
-        if schema_part == "additional_key":
-            continue  # wildcard: match any key
-        elif schema_part.startswith("pattern_key"):
-            pattern = schema_part[len("pattern_key"):]
-            try:
-                if not re.fullmatch(pattern, json_part):
-                    return False
-            except re.error as e:
-                raise ValueError(f"Invalid regex pattern in schema_path: '{pattern}' -> {e}")
-        elif schema_part != json_part:
-            return False
-
-    return True
-
-
+# -------------------------------
+# Schema Reference Resolution
+# -------------------------------
 def resolve_internal_refs(schema_def, full_schema, current_depth=0, max_depth=10):
     """
     Recursively resolve internal $ref references within the same schema, with recursion depth limitation
@@ -612,73 +575,42 @@ def resolve_internal_refs(schema_def, full_schema, current_depth=0, max_depth=10
     
     return schema_def
     
-
-def validate_json_against_schema(json_data, schema_def, full_schema):
+def match_paths(schema_path, json_path):
     """
-    Validate JSON data against a partial schema definition while resolving internal references.
+    Check if a schema path matches a JSON path, allowing for wildcard and regex components.
 
     Args:
-        json_data (dict): The JSON data to validate.
-        schema_def (dict): The partial schema definition.
-        full_schema (dict): The full schema containing all definitions.
+        schema_path (tuple): A tuple from the schema, may include "additional_key" or "pattern_key<regex>".
+        json_path (tuple): A tuple representing a concrete path in a JSON document.
 
     Returns:
-        bool: True if JSON is valid, False otherwise.
+        bool: True if the schema path matches the JSON path, False otherwise.
     """
-    
-    # Convert JSON string to dict if needed
-    if isinstance(json_data, str):
-        try:
-            json_data = json.loads(json_data)
-        except json.JSONDecodeError:
+    if len(schema_path) != len(json_path):
+        return False
+
+    for schema_part, json_part in zip(schema_path, json_path):
+        if schema_part == "additional_key":
+            continue  # wildcard: match any key
+        elif schema_part.startswith("pattern_key"):
+            pattern = schema_part[len("pattern_key"):]
+            try:
+                if not re.fullmatch(pattern, json_part):
+                    return False
+            except re.error as e:
+                raise ValueError(f"Invalid regex pattern in schema_path: '{pattern}' -> {e}")
+        elif schema_part != json_part:
             return False
 
-    try:
-        # Resolve references within the provided schema
-        resolved_schema = resolve_internal_refs(schema_def, full_schema)
-        # Validate using jsonschema
-        validate(instance=json_data, schema=resolved_schema)
-        return True  # Valid JSON
+    return True
 
-    except jsonschema.exceptions.ValidationError as e:
-        return False
-    except jsonschema.exceptions.SchemaError as e:
-        return False
-    except ValueError as e:
-        return False
-    except RecursionError as e:
-        return False
-
-'''
-def check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, paths_dict, schema):
+def check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, paths_values):
     """
     Check if the paths from JSON Schemas exist in JSON datasets, ensuring they conform to the schema definition.
 
     Args:
         cleaned_ref_defn_paths (dict): Dictionary of referenced definitions and their paths.
-        paths_dict (dict): Dictionary of paths and their corresponding values.
-        schema (dict): JSON schema object.
-
-    Returns:
-        dict: Dictionary of definitions with paths that exist and conform in the JSON documents.
-    """
-    filtered_ref_defn_paths = defaultdict(set)
-
-    for ref_defn, schema_paths in tqdm(cleaned_ref_defn_paths.items(), desc="Referenced definitions", total=len(cleaned_ref_defn_paths)):
-        # Check matching schema and json paths
-        for schema_path in schema_paths:
-            if schema_path in paths_dict:
-                filtered_ref_defn_paths[ref_defn].add(schema_path)
-
-    return filtered_ref_defn_paths
-'''
-def check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, paths_dict):
-    """
-    Check if the paths from JSON Schemas exist in JSON datasets, ensuring they conform to the schema definition.
-
-    Args:
-        cleaned_ref_defn_paths (dict): Dictionary of referenced definitions and their paths.
-        paths_dict (dict): Dictionary of paths and their corresponding values.
+        paths_values (dict): Dictionary of paths and their corresponding values.
 
     Returns:
         dict: Dictionary of definitions with paths that exist and conform in the JSON documents.
@@ -688,11 +620,10 @@ def check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, paths_dict):
     for ref_defn, schema_paths in tqdm(cleaned_ref_defn_paths.items(), desc="Number of referenced definitions", position=0, leave=False, total=len(cleaned_ref_defn_paths)):
 
         for schema_path in tqdm(schema_paths, desc="Number of paths for a ref_defn", position=1, leave=False, total=len(schema_paths)):
-            for json_path in tqdm(paths_dict.keys(), desc="Number of paths in JSON files", position=2, leave=False, total=len(paths_dict)):
+            for json_path in tqdm(paths_values.keys(), desc="Number of paths in JSON files", position=2, leave=False, total=len(paths_values)):
                 if match_paths(schema_path, json_path):
                     filtered_ref_defn_paths[ref_defn].add(json_path)
     return filtered_ref_defn_paths
-
 
 def find_frequent_definitions(filtered_ref_defn_paths, paths_to_exclude):
     """
@@ -721,244 +652,125 @@ def find_frequent_definitions(filtered_ref_defn_paths, paths_to_exclude):
     return frequent_ref_defn_paths
 
 
-
-
-
-def unique_oneOf(schemas):
+# -------------------------------
+# DataFrame Creation and Semantic Similarity
+# -------------------------------
+def get_embeddings(nested_keys):
     """
-    Ensures uniqueness in `oneOf` lists by removing duplicates.
-    
-    Args:
-        schemas (list): List of JSON schemas to deduplicate.
-
-    Returns:
-        list: A list of unique schemas.
-    """
-    serialized = {json.dumps(s, sort_keys=True): s for s in schemas}
-    return list(serialized.values())
-
-
-def flatten_oneOf(schema):
-    if "oneOf" in schema:
-        result = []
-        for s in schema["oneOf"]:
-            if isinstance(s, dict) and "oneOf" in s:
-                result.extend(flatten_oneOf(s)["oneOf"])
-            else:
-                result.append(s)
-        return {"oneOf": unique_oneOf(result)}
-    return schema
-
-
-def merge_schemas(schema1, schema2, depth=0, max_depth=10):
-    if depth > max_depth:
-        raise RecursionError(f"Exceeded max recursion depth of {max_depth}")
-    
-    if not isinstance(schema1, dict) or not isinstance(schema2, dict):
-        raise TypeError("Both schema1 and schema2 must be dictionaries.")
-    
-    schema1 = flatten_oneOf(schema1)
-    schema2 = flatten_oneOf(schema2)
-    
-    type1 = schema1.get("type")
-    type2 = schema2.get("type")
-
-    if type1 == type2:
-        new_schema = deepcopy(schema1)
-
-        if type1 == "object":
-            new_schema["required"] = sorted(set(schema1.get("required", [])) | set(schema2.get("required", [])))
-            for k, v in schema2.get("properties", {}).items():
-                if k in new_schema["properties"]:
-                    new_schema["properties"][k] = merge_schemas(new_schema["properties"][k], v, depth + 1)
-                else:
-                    new_schema["properties"][k] = v
-
-            return new_schema
-
-        elif type1 == "array" and "items" in schema1 and "items" in schema2:
-            new_schema["items"] = merge_schemas(schema1["items"], schema2["items"], depth + 1)
-            return new_schema
-
-        return new_schema
-
-    # Flatten and merge into oneOf
-    return flatten_oneOf({"oneOf": [schema1, schema2]})
-
-
-def discover_schema(value, max_depth=2, current_depth=0):
-    """
-    Determine the structure (type) of the JSON key's value, considering only top-level properties of objects
-    and top-level items of arrays.
+    Get the embeddings for the given nested keys using a pre-trained model.
 
     Args:
-        value: The value of the JSON key. It can be of any type.
-        max_depth (int): The maximum depth to recurse into nested objects or arrays. Defaults to 1 (top-level only).
-        current_depth (int): The current recursion depth (default 0).
+        nested_keys (list): A list of nested keys to get embeddings for.
 
     Returns:
-        dict: An object representing the structure of the JSON key's value.
+        np.ndarray: An array of embeddings for the nested keys.
     """
-    if isinstance(value, str):
-        return {"type": "string"}
-    elif isinstance(value, float):
-        return {"type": "number"}
-    elif isinstance(value, int):
-        return {"type": "integer"}
-    elif isinstance(value, bool):
-        return {"type": "boolean"}
-    elif isinstance(value, list):
-        # Handle lists, assuming mixed types if any items exist
-        item_schemas = [discover_schema(item, max_depth, current_depth + 1) for item in value]
-        if item_schemas:
-            merged_items = reduce(merge_schemas, item_schemas)
-        else:
-            merged_items = {}
-        return {"type": "array", "items": merged_items}
+    inputs = tokenizer(nested_keys, padding=True, truncation=True, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    return outputs.last_hidden_state.mean(dim=1).cpu().numpy()
+
+def calc_semantic_similarity(nested_keys):
+    """
+    Calculate the average semantic similarity of nested keys based on their embeddings
+
+    Args:
+        nested_keys (dict): A dictionary where keys are nested keys and values are their types.
+    Returns:
+        float: The average cosine similarity between the embeddings of the nested keys.
         
-    elif isinstance(value, dict):
-        schema = {"type": "object", "required": list(set(value.keys())), "properties": {}}
-        
-        if current_depth < max_depth:
-            # Recursively process properties for deeper levels
-            for k, v in value.items():
-                schema["properties"][k] = discover_schema(v, max_depth, current_depth + 1)
-                
-        return schema
-    elif value is None:
-        return {"type": "null"}
-    else:
-        raise TypeError(f"Unsupported value type: {type(value)}")
-
-
-def discover_schema_from_values(values):
-    if not values:
-        return {"type": "null"}
-    schemas = [discover_schema(v) for v in values]
-    return reduce(merge_schemas, schemas)
-
-
-def calculate_nested_keys_frequency(values, num_docs):
     """
-    Calculate frequency of each top-level key relative to total number of documents.
+    n_keys = len(nested_keys)
+    if n_keys < 2:
+        return 0.5
 
-    Args:
-        values (list): List of dicts or list-of-dicts at the path.
-        num_docs (int): Total number of documents in the dataset.
+    keys = list(nested_keys.keys())
+    embeddings = get_embeddings(keys)
+    similarity_matrix = cosine_similarity(embeddings)
 
-    Returns:
-        dict: {key: relative_frequency} where frequency is fraction of total documents
-              where path and key co-occur.
-    """
-    from collections import Counter
+    # Exclude diagonal (self-similarity)
+    avg_similarity = float((np.sum(similarity_matrix) - n_keys) / (n_keys * (n_keys - 1)))
 
-    key_presence_counter = Counter()
+    return round(avg_similarity, 3)
 
-    for val in values:
-        dicts_to_check = val if isinstance(val, list) else [val]
-        keys_in_doc = set()
-        for d in dicts_to_check:
-            if not isinstance(d, dict):
-                continue
-            keys_in_doc.update(d.keys())
-        for key in keys_in_doc:
-            key_presence_counter[key] += 1
-
-    if num_docs == 0:
-        return {}
-
-    return {k: v / num_docs for k, v in key_presence_counter.items()}
-
-
-def create_dataframe(paths_dict, paths_to_exclude, num_docs):
+def create_dataframe(path_values, path_freqs, schema_name, path_to_exclude):
     """
     Create a DataFrame of paths and their merged schemas.
 
     Args:
-        paths_dict (dict): Dictionary of paths and their serialized JSON values.
-        paths_to_exclude (set): Paths to exclude.
-        num_docs (int): Total number of documents processed (for path frequency computation).
+        path_values (dict): Dictionary of paths and their serialized JSON values.
+        path_freqs (dict): Dictionary of paths and their frequencies.
+        schema_name (str): Dataset filename.
+        path_to_exclude (set): Paths to exclude.
 
     Returns:
         pd.DataFrame: DataFrame with tokenized schemas and metadata.
     """
-    df_data = []
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    data = []
 
-    for path, values in tqdm(paths_dict.items(), desc="Creating dataframe", total=len(paths_dict), leave=False):
-        if path in paths_to_exclude:
+    for path, nested_keys in path_values.items():
+        if path in path_to_exclude:
             continue
 
-        # Full list: needed for frequency analysis
-        parsed_values = [json.loads(v) for v in values]
+        schema_info = {"properties": {}}
+        values_types = set()
+        frequencies = []
 
-        # Deduplicated: needed for efficient schema inference
-        unique_value_strs = list(set(values))
-        unique_parsed_values = [json.loads(v) for v in unique_value_strs]
+        parent_frequency = path_freqs.get(path, 0)
+        observed_keys = set(nested_keys.keys())
+        required_keys = []
 
-        try:
-            schema = discover_schema_from_values(unique_parsed_values)
-        except Exception as e:
-            print(f"Error discovering schema for path {path}: {e}", flush=True)
-            paths_to_exclude.add(path)
-            continue
+        for nested_key, nested_key_info in nested_keys.items():
+            frequency = nested_key_info["frequency"] / parent_frequency if parent_frequency else 0
+            value_type = nested_key_info["type"]
 
-        if len(schema.get("properties", {})) >= 1:
-            nested_freqs = calculate_nested_keys_frequency(parsed_values, num_docs)
-            #print(f"Processing path: {path}", flush=True)
-            #print(f"Nested key freqs: {nested_freqs}", flush=True)
+            # Convert set to list if necessary
+            if isinstance(value_type, set):
+                value_type = list(value_type)
 
-            tokenized_schema = tokenize_schema(json.dumps(schema), tokenizer)
+            values_types.add(json.dumps(value_type))  # for datatype_entropy calculation
+            frequencies.append(frequency)
 
-            df_data.append([
-                path,
-                len(path),
-                nested_freqs,
-                tokenized_schema,
-                json.dumps(schema)
-            ])
+            schema_info["properties"][nested_key] = {
+                "frequency": round(frequency, 2),
+                "type": value_type  # now always JSON-serializable
+            }
+
+            # Required if appears in every parent occurrence
+            if nested_key_info["frequency"] == parent_frequency:
+                required_keys.append(nested_key)
+
+        # Compute additionalProperties
+        additional_properties = len(observed_keys - set(required_keys)) > 0
+
+        schema_info["required"] = required_keys
+        schema_info["additionalProperties"] = additional_properties
+
+        # Derived info
+        schema_info["nesting_depth"] = len(path) - 1
+        schema_info["datatype_entropy"] = 0 if len(values_types) == 1 else 1
+        schema_info["num_nested_keys"] = len(nested_keys)
+        schema_info["semantic_similarity"] = calc_semantic_similarity(nested_keys)
+
+        # Key entropy
+        if frequencies:
+            total_freq = sum(frequencies)
+            probs = [f / total_freq for f in frequencies if f > 0]
+            key_entropy = -sum(p * math.log(p) for p in probs)
         else:
-            paths_to_exclude.add(path)
+            key_entropy = 0
 
-    columns = ["path", "nesting_depth", "nested_keys", "tokenized_schema", "schema"]
-    return pd.DataFrame(df_data, columns=columns)
+        data.append({
+            "path": path,
+            "schema": schema_info,
+            "datatype_entropy": schema_info["datatype_entropy"],
+            "key_entropy": round(key_entropy, 2),
+            "parent_frequency": parent_frequency,
+            "filename": schema_name
+        })
 
-
-
-
-def create_dataframe_baseline_model(paths_dict, paths_to_exclude, num_docs):
-    """
-    Create a DataFrame of paths and distinct nested keys.
-
-    Args:
-        paths_dict (dict): Dictionary of paths and their nested keys.
-        paths_to_exclude (set): Paths to exclude from JSON files.
-
-    Returns:
-        pd.DataFrame: DataFrame containing paths and distinct nested keys.
-    """
-    df_data = []
-
-    for path, values in tqdm(paths_dict.items(), desc="Processing paths", total=len(paths_dict), leave=False):
-        # Skip paths that are in the exclusion set
-        if path in paths_to_exclude:
-            continue
-
-        # Parse and discover the schema from values
-        parsed_values = [json.loads(v) for v in values]
-       
-        nested_keys = calculate_nested_keys_frequency(parsed_values, num_docs)
-        if len(nested_keys) == 0:
-            paths_to_exclude.add(path)
-            continue
-        df_data.append([path, nested_keys])
-
-    # Create DataFrame from collected data
-    columns = ["path", "distinct_nested_keys"]
-    df = pd.DataFrame(df_data, columns=columns)
-    
-    return df.sort_values(by="path")
-
+    df = pd.DataFrame(data)
+    return df
 
 def update_ref_defn_paths(frequent_ref_defn_paths, df):
     """
@@ -977,20 +789,11 @@ def update_ref_defn_paths(frequent_ref_defn_paths, df):
         if len(set(paths) & set(df["path"])) > 1
     }
 
-
-def process_schema(schema_name, filename):
+def process_schema(schema_name, schema_folder):
     """
-    Process a single schema and return the relevant dataframes and ground truths.
-
-    Args:
-        schema_name (str): The name of the schema file.
-        filename (str): The name of the file to save the test data.
-
-    Returns:
-        tuple: A tuple containing the filtered DataFrame, frequent referenced definition paths, and schema name,
-               or (None, None, None) if processing failed.
+    Process a single schema safely in a spawned worker.
+    Returns DataFrame as records, updated reference definitions, failure flags, and valid docs.
     """
-    # Dictionary to track failures
     failure_flags = {
         "load": 0,
         "ref_defn": 0,
@@ -1002,347 +805,68 @@ def process_schema(schema_name, filename):
         "properties": 0
     }
 
-    schema_path = os.path.join(SCHEMA_FOLDER, schema_name)
+    try:
+        schema_path = os.path.join(schema_folder, schema_name)
 
-    # Load schema
-    schema = load_schema(schema_path)
-    if schema is None:
-        failure_flags["load"] = 1
-        #print(f"Failed to load schema {schema_name}.", flush=True)
-        return None, None, schema_name, failure_flags
+        schema = load_schema(schema_path)
+        if schema is None:
+            failure_flags["load"] = 1
+            return None, None, failure_flags, []
 
-    # Get and clean referenced definitions
-    ref_defn_paths = clean_ref_defn_paths(schema)
+        ref_defn_paths = clean_ref_defn_paths(schema)
+        if not ref_defn_paths:
+            failure_flags["ref_defn"] = 1
+            return None, None, failure_flags, []
 
-    if not ref_defn_paths:
-        failure_flags["ref_defn"] = 1
-        #print(f"No referenced definitions in {schema_name}.", flush=True)
-        return None, None, schema_name, failure_flags
-    
-    # Handle nested definitions
-    new_ref_defn_paths = handle_nested_definitions(ref_defn_paths)
-    cleaned_ref_defn_paths = remove_definition_keywords(new_ref_defn_paths)
-   
-    # Get referenced definitions of type object
-    paths_to_exclude = get_ref_defn_of_type_obj(schema, cleaned_ref_defn_paths)
-    if not cleaned_ref_defn_paths:
-        failure_flags["object_defn"] = 1
-        #print(f"No referenced definitions of type object in {schema_name}.", flush=True)
-        return None, None, schema_name, failure_flags
-    
-    paths_dict, num_docs = process_dataset(schema_name)
-    if len(paths_dict) == 0:
-        failure_flags["path"] = 1
-        #print(f"No paths extracted from {schema_name}.", flush=True)
-        return None, None, schema_name, failure_flags
+        cleaned_ref_defn_paths = remove_definition_keywords(handle_nested_definitions(ref_defn_paths))
+        path_to_exclude = get_ref_defn_of_type_obj(schema, cleaned_ref_defn_paths)
+        if not cleaned_ref_defn_paths:
+            failure_flags["object_defn"] = 1
+            return None, None, failure_flags, []
 
-    # Check reference definition paths in the dataset
-    filtered_ref_defn_paths = check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, paths_dict)
-    if not filtered_ref_defn_paths:
-        failure_flags["schema_intersection"] = 1
-        #print(f"No paths of properties in referenced definitions found in {schema_name} dataset.", flush=True)
-        return None, None, schema_name, failure_flags
-    '''
-    for ref, paths in filtered_ref_defn_paths.items():
-        print(f" Object Reference: {ref} Paths: {paths}", flush=True)
-    print("_________________________________________________________________________________________________________________________")
-    '''
-    
-    # Find frequent definitions
-    frequent_ref_defn_paths = find_frequent_definitions(filtered_ref_defn_paths, paths_to_exclude)
-    if not frequent_ref_defn_paths:
-        failure_flags["freq_defn"] = 1
-        #print(f"No frequent referenced definitions found in {schema_name}.", flush=True)
-        return None, None, schema_name, failure_flags
-    '''
-    for ref, paths in frequent_ref_defn_paths.items():
-        print(f"Frequent Reference: {ref} Paths: {paths}")
-    print("_________________________________________________________________________________________________________________________")
-    '''
-    # Create DataFrame
-    if filename == "baseline_test_data.csv":
-        df = create_dataframe_baseline_model(paths_dict, paths_to_exclude, num_docs)
-    else:
-        df = create_dataframe(paths_dict, paths_to_exclude, num_docs)
-        print(f"Number of paths in {schema_name}: {len(df)}", flush=True)
+        path_values, path_freqs, valid_docs = process_dataset(schema_name, path_to_exclude)
+        if len(path_values) == 0:
+            failure_flags["path"] = 1
+            return None, None, failure_flags, valid_docs
 
-    # Update reference definitions
-    updated_ref_defn_paths = update_ref_defn_paths(frequent_ref_defn_paths, df)
-    if not updated_ref_defn_paths:
-        failure_flags["properties"] = 1
-        print(f"Not enough properties found under refererenced definitions in {schema_name}.", flush=True)
-        return None, None, schema_name, failure_flags
+        filtered_ref_defn_paths = check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, path_values)
+        if not filtered_ref_defn_paths:
+            failure_flags["schema_intersection"] = 1
+            return None, None, failure_flags, valid_docs
 
-    df["filename"] = schema_name
-    df.reset_index(drop=True, inplace=True)
-    
-    return df, updated_ref_defn_paths, schema_name, failure_flags
+        frequent_ref_defn_paths = find_frequent_definitions(filtered_ref_defn_paths, path_to_exclude)
+        if not frequent_ref_defn_paths:
+            failure_flags["freq_defn"] = 1
+            return None, None, failure_flags, valid_docs
 
+        df = create_dataframe(path_values, path_freqs, schema_name, path_to_exclude)
+        updated_ref_defn_paths = update_ref_defn_paths(frequent_ref_defn_paths, df)
+        if not updated_ref_defn_paths:
+            failure_flags["properties"] = 1
+            return None, None, failure_flags, valid_docs
 
+        # Make everything pickle-safe
+        df_records = df.to_dict(orient="records")
+        updated_ref_defn_paths = {k: list(v) for k, v in updated_ref_defn_paths.items()}
 
+        return df_records, updated_ref_defn_paths, failure_flags, valid_docs
 
+    except Exception as e:
+        print(f"Worker crashed on {schema_name}: {e}", flush=True)
+        return None, None, failure_flags, []
 
-def load_model():
+def save_valid_docs(matched_jsons_dir, dataset_name, valid_docs):
     """
-    Function to load and return the model, tokenizer, and device.
+    Save valid documents to a JSONL file.
     """
-    MODEL_NAME = "microsoft/codebert-base"
-    model = AutoAdapterModel.from_pretrained(MODEL_NAME)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    return model, device
+    os.makedirs(matched_jsons_dir, exist_ok=True)
 
+    output_path = os.path.join(matched_jsons_dir, dataset_name)
 
-def tokenize_schema(schema_str, tokenizer, max_length=512):
-    """
-    Tokenize a schema string using the specified tokenizer.
-
-    Args:
-        schema_str (str): A string representation of the schema to tokenize.
-        tokenizer (PreTrainedTokenizer): The tokenizer to use (e.g., from HuggingFace).
-        max_length (int, optional): Maximum sequence length. Defaults to 512.
-
-    Returns:
-        dict: A dictionary of tokenized inputs (input_ids, attention_mask, etc.) as torch tensors.
-    """
-    if not isinstance(schema_str, str):
-        raise ValueError("Expected a string schema, got type: {}".format(type(schema_str).__name__))
-
-    return tokenizer(
-        schema_str,
-        return_tensors="pt",
-        max_length=max_length,
-        padding="max_length",
-        truncation=True,
-    )
-
-
-def calculate_embeddings(df, model, device):
-    """
-    Calculate the embeddings for each schema in batches.
-
-    Args:
-        df (pd.DataFrame): DataFrame containing paths and their tokenized schemas.
-        model (AutoAdapterModel): Pretrained model to compute embeddings.
-        device (torch.device): Device to move tensors to.
-
-    Returns:
-        dict: Dictionary mapping paths to their corresponding embeddings.
-    """
-
-    schema_embeddings = {}
-    paths = df["path"].tolist()
-    tokenized_schemas = df["tokenized_schema"].tolist()
-
-    # Create batches of tokenized schemas
-    for batch_start in tqdm(range(0, len(tokenized_schemas), BATCH_SIZE), desc="Calculating schema embeddings", position=0, leave=False):
-        batch_paths = paths[batch_start: batch_start + BATCH_SIZE]
-        batch_schemas = tokenized_schemas[batch_start: batch_start + BATCH_SIZE]
-
-        # Prepare batch tensors
-        batch_input_ids = [torch.tensor(schema["input_ids"]) for schema in batch_schemas]
-        batch_attention_mask = [torch.tensor(schema["attention_mask"]) for schema in batch_schemas]
-
-        # Pad sequences to get a uniform length
-        batch_input_ids = pad_sequence(batch_input_ids, batch_first=True)
-        batch_attention_mask = pad_sequence(batch_attention_mask, batch_first=True)
-
-        # Move tensors to the device
-        batch_input_ids = batch_input_ids.to(device)
-        batch_attention_mask = batch_attention_mask.to(device)
-
-        # Use model to compute embeddings
-        with torch.no_grad():
-            outputs = model(input_ids=batch_input_ids, attention_mask=batch_attention_mask)
-            batch_embeddings = outputs.last_hidden_state.mean(dim=1)
-
-        # Store embeddings
-        for path, embedding in zip(batch_paths, batch_embeddings):
-            schema_embeddings[path] = embedding.cpu()
-
-    return schema_embeddings
-
-
-def label_samples(df, good_pairs, bad_pairs):
-    """
-    Label the samples in the DataFrame based on good and bad pairs.
-
-    Args:
-        df (pd.DataFrame): DataFrame containing paths, schemas, and filenames.
-        good_pairs (set): Set of paths that should be grouped together.
-        bad_pairs (set): Set of paths that should not be grouped together.
-
-    Returns:
-        pd.DataFrame: DataFrame containing labeled pairs, schemas, and filenames.
-    """
-    # Create lists to store data
-    paths1 = []
-    paths2 = []
-    labels = []
-    nested_keys1 = []
-    nested_keys2 = []
-    schemas1 = [] 
-    schemas2 = []  
-    filenames = []  
-
-    # Process good pairs: label them as 1 (positive)
-    for path1, path2 in good_pairs:
-        paths1.append(path1)
-        paths2.append(path2)
-        labels.append(1)
-
-        # Extract schemas and filename for both paths
-        path1_row = df[df["path"] == path1].iloc[0]
-        path2_row = df[df["path"] == path2].iloc[0]
-        nested_keys1.append(path1_row["nested_keys"])
-        nested_keys2.append(path2_row["nested_keys"])
-        filenames.append(path1_row["filename"])
-        schemas1.append(path1_row["schema"])
-        schemas2.append(path2_row["schema"])
-        
-    # Process bad pairs: label them as 0 (negative)
-    for path1, path2 in bad_pairs:
-        paths1.append(path1)
-        paths2.append(path2)
-        labels.append(0)
-
-        # Extract schemas and filename for both paths
-        path1_row = df[df["path"] == path1].iloc[0]
-        path2_row = df[df["path"] == path2].iloc[0]
-        nested_keys1.append(path1_row["nested_keys"])
-        nested_keys2.append(path2_row["nested_keys"])
-        filenames.append(path1_row["filename"])
-        schemas1.append(path1_row["schema"])
-        schemas2.append(path2_row["schema"])
-
-    # Create a new DataFrame with separate columns for path1 and path2
-    labeled_df = pd.DataFrame({
-        "filename": filenames,
-        "label": labels,
-        "path1": paths1,
-        "path2": paths2,
-        "nested_keys1": nested_keys1,
-        "nested_keys2": nested_keys2,
-        "schema1": schemas1,
-        "schema2": schemas2
-    })
-
-    return labeled_df
-
-
-def sample_path_pairs(paths, rng=None, k=100000):
-    """
-    Efficiently sample k unique unordered pairs from paths, optionally using a seeded RNG.
-
-    Args:
-        paths (list): List of paths to sample from.
-        k (int): Number of pairs to sample.
-        rng (random.Random, optional): Custom random generator for reproducibility.
-
-    Returns:
-        list: List of unique unordered (sorted) path pairs.
-    """
-    rng = rng or random
-    n = len(paths)
-    if n < 2:
-        return []
-
-    max_possible = n * (n - 1) // 2
-    k = min(k, max_possible)
-
-    if k > max_possible * 0.6:
-        all_pairs = list(combinations(paths, 2))
-        return rng.sample(all_pairs, k)
-
-    seen = set()
-    pairs = []
-    attempts = 0
-    max_attempts = k * 10
-
-    while len(pairs) < k and attempts < max_attempts:
-        p1, p2 = rng.sample(paths, 2)
-        pair = tuple(sorted((p1, p2)))
-        if pair not in seen:
-            seen.add(pair)
-            pairs.append(pair)
-        attempts += 1
-
-    return pairs
-
-
-def get_samples(df, frequent_ref_defn_paths, best_good_pairs=False):
-    """
-    Generate labeled samples of good and bad pairs from the DataFrame based on ground truth definitions.
-
-    Args:
-        df (pd.DataFrame): DataFrame containing paths and schemas.
-        frequent_ref_defn_paths (dict): Dictionary of frequent referenced definition and their paths.
-        best_good_pairs (bool, optional): Whether to select the best good pairs. Defaults to False.
-
-    Returns:
-        pd.DataFrame: Labeled dataFrame containing sample paths and schemas.
-    """
-    all_good_pairs = set()
-    all_bad_pairs = set()
-    all_good_paths = set()
-    sample_good_pairs = set()
-    sample_bad_pairs = set()
-
-    model, device = load_model()
-    schema_embeddings = calculate_embeddings(df, model, device)
-    paths = list(df["path"])
-
-    for ref_defn, good_paths in tqdm(frequent_ref_defn_paths.items(), desc="Processing good pairs", position=0, leave=False):
-        all_good_paths.update(good_paths)
-        good_pairs = list(itertools.combinations(good_paths, 2))
-        path_to_keys = {path: set(df.loc[df["path"] == path, "nested_keys"].values[0]) for path in good_paths}
-
-        all_good_pairs.update(good_pairs)
-        good_pairs = [(p1, p2) for p1, p2 in good_pairs if len(path_to_keys[p1] & path_to_keys[p2]) >= 2]
-
-        if best_good_pairs:
-            good_pairs_distances = [
-                ((p1, p2), cosine(schema_embeddings[p1], schema_embeddings[p2]))
-                for p1, p2 in good_pairs
-            ]
-            top_1000_good_pairs = nlargest(1000, good_pairs_distances, key=lambda x: x[1])
-            sample_good_pairs.update(pair for pair, _ in top_1000_good_pairs)
-        else:
-            sample_good_pairs.update(good_pairs[:1000])
-
-    good_schemas = set(df.loc[df["path"].isin(all_good_paths), "schema"])
-    path_to_schema = df.set_index("path")["schema"].to_dict()
-
-    # Efficiently sample path pairs
-    rng = random.Random(42)  # Create a reproducible RNG
-    sampled_pairs = sample_path_pairs(paths, rng)
-
-    for p1, p2 in sampled_pairs:
-        if ((p1, p2) not in all_good_pairs and (p2, p1) not in all_good_pairs):
-            schema1_good = path_to_schema.get(p1) in good_schemas
-            schema2_good = path_to_schema.get(p2) in good_schemas
-            keys1 = set(df.loc[df["path"] == p1, "nested_keys"].values[0].keys())
-            keys2 = set(df.loc[df["path"] == p2, "nested_keys"].values[0].keys())
-
-            if not (schema1_good and schema2_good) and len(keys1 & keys2) >= 1:
-                all_bad_pairs.add((p1, p2))
-
-
-    bad_pairs_distances = [
-        ((p1, p2), cosine(schema_embeddings[p1], schema_embeddings[p2]))
-        for p1, p2 in all_bad_pairs
-    ]
-
-    num_bad_pairs = min(len(sample_good_pairs), len(bad_pairs_distances))
-    top_bad_pairs = nsmallest(num_bad_pairs, bad_pairs_distances, key=lambda x: x[1])
-    sample_bad_pairs.update(pair for pair, _ in top_bad_pairs)
-
-    return label_samples(df, sample_good_pairs, sample_bad_pairs)
-
-
-
-
-
+    with open(output_path, 'w') as outfile:
+        for doc in valid_docs:
+            json.dump(doc, outfile)
+            outfile.write('\n')
 
 def save_ground_truths(ground_truths, ground_truth_file):
     """
@@ -1361,68 +885,56 @@ def save_ground_truths(ground_truths, ground_truth_file):
         for ref_defn, subdict in ground_truths_serializable.items():
             json_file.write(json.dumps({ref_defn: subdict}) + '\n')
 
-
-def preprocess_data(schemas, filename, ground_truth_file):
+def find_ref_defn_for_path(path, merged_defn_paths):
     """
-    Process all the data from the JSON files to get their embeddings using multiple CPUs.
-
+    Given a path string, find which reference definition it belongs to.
+    
     Args:
-        schemas (list): List of schema filenames.
-        filename (str): Filename to save the resulting DataFrame.
-        ground_truth_file (str): Filename to save the ground truth definitions.
+        path (str): A JSONSchema path string.
+        merged_defn_paths (dict): Mapping ref_defn -> set(paths)
+    
+    Returns:
+        str or None: The reference definition name, or None if not found.
     """
+    for ref_defn, paths in merged_defn_paths.items():
+        if path in paths:
+            return ref_defn
+    return None
 
-    ground_truths = defaultdict(dict)
+def label_definitions(df_list, merged_defn_paths):
+    """
+    Assigns reference definitions and numeric labels to a list of dataframes.
+    Uses -1 for any path that does not belong to a definition.
     
-    total_schemas = len(schemas)
-    load_count = 0
-    ref_defn = 0
-    object_defn = 0
-    path = 0
-    schema_intersection = 0
-    freq_defn = 0
-    properties = 0
+    Args:
+        df_list (List[pd.DataFrame]): List of dataframes to label.
+        merged_defn_paths (dict): Mapping of ref_defn -> set of paths.
+        
+    Returns:
+        pd.DataFrame: Merged dataframe with 'ref_defn' and 'label' columns.
+    """
+    # 1. Collect all unique definitions
+    all_definitions = set(merged_defn_paths.keys())
 
+    # 2. Create integer label mapping and add special -1 label for None
+    label_map = {ref_defn: idx for idx, ref_defn in enumerate(sorted(all_definitions))}
+    label_map[None] = -1  # special label for paths not belonging to any definition
 
-    # Limit the number of concurrent workers to prevent memory overload
-    for i in tqdm(range(0, len(schemas), BATCH_SIZE), position=0, desc="Processing schemas", leave=True, total=len(schemas)):
-        batch = schemas[i:i+BATCH_SIZE]
-        with concurrent.futures.ProcessPoolExecutor() as executor:
-            futures = {executor.submit(process_schema, schema, filename): schema for schema in batch}
+    # 3. Merge all dataframes
+    if df_list:
+        merged_df = pd.concat(df_list, ignore_index=True)
+    else:
+        merged_df = pd.DataFrame()
 
-            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), position=1, desc="Processing batch", leave=False):
-                try:
-                    df, frequent_ref_defn_paths, schema_name, failure_flags = future.result()
-                    load_count += failure_flags["load"]
-                    ref_defn += failure_flags["ref_defn"]
-                    object_defn += failure_flags["object_defn"]
-                    path += failure_flags["path"]
-                    schema_intersection += failure_flags["schema_intersection"]
-                    freq_defn += failure_flags["freq_defn"]
-                    properties += failure_flags["properties"]
+    if not merged_df.empty:
+        # 4. Assign reference definitions
+        merged_df["ref_defn"] = merged_df["path"].apply(
+            lambda p: find_ref_defn_for_path(p, merged_defn_paths)
+        )
+        # 5. Map numeric labels (None -> -1)
+        merged_df["label"] = merged_df["ref_defn"].map(label_map)
 
-                    if df is not None and frequent_ref_defn_paths:
-                        ground_truths[schema_name] = frequent_ref_defn_paths
-                        
-                        if filename != "baseline_test_data.csv":
-                            df = get_samples(df, frequent_ref_defn_paths, best_good_pairs=True)
-                        
-                        # Append batch to CSV to avoid holding everything in memory
-                        df.to_csv(filename, mode='a', header=not os.path.exists(filename), index=False, sep=';')
-
-                except Exception as e:
-                    print(f"Error processing schema {futures[future]}: {e}", flush=True)
-    
-    # Save ground truth definitions once all processing is done
-    save_ground_truths(ground_truths, ground_truth_file)
-    print("Total schemas processed:", total_schemas)
-    print("Schemas that loaded:", total_schemas - load_count)
-    print("Schemas with referenced definitions:", total_schemas - load_count - ref_defn)
-    print("Schemas with object definitions:", total_schemas - load_count - ref_defn - object_defn)
-    print("Schemas with paths:", total_schemas - load_count - ref_defn - object_defn - path)
-    print("Schemas with schema intersection:", total_schemas - load_count - ref_defn - object_defn - path - schema_intersection)
-    print("Schemas with frequent definitions:", total_schemas - load_count - ref_defn - object_defn - path - schema_intersection - freq_defn)
-    print("Schemas with properties:", total_schemas - load_count - ref_defn - object_defn - path - schema_intersection - freq_defn - properties)
+    return merged_df
 
 
 def delete_file_if_exists(filename):
@@ -1439,62 +951,124 @@ def delete_file_if_exists(filename):
         print(f"File {filename} does not exist.")
 
 
+def preprocess_data(schemas, filename, ground_truth_file, schema_folder):
+    """
+    Sequentially process all schemas and track failure flags.
+    """
+    ground_truths = defaultdict(dict)
+    all_dfs = []
+    merged_defn_paths = {}
+
+    # Counters for different failure types
+    load_count = ref_defn = object_defn = path = schema_intersection = freq_defn = properties = 0
+
+    for schema_name in tqdm(schemas, desc="Processing schemas"):
+        try:
+            df_records, frequent_ref_defn_paths, failure_flags, valid_docs = process_schema(schema_name, schema_folder)
+
+            # Update counters
+            load_count += failure_flags.get("load", 0)
+            ref_defn += failure_flags.get("ref_defn", 0)
+            object_defn += failure_flags.get("object_defn", 0)
+            path += failure_flags.get("path", 0)
+            schema_intersection += failure_flags.get("schema_intersection", 0)
+            freq_defn += failure_flags.get("freq_defn", 0)
+            properties += failure_flags.get("properties", 0)
+
+            if df_records is None or not frequent_ref_defn_paths:
+                continue
+
+            # Merge data
+            ground_truths[schema_name] = frequent_ref_defn_paths
+            for ref_def, paths_list in frequent_ref_defn_paths.items():
+                merged_defn_paths.setdefault(ref_def, set()).update(paths_list)
+
+            all_dfs.append(pd.DataFrame(df_records))
+
+            # Save valid JSON docs if this is test data
+            matched_jsons_dir = "train_jsons" if "train" in filename else "test_jsons"
+            if matched_jsons_dir == "test_jsons":
+                save_valid_docs(matched_jsons_dir, schema_name, valid_docs)
+
+        except Exception as e:
+            print(f"Error processing schema {schema_name}: {e}", flush=True)
+            continue
+
+    # ---------- Combine data across all schemas ----------
+    merged_df = label_definitions(all_dfs, merged_defn_paths)
+
+    # Save results
+    merged_df.to_csv(filename, index=False, sep=";")
+    save_ground_truths(ground_truths, ground_truth_file)
+
+    # ---------- Print failure summary ----------
+    total_schemas = len(schemas)
+    print("Total schemas processed:", total_schemas)
+    print("Schemas that loaded:", total_schemas - load_count)
+    print("Schemas with referenced definitions:", total_schemas - load_count - ref_defn)
+    print("Schemas with object definitions:", total_schemas - load_count - ref_defn - object_defn)
+    print("Schemas with paths:", total_schemas - load_count - ref_defn - object_defn - path)
+    print("Schemas with schema intersection:", total_schemas - load_count - ref_defn - object_defn - path - schema_intersection)
+    print("Schemas with frequent definitions:", total_schemas - load_count - ref_defn - object_defn - path - schema_intersection - freq_defn)
+    print("Schemas with properties:", total_schemas - load_count - ref_defn - object_defn - path - schema_intersection - freq_defn - properties)
+
+
+# ---------- Main Entry Point ----------
 def main():
+    start_time = time.time()
+
     try:
         # Parse command-line arguments
-        train_size, random_value, model = sys.argv[-3:]
-        train_ratio = float(train_size)
-        random_value = int(random_value)
+        parser = argparse.ArgumentParser(description="Process data for training and testing.")
+        parser.add_argument("train_size", type=float, help="Training set size ratio (0 < train_size < 1)")
+        parser.add_argument("random_value", type=int, help="Random seed value")
+        args = parser.parse_args()
 
+        train_ratio = args.train_size
+        random_value = args.random_value
 
         # Split the data into training and testing sets
         train_set, test_set = split_data(train_ratio, random_value)
 
-        if model == "baseline":
-            # Files to be checked for deletion
-            files_to_delete = [
-                "baseline_test_data.csv",
-                "baseline_test_ground_truth.json",
-            ]
+        # Files to delete if they exist
+        files_to_delete = [
+            "train_data.csv",
+            "train_ground_truth.json",
+            "test_data.csv",
+            "test_ground_truth.json"
+        ]
+        for file in files_to_delete:
+            delete_file_if_exists(file)
 
-            # Delete files if they exist
-            for file in files_to_delete:
-                delete_file_if_exists(file)
+        # ---------- Preprocess training data ----------
+        print("Preprocessing training data...")
+        preprocess_data(
+            schemas=train_set,
+            filename="train_data.csv",
+            ground_truth_file="train_ground_truth.json",
+            schema_folder=SCHEMA_FOLDER
+        )
 
-            # Preprocess the testing data for the baseline model
-            preprocess_data(test_set, filename="baseline_test_data.csv", ground_truth_file="baseline_test_ground_truth.json")
+        # ---------- Preprocess testing data ----------
+        print("Preprocessing testing data...")
+        preprocess_data(
+            schemas=test_set,
+            filename="test_data.csv",
+            ground_truth_file="test_ground_truth.json",
+            schema_folder=SCHEMA_FOLDER
+        )
 
-        else:
-            # Files to be checked for deletion
-            files_to_delete = [
-                "sample_train_data.csv",
-                "train_ground_truth.json",
-                "sample_test_data.csv",
-                "test_ground_truth.json"
-            ]
-
-            # Delete files if they exist
-            for file in files_to_delete:
-                delete_file_if_exists(file)
-
-            # Start a timer
-            start_time = time.time()
-            # Preprocess the training and testing data
-            preprocess_data(train_set, filename="sample_train_data.csv", ground_truth_file="train_ground_truth.json")
-            preprocess_data(test_set, filename="sample_test_data.csv", ground_truth_file="test_ground_truth.json")
-            #preprocess_data(test_set, filename="test.csv", ground_truth_file="test.json")
-            # End the timer
-            end_time = time.time()
-            # Calculate the elapsed time
-            elapsed_time = end_time - start_time
-            print(f"Time taken for preprocessing: {elapsed_time:.2f} seconds")
+        # End the timer
+        elapsed_time = time.time() - start_time
+        print(f"Time taken for preprocessing: {elapsed_time:.2f} seconds")
 
     except (ValueError, IndexError) as e:
-        print(f"Error: {e}\nUsage: script.py <train_size> <random_value> <model>")
+        print(f"Error: {e}\nUsage: script.py <train_size> <random_value>")
         sys.exit(1)
-    
+
 
 if __name__ == "__main__":
+    # Disable HuggingFace tokenizers parallelism if using tokenizers
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    mp.set_start_method('spawn', force=True)
     main()
+
