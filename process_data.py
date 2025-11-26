@@ -5,6 +5,7 @@ import math
 import numpy as np
 import os
 import pandas as pd
+import random
 import re
 import sys
 import time
@@ -12,13 +13,18 @@ import torch
 import torch.multiprocessing as mp
 import warnings
 
+from adapters import AutoAdapterModel
 from collections import defaultdict, Counter
 from collections.abc import Mapping
+from heapq import nlargest, nsmallest
+from itertools import combinations
+from scipy.spatial.distance import cosine
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import GroupShuffleSplit
 from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer
-
+from transformers import AutoTokenizer
+from torch.nn.functional import normalize
+from torch.nn.utils.rnn import pad_sequence
 
 warnings.filterwarnings("ignore")
 
@@ -34,11 +40,6 @@ BATCH_SIZE = 64
 MODEL_NAME = "microsoft/codebert-base" 
 ARRAY_WILDCARD = "<ARRAY_ITEM>"
 
-# Load CodeBERT
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModel.from_pretrained(MODEL_NAME)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device) 
 
 # -------------------------------
 # Data Splitting 
@@ -450,7 +451,8 @@ def process_document(doc, path_values, path_freqs):
                 path_values[prefix] = {}
 
             if nested_key not in path_values[prefix]:
-                path_values[prefix][nested_key] = {"frequency": 0, "type": set()}
+                path_values[prefix][nested_key] = {"frequency": 0.0, "type": set()}
+
             # Update frequency and type for the nested key
             path_values[prefix][nested_key]["frequency"] += 1
             path_values[prefix][nested_key]["type"].add(value_type)
@@ -471,7 +473,7 @@ def process_dataset(dataset, paths_to_exclude):
     Returns:
         tuple: (path_values, path_freqs, valid_docs)
     """
-    path_values = defaultdict(lambda: defaultdict(lambda: {"frequency": 0, "type": set()}))
+    path_values = defaultdict(lambda: defaultdict(lambda: {"frequency": 0.0, "type": set()}))
     path_freqs = Counter()
     valid_docs = []
 
@@ -507,7 +509,7 @@ def process_dataset(dataset, paths_to_exclude):
     # No extracted object paths
     if len(path_values) == 0:
         print(f"No object-like paths extracted from {dataset}.")
-        return None, None, valid_docs
+        return {}, {}, valid_docs
 
     # Add all infrequent paths (freq <= 1) to paths_to_exclude
     infrequent = {p for p, f in path_freqs.items() if f <= 1}
@@ -655,12 +657,25 @@ def find_frequent_definitions(filtered_ref_defn_paths, paths_to_exclude):
 # -------------------------------
 # DataFrame Creation and Semantic Similarity
 # -------------------------------
-def get_embeddings(nested_keys):
+def load_model():
+    """
+    Function to load and return the model, tokenizer, and device.
+    """
+    model = AutoAdapterModel.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    return model, tokenizer, device
+
+def get_embeddings(nested_keys, model, tokenizer, device):
     """
     Get the embeddings for the given nested keys using a pre-trained model.
 
     Args:
         nested_keys (list): A list of nested keys to get embeddings for.
+        model: The pre-trained model to use for embeddings.
+        tokenizer: The tokenizer corresponding to the model.
+        device: The device (CPU or GPU) to perform computations on.
 
     Returns:
         np.ndarray: An array of embeddings for the nested keys.
@@ -670,28 +685,54 @@ def get_embeddings(nested_keys):
         outputs = model(**inputs)
     return outputs.last_hidden_state.mean(dim=1).cpu().numpy()
 
-def calc_semantic_similarity(nested_keys):
+def calc_semantic_similarity(nested_keys, model, tokenizer, device):
     """
     Calculate the average semantic similarity of nested keys based on their embeddings
 
     Args:
         nested_keys (dict): A dictionary where keys are nested keys and values are their types.
+        model: The pre-trained model to use for embeddings.
+        tokenizer: The tokenizer corresponding to the model.
+        device: The device (CPU or GPU) to perform computations on.
+
     Returns:
         float: The average cosine similarity between the embeddings of the nested keys.
         
     """
     n_keys = len(nested_keys)
     if n_keys < 2:
-        return 0.5
+        return 0.50
 
     keys = list(nested_keys.keys())
-    embeddings = get_embeddings(keys)
+    embeddings = get_embeddings(keys, model, tokenizer, device)
     similarity_matrix = cosine_similarity(embeddings)
 
     # Exclude diagonal (self-similarity)
     avg_similarity = float((np.sum(similarity_matrix) - n_keys) / (n_keys * (n_keys - 1)))
 
-    return round(avg_similarity, 3)
+    return round(avg_similarity, 2)
+
+def tokenize_schema(schema_str, tokenizer):
+    """
+    Tokenize a schema string using the specified tokenizer.
+
+    Args:
+        schema_str (str): A string representation of the schema to tokenize.
+        tokenizer (PreTrainedTokenizer): The tokenizer to use (e.g., from HuggingFace).
+
+    Returns:
+        dict: A dictionary of tokenized inputs (input_ids, attention_mask, etc.) as torch tensors.
+    """
+    if not isinstance(schema_str, str):
+        raise ValueError("Expected a string schema, got type: {}".format(type(schema_str).__name__))
+
+    return tokenizer(
+        schema_str,
+        return_tensors="pt",
+        max_length=MAX_TOK_LEN,
+        padding="max_length",
+        truncation=True,
+    )
 
 def create_dataframe(path_values, path_freqs, schema_name, path_to_exclude):
     """
@@ -707,6 +748,7 @@ def create_dataframe(path_values, path_freqs, schema_name, path_to_exclude):
         pd.DataFrame: DataFrame with tokenized schemas and metadata.
     """
     data = []
+    model, tokenizer, device = load_model()
 
     for path, nested_keys in path_values.items():
         if path in path_to_exclude:
@@ -732,7 +774,7 @@ def create_dataframe(path_values, path_freqs, schema_name, path_to_exclude):
             frequencies.append(frequency)
 
             schema_info["properties"][nested_key] = {
-                "frequency": round(frequency, 2),
+                "frequency": round(frequency, 3),
                 "type": value_type  # now always JSON-serializable
             }
 
@@ -750,7 +792,7 @@ def create_dataframe(path_values, path_freqs, schema_name, path_to_exclude):
         schema_info["nesting_depth"] = len(path) - 1
         schema_info["datatype_entropy"] = 0 if len(values_types) == 1 else 1
         schema_info["num_nested_keys"] = len(nested_keys)
-        schema_info["semantic_similarity"] = calc_semantic_similarity(nested_keys)
+        schema_info["semantic_similarity"] = calc_semantic_similarity(nested_keys, model, tokenizer, device)
 
         # Key entropy
         if frequencies:
@@ -760,9 +802,13 @@ def create_dataframe(path_values, path_freqs, schema_name, path_to_exclude):
         else:
             key_entropy = 0
 
+        # Tokenize schema
+        tokenized_schema = tokenize_schema(json.dumps(schema_info), tokenizer)
+
         data.append({
             "path": path,
-            "schema": schema_info,
+            "schema": json.dumps(schema_info, sort_keys=True),
+            "tokenized_schema": tokenized_schema,
             "datatype_entropy": schema_info["datatype_entropy"],
             "key_entropy": round(key_entropy, 2),
             "parent_frequency": parent_frequency,
@@ -771,6 +817,178 @@ def create_dataframe(path_values, path_freqs, schema_name, path_to_exclude):
 
     df = pd.DataFrame(data)
     return df
+
+def calculate_embeddings(df, model, device):
+    """
+    Calculate the embeddings for each schema in batches.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing paths and their tokenized schemas.
+        model (AutoModel): Pretrained model to compute embeddings.
+        device (torch.device): Device to move tensors to.
+
+    Returns:
+        dict: Dictionary mapping paths (tuples) to their corresponding embeddings.
+    """
+
+    schema_embeddings = {}
+    paths = df["path"].tolist()
+    tokenized_schemas = df["tokenized_schema"].tolist()
+
+    # Create batches of tokenized schemas
+    for batch_start in tqdm(range(0, len(tokenized_schemas), BATCH_SIZE), desc="Calculating schema embeddings", position=0, leave=False):
+        batch_paths = paths[batch_start: batch_start + BATCH_SIZE]
+        batch_schemas = tokenized_schemas[batch_start: batch_start + BATCH_SIZE]
+
+        # Prepare batch tensors
+        batch_input_ids = [torch.tensor(schema["input_ids"]) for schema in batch_schemas]
+        batch_attention_mask = [torch.tensor(schema["attention_mask"]) for schema in batch_schemas]
+
+        # Pad sequences to get a uniform length
+        batch_input_ids = pad_sequence(batch_input_ids, batch_first=True)
+        batch_attention_mask = pad_sequence(batch_attention_mask, batch_first=True)
+
+        # Move tensors to the device
+        batch_input_ids = batch_input_ids.to(device)
+        batch_attention_mask = batch_attention_mask.to(device)
+
+        # Use model to compute embeddings
+        with torch.no_grad():
+            outputs = model(input_ids=batch_input_ids, attention_mask=batch_attention_mask)
+            batch_embeddings = outputs.last_hidden_state.mean(dim=1)
+
+        # Store embeddings
+        for path, embedding in zip(batch_paths, batch_embeddings):
+            schema_embeddings[path] = embedding.cpu()
+
+    return schema_embeddings
+
+def get_samples(df, frequent_ref_defn_paths, best_good_pairs=True):
+    """
+    Generate labeled samples of good and bad pairs from the DataFrame based on ground truth definitions.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing paths and schemas (schemas as JSON strings).
+        frequent_ref_defn_paths (dict): Dictionary of frequent referenced definitions and their paths.
+        best_good_pairs (bool, optional): Whether to select the best good pairs. Defaults to True.
+
+    Returns:
+        tuple: (sample_good_pairs, sample_bad_pairs)
+    """
+    all_good_pairs = set()
+    all_bad_pairs = set()
+    all_good_paths = set()
+    sample_good_pairs = set()
+    sample_bad_pairs = set()
+
+    # Load model and compute embeddings
+    model, tokenizer, device = load_model()
+    schema_embeddings = calculate_embeddings(df, model, device)
+
+    paths = list(df["path"])
+
+    # --- Process good pairs ---
+    for ref_defn, good_paths in tqdm(frequent_ref_defn_paths.items(), desc="Processing good pairs", position=0, leave=False):
+        all_good_paths.update(good_paths)
+        good_pairs = list(combinations(good_paths, 2))
+        all_good_pairs.update(good_pairs)
+
+        if best_good_pairs:
+            good_pairs_distances = [
+                ((p1, p2), 1 - cosine(schema_embeddings[p1], schema_embeddings[p2]))
+                for p1, p2 in good_pairs
+            ]
+            top_1000_good_pairs = nlargest(1000, good_pairs_distances, key=lambda x: x[1])
+            sample_good_pairs.update(pair for pair, _ in top_1000_good_pairs)
+        else:
+            sample_good_pairs.update(good_pairs[:1000])
+
+    # --- Prepare for bad pairs ---
+    good_schemas = set(df.loc[df["path"].isin(all_good_paths), "schema"])
+    path_to_schema = df.set_index("path")["schema"].to_dict()
+
+    # --- Process bad pairs ---
+    all_pairs = list(combinations(paths, 2))
+    for p1, p2 in all_pairs:
+        if ((p1, p2) not in all_good_pairs and (p2, p1) not in all_good_pairs):
+            schema1_good = path_to_schema.get(p1) in good_schemas
+            schema2_good = path_to_schema.get(p2) in good_schemas
+
+            if not (schema1_good and schema2_good):
+                all_bad_pairs.add((p1, p2))
+
+    # Calculate distances for bad pairs
+    bad_pairs_distances = [
+        ((p1, p2), 1 - cosine(schema_embeddings[p1], schema_embeddings[p2]))
+        for p1, p2 in all_bad_pairs
+    ]
+
+    # Sample bad pairs equal to the number of good pairs sampled
+    num_bad_pairs = min(len(sample_good_pairs), len(bad_pairs_distances))
+    top_bad_pairs = nsmallest(num_bad_pairs, bad_pairs_distances, key=lambda x: x[1])
+    sample_bad_pairs.update(pair for pair, _ in top_bad_pairs)
+
+    return sample_good_pairs, sample_bad_pairs
+
+def label_samples(df, good_pairs, bad_pairs):
+    """
+    Label the samples in the DataFrame based on good and bad pairs.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing paths, schemas, and filenames.
+        good_pairs (set): Set of paths that should be grouped together.
+        bad_pairs (set): Set of paths that should not be grouped together.
+
+    Returns:
+        pd.DataFrame: DataFrame containing labeled pairs, schemas, and filenames.
+    """
+    # Create lists to store data
+    paths1 = []
+    paths2 = []
+    labels = []
+    schemas1 = [] 
+    schemas2 = []  
+    filenames = []  
+
+    # Process good pairs: label them as 1 (positive)
+    for path1, path2 in good_pairs:
+        paths1.append(path1)
+        paths2.append(path2)
+        labels.append(1)
+
+        # Extract schemas and filename for both paths
+        path1_row = df[df["path"] == path1].iloc[0]
+        path2_row = df[df["path"] == path2].iloc[0]
+        filenames.append(path1_row["filename"])
+        schemas1.append(path1_row["schema"])
+        schemas2.append(path2_row["schema"])
+
+    # Process bad pairs: label them as 0 (negative)
+    for path1, path2 in bad_pairs:
+        paths1.append(path1)
+        paths2.append(path2)
+        labels.append(0)
+
+        # Extract schemas and filename for both paths
+        path1_row = df[df["path"] == path1].iloc[0]
+        path2_row = df[df["path"] == path2].iloc[0]
+        filenames.append(path1_row["filename"])
+        schemas1.append(path1_row["schema"])
+        schemas2.append(path2_row["schema"])
+
+    # Create a new DataFrame with separate columns for path1 and path2
+    labeled_df = pd.DataFrame({
+        "filename": filenames,
+        "label": labels,
+        "path1": paths1,
+        "path2": paths2,
+        "schema1": schemas1,
+        "schema2": schemas2
+    })
+
+    return labeled_df
+
+
 
 def update_ref_defn_paths(frequent_ref_defn_paths, df):
     """
@@ -811,49 +1029,48 @@ def process_schema(schema_name, schema_folder):
         schema = load_schema(schema_path)
         if schema is None:
             failure_flags["load"] = 1
-            return None, None, failure_flags, []
+            return None, {}, failure_flags, []
 
         ref_defn_paths = clean_ref_defn_paths(schema)
         if not ref_defn_paths:
             failure_flags["ref_defn"] = 1
-            return None, None, failure_flags, []
+            return None, {}, failure_flags, []
 
         cleaned_ref_defn_paths = remove_definition_keywords(handle_nested_definitions(ref_defn_paths))
         path_to_exclude = get_ref_defn_of_type_obj(schema, cleaned_ref_defn_paths)
         if not cleaned_ref_defn_paths:
             failure_flags["object_defn"] = 1
-            return None, None, failure_flags, []
+            return None, {}, failure_flags, []
 
         path_values, path_freqs, valid_docs = process_dataset(schema_name, path_to_exclude)
         if len(path_values) == 0:
             failure_flags["path"] = 1
-            return None, None, failure_flags, valid_docs
+            return None, {}, failure_flags, valid_docs
 
         filtered_ref_defn_paths = check_ref_defn_paths_exist_in_jsonfiles(cleaned_ref_defn_paths, path_values)
         if not filtered_ref_defn_paths:
             failure_flags["schema_intersection"] = 1
-            return None, None, failure_flags, valid_docs
+            return None, {}, failure_flags, valid_docs
 
         frequent_ref_defn_paths = find_frequent_definitions(filtered_ref_defn_paths, path_to_exclude)
         if not frequent_ref_defn_paths:
             failure_flags["freq_defn"] = 1
-            return None, None, failure_flags, valid_docs
+            return None, {}, failure_flags, valid_docs
 
         df = create_dataframe(path_values, path_freqs, schema_name, path_to_exclude)
         updated_ref_defn_paths = update_ref_defn_paths(frequent_ref_defn_paths, df)
         if not updated_ref_defn_paths:
             failure_flags["properties"] = 1
-            return None, None, failure_flags, valid_docs
+            return None, {}, failure_flags, valid_docs
 
         # Make everything pickle-safe
-        df_records = df.to_dict(orient="records")
         updated_ref_defn_paths = {k: list(v) for k, v in updated_ref_defn_paths.items()}
 
-        return df_records, updated_ref_defn_paths, failure_flags, valid_docs
+        return df, updated_ref_defn_paths, failure_flags, valid_docs
 
     except Exception as e:
         print(f"Worker crashed on {schema_name}: {e}", flush=True)
-        return None, None, failure_flags, []
+        return None, {}, failure_flags, []
 
 def save_valid_docs(matched_jsons_dir, dataset_name, valid_docs):
     """
@@ -901,40 +1118,7 @@ def find_ref_defn_for_path(path, merged_defn_paths):
             return ref_defn
     return None
 
-def label_definitions(df_list, merged_defn_paths):
-    """
-    Assigns reference definitions and numeric labels to a list of dataframes.
-    Uses -1 for any path that does not belong to a definition.
-    
-    Args:
-        df_list (List[pd.DataFrame]): List of dataframes to label.
-        merged_defn_paths (dict): Mapping of ref_defn -> set of paths.
-        
-    Returns:
-        pd.DataFrame: Merged dataframe with 'ref_defn' and 'label' columns.
-    """
-    # 1. Collect all unique definitions
-    all_definitions = set(merged_defn_paths.keys())
 
-    # 2. Create integer label mapping and add special -1 label for None
-    label_map = {ref_defn: idx for idx, ref_defn in enumerate(sorted(all_definitions))}
-    label_map[None] = -1  # special label for paths not belonging to any definition
-
-    # 3. Merge all dataframes
-    if df_list:
-        merged_df = pd.concat(df_list, ignore_index=True)
-    else:
-        merged_df = pd.DataFrame()
-
-    if not merged_df.empty:
-        # 4. Assign reference definitions
-        merged_df["ref_defn"] = merged_df["path"].apply(
-            lambda p: find_ref_defn_for_path(p, merged_defn_paths)
-        )
-        # 5. Map numeric labels (None -> -1)
-        merged_df["label"] = merged_df["ref_defn"].map(label_map)
-
-    return merged_df
 
 
 def delete_file_if_exists(filename):
@@ -956,15 +1140,13 @@ def preprocess_data(schemas, filename, ground_truth_file, schema_folder):
     Sequentially process all schemas and track failure flags.
     """
     ground_truths = defaultdict(dict)
-    all_dfs = []
-    merged_defn_paths = {}
 
     # Counters for different failure types
     load_count = ref_defn = object_defn = path = schema_intersection = freq_defn = properties = 0
 
     for schema_name in tqdm(schemas, desc="Processing schemas"):
         try:
-            df_records, frequent_ref_defn_paths, failure_flags, valid_docs = process_schema(schema_name, schema_folder)
+            df, frequent_ref_defn_paths, failure_flags, valid_docs = process_schema(schema_name, schema_folder)
 
             # Update counters
             load_count += failure_flags.get("load", 0)
@@ -975,15 +1157,19 @@ def preprocess_data(schemas, filename, ground_truth_file, schema_folder):
             freq_defn += failure_flags.get("freq_defn", 0)
             properties += failure_flags.get("properties", 0)
 
-            if df_records is None or not frequent_ref_defn_paths:
+            if df is None or len(frequent_ref_defn_paths) == 0:
                 continue
-
-            # Merge data
+    
+            # Save ground truths
             ground_truths[schema_name] = frequent_ref_defn_paths
-            for ref_def, paths_list in frequent_ref_defn_paths.items():
-                merged_defn_paths.setdefault(ref_def, set()).update(paths_list)
 
-            all_dfs.append(pd.DataFrame(df_records))
+            # Sample good and bad pairs
+            sample_good_pairs, sample_bad_pairs = get_samples(df, frequent_ref_defn_paths, best_good_pairs=True)
+            labeled_df = label_samples(df, sample_good_pairs, sample_bad_pairs)
+
+            # Append batch to CSV to avoid holding everything in memory
+            labeled_df.to_csv(filename, mode='a', header=not os.path.exists(filename), index=False, sep=';')
+
 
             # Save valid JSON docs if this is test data
             matched_jsons_dir = "train_jsons" if "train" in filename else "test_jsons"
@@ -992,13 +1178,9 @@ def preprocess_data(schemas, filename, ground_truth_file, schema_folder):
 
         except Exception as e:
             print(f"Error processing schema {schema_name}: {e}", flush=True)
-            continue
-
-    # ---------- Combine data across all schemas ----------
-    merged_df = label_definitions(all_dfs, merged_defn_paths)
+        
 
     # Save results
-    merged_df.to_csv(filename, index=False, sep=";")
     save_ground_truths(ground_truths, ground_truth_file)
 
     # ---------- Print failure summary ----------
