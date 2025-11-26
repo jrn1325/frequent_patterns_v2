@@ -5,7 +5,6 @@ import math
 import numpy as np
 import os
 import pandas as pd
-import random
 import re
 import sys
 import time
@@ -23,7 +22,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import GroupShuffleSplit
 from tqdm import tqdm
 from transformers import AutoTokenizer
-from torch.nn.functional import normalize
 from torch.nn.utils.rnn import pad_sequence
 
 warnings.filterwarnings("ignore")
@@ -40,6 +38,7 @@ BATCH_SIZE = 64
 MODEL_NAME = "microsoft/codebert-base" 
 ARRAY_WILDCARD = "<ARRAY_ITEM>"
 
+# Random value for reproducibility = 42
 
 # -------------------------------
 # Data Splitting 
@@ -802,6 +801,9 @@ def create_dataframe(path_values, path_freqs, schema_name, path_to_exclude):
         else:
             key_entropy = 0
 
+        schema_info["key_entropy"] = round(key_entropy, 2)
+        schema_info["parent_frequency"] = parent_frequency
+
         # Tokenize schema
         tokenized_schema = tokenize_schema(json.dumps(schema_info), tokenizer)
 
@@ -809,9 +811,6 @@ def create_dataframe(path_values, path_freqs, schema_name, path_to_exclude):
             "path": path,
             "schema": json.dumps(schema_info, sort_keys=True),
             "tokenized_schema": tokenized_schema,
-            "datatype_entropy": schema_info["datatype_entropy"],
-            "key_entropy": round(key_entropy, 2),
-            "parent_frequency": parent_frequency,
             "filename": schema_name
         })
 
@@ -949,6 +948,7 @@ def label_samples(df, good_pairs, bad_pairs):
     schemas1 = [] 
     schemas2 = []  
     filenames = []  
+
 
     # Process good pairs: label them as 1 (positive)
     for path1, path2 in good_pairs:
